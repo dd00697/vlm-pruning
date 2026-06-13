@@ -1,0 +1,8 @@
+dataset:
+  name: refcoco
+  raw_root: N/A
+  manifest_path: data/manifests/refcoco_manifest.jsonl
+  splits:
+    train: N/A
+    val: N/A
+    test: N/A
