@@ -1,8 +1,0 @@
-dataset:
-  name: reasonseg
-  raw_root: N/A
-  manifest_path: data/manifests/reasonseg_manifest.jsonl
-  splits:
-    train: N/A
-    val: N/A
-    test: N/A
