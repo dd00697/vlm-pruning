@@ -1,0 +1,9 @@
+[submodule "third_party/VisionZip"]
+	path = third_party/VisionZip
+	url = https://github.com/JIA-Lab-research/VisionZip
+[submodule "third_party/FastV"]
+	path = third_party/FastV
+	url = https://github.com/pkunlp-icler/FastV
+[submodule "third_party/Nuwa"]
+	path = third_party/Nuwa
+	url = https://github.com/Man-PaperRejected/Nuwa.git
