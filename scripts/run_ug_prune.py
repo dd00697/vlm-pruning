@@ -32,7 +32,8 @@ from run_baseline import (  # noqa: E402
     Tee,
     apply_chat_template,
     box_iou,
-    generate_answer_true_removal,
+    cuda_sync,
+    eos_token_ids,
     indices_checksum,
     parse_box,
     prepare_compacted_inputs,
@@ -63,11 +64,15 @@ from run_official_baseline import (  # noqa: E402
 from vlm_pruning.analysis.coverage import selection_diagnostics  # noqa: E402
 from vlm_pruning.analysis.heatmaps import save_heatmap_overlay  # noqa: E402
 from vlm_pruning.features import (  # noqa: E402
+    FusedMapResult,
     extract_maps_from_hidden_states,
     fuse_layer_maps,
+    map_statistics,
     parse_bins,
     parse_int_tuple,
+    parse_probe_layers,
     resolve_query_token_positions,
+    zscore_normalise,
 )
 from vlm_pruning.selectors import UGPruneConfig, UGPruneInputs, UGPruneSelector  # noqa: E402
 
@@ -112,14 +117,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--suite-total-runs", type=int, default=None)
     parser.add_argument("--suite-completed-runs", type=int, default=None)
     parser.add_argument("--suite-start-time", type=float, default=None)
+    parser.add_argument("--ablation-name", default="main")
+    parser.add_argument("--ablation-family", default="main")
+    parser.add_argument("--ug-map-family", default="unrolled", choices=["unrolled", "clip"])
     parser.add_argument("--ug-map-source", default="query_max", choices=["query_max", "query_pooled"])
     parser.add_argument("--ug-probe-layers", default="4,8,12")
+    parser.add_argument("--ug-fusion-mode", default="soft_average", choices=["soft_average", "hard_best", "single_layer"])
+    parser.add_argument("--ug-dynamic-layer-metric", default="peakiness_minus_entropy", choices=["peakiness_minus_entropy"])
+    parser.add_argument("--ug-role-mode", default="target_context_anchor", choices=["target_only", "target_context", "target_context_anchor"])
     parser.add_argument("--ug-target-ratio", type=float, default=0.50)
     parser.add_argument("--ug-context-ratio", type=float, default=0.30)
     parser.add_argument("--ug-anchor-ratio", type=float, default=0.20)
     parser.add_argument("--ug-context-radius", type=int, default=1)
     parser.add_argument("--ug-anchor-bins", default="3,3")
+    parser.add_argument("--ug-anchor-pattern", default="fps", choices=["none", "corners", "grid", "fps"])
     parser.add_argument("--ug-nms-radius", type=int, default=1)
+    parser.add_argument("--position-mode", default="compact", choices=["compact", "raster_compact", "gap_preserving"])
     parser.add_argument("--ug-save-map-overlays", action="store_true")
     parser.add_argument("--ug-max-map-overlays", type=int, default=24)
     return parser.parse_args()
@@ -156,6 +169,8 @@ def config_payload(args: argparse.Namespace, name: str, original_tokens: int, to
         "task": args.task,
         "method/name": METHOD_NAME,
         "method/seed": args.seed,
+        "ablation/name": args.ablation_name,
+        "ablation/family": args.ablation_family,
         "tokens/original_visual_tokens": original_tokens,
         "tokens/target_visual_tokens": tokens,
         "tokens/actual_visual_tokens": tokens,
@@ -167,14 +182,20 @@ def config_payload(args: argparse.Namespace, name: str, original_tokens: int, to
         "pruning_location": TRUE_REMOVAL_LOCATION,
         "selector/name": METHOD_NAME,
         "selector/interface_version": "phase2",
+        "ug/map_family": args.ug_map_family,
         "ug/map_source": args.ug_map_source,
-        "ug/probe_layers": list(parse_int_tuple(args.ug_probe_layers)),
+        "ug/probe_layers": args.ug_probe_layers,
+        "ug/fusion_mode": args.ug_fusion_mode,
+        "ug/dynamic_layer_metric": args.ug_dynamic_layer_metric,
+        "ug/role_mode": args.ug_role_mode,
         "ug/target_ratio": args.ug_target_ratio,
         "ug/context_ratio": args.ug_context_ratio,
         "ug/anchor_ratio": args.ug_anchor_ratio,
         "ug/context_radius": args.ug_context_radius,
         "ug/anchor_bins": list(parse_bins(args.ug_anchor_bins)),
+        "ug/anchor_pattern": args.ug_anchor_pattern,
         "ug/nms_radius": args.ug_nms_radius,
+        "ug/position_mode": args.position_mode,
         "limit": args.limit,
     }
 
@@ -205,6 +226,186 @@ def forward_hidden_states(model: Any, compacted: dict[str, Any]) -> Any:
         return model(**kwargs, logits_to_keep=1)
     except TypeError:
         return model(**kwargs)
+
+
+def model_forward(model: Any, kwargs: dict[str, Any], *, require_position_ids: bool = False) -> Any:
+    try:
+        return model(**kwargs, logits_to_keep=1)
+    except TypeError:
+        try:
+            return model(**kwargs)
+        except TypeError as retry_exc:
+            if require_position_ids and "position_ids" in kwargs:
+                raise BaselineError(
+                    f"Model rejected explicit position_ids required for gap_preserving mode: {retry_exc}"
+                ) from retry_exc
+            raise
+
+
+def gap_position_ids(torch: Any, full_input_ids: Any, image_token_id: int, retained: list[int]) -> Any:
+    image_positions = torch.nonzero(full_input_ids[0] == int(image_token_id), as_tuple=False).flatten()
+    keep = torch.tensor(sorted(retained), dtype=torch.long, device=full_input_ids.device)
+    keep_mask = torch.ones(full_input_ids.shape[1], dtype=torch.bool, device=full_input_ids.device)
+    keep_mask[image_positions] = False
+    keep_mask[image_positions[keep]] = True
+    selected_positions = torch.nonzero(keep_mask, as_tuple=False).flatten()
+    return selected_positions.unsqueeze(0).to(device=full_input_ids.device, dtype=torch.long)
+
+
+def greedy_decode_from_embeds_ablation(
+    torch: Any,
+    processor: Any,
+    model: Any,
+    compacted: dict[str, Any],
+    max_new_tokens: int,
+    *,
+    require_position_ids: bool = False,
+) -> tuple[str, int, float, float]:
+    generated_ids: list[Any] = []
+    eos_ids = eos_token_ids(model, processor)
+    attention_mask = compacted["attention_mask"]
+    position_ids = compacted.get("position_ids")
+    next_position_id = None
+    if position_ids is not None:
+        next_position_id = int(position_ids[0, -1].item()) + 1
+    cuda_sync(torch)
+    prefill_start = time.perf_counter()
+    with torch.inference_mode():
+        kwargs = {
+            "inputs_embeds": compacted["inputs_embeds"],
+            "attention_mask": attention_mask,
+            "use_cache": True,
+            "return_dict": True,
+        }
+        if position_ids is not None:
+            kwargs["position_ids"] = position_ids
+        outputs = model_forward(model, kwargs, require_position_ids=require_position_ids)
+        next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+    cuda_sync(torch)
+    prefill_latency = time.perf_counter() - prefill_start
+    generated_ids.append(next_token)
+    past_key_values = outputs.past_key_values
+    finished = bool(eos_ids and int(next_token.item()) in eos_ids)
+
+    cuda_sync(torch)
+    decode_start = time.perf_counter()
+    with torch.inference_mode():
+        while len(generated_ids) < max_new_tokens and not finished:
+            attention_mask = torch.cat([attention_mask, torch.ones_like(next_token)], dim=1)
+            kwargs = {
+                "input_ids": next_token,
+                "attention_mask": attention_mask,
+                "past_key_values": past_key_values,
+                "use_cache": True,
+                "return_dict": True,
+            }
+            if next_position_id is not None:
+                kwargs["position_ids"] = torch.full_like(next_token, next_position_id)
+                next_position_id += 1
+            outputs = model_forward(model, kwargs, require_position_ids=require_position_ids)
+            past_key_values = outputs.past_key_values
+            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+            generated_ids.append(next_token)
+            finished = bool(eos_ids and int(next_token.item()) in eos_ids)
+    cuda_sync(torch)
+    decode_latency = time.perf_counter() - decode_start
+
+    generated = torch.cat(generated_ids, dim=1)[0] if generated_ids else torch.empty(0, dtype=torch.long)
+    decoded = processor.decode(generated, skip_special_tokens=True).strip()
+    return decoded, int(generated.numel()), prefill_latency, decode_latency
+
+
+def generate_answer_with_position_mode(
+    torch: Any,
+    processor: Any,
+    model: Any,
+    device: Any,
+    image: Image.Image,
+    prompt: str,
+    max_new_tokens: int,
+    retained: list[int],
+    expected_original_tokens: int,
+    *,
+    position_mode: str,
+    full_input_ids: Any,
+    image_token_id: int,
+) -> tuple[str, int, float, dict[str, Any]]:
+    retained_for_mode = sorted(retained) if position_mode in {"raster_compact", "gap_preserving"} else retained
+    compacted, diagnostics = prepare_compacted_inputs(
+        torch, processor, model, device, image, prompt, retained_for_mode, expected_original_tokens
+    )
+    if position_mode == "gap_preserving":
+        compacted["position_ids"] = gap_position_ids(torch, full_input_ids, image_token_id, retained_for_mode).to(
+            device=compacted["inputs_embeds"].device
+        )
+        diagnostics["position_ids_mode"] = "gap_preserving"
+        diagnostics["position_ids_first"] = int(compacted["position_ids"][0, 0].item())
+        diagnostics["position_ids_last"] = int(compacted["position_ids"][0, -1].item())
+    else:
+        diagnostics["position_ids_mode"] = position_mode
+    raw_output, generated_count, prefill_latency, decode_latency = greedy_decode_from_embeds_ablation(
+        torch,
+        processor,
+        model,
+        compacted,
+        max_new_tokens,
+        require_position_ids=position_mode == "gap_preserving",
+    )
+    diagnostics["llm_prefill_latency_s"] = prefill_latency
+    diagnostics["prefill_latency_s"] = prefill_latency
+    diagnostics["time_to_first_token_s"] = prefill_latency
+    diagnostics["decode_latency_s"] = decode_latency
+    total_latency = (
+        diagnostics["vision_encoder_latency_s"]
+        + diagnostics["projector_latency_s"]
+        + diagnostics["pruning_selection_latency_s"]
+        + prefill_latency
+        + decode_latency
+    )
+    diagnostics["total_inference_latency_s"] = total_latency
+    return raw_output, generated_count, total_latency, diagnostics
+
+
+def clip_like_map_from_inputs(
+    torch: Any,
+    compacted: dict[str, Any],
+    image_token_id: int,
+    query_positions: list[int],
+    *,
+    source: str,
+    grid: int,
+) -> FusedMapResult:
+    embeds = compacted["inputs_embeds"][0]
+    ids = compacted["input_ids"][0]
+    image_positions = torch.nonzero(ids == int(image_token_id), as_tuple=False).flatten()
+    if int(image_positions.numel()) != grid * grid:
+        raise BaselineError(f"Expected {grid * grid} image-token positions for CLIP-style map, found {int(image_positions.numel())}.")
+    image_states = embeds[image_positions, :]
+    query_states = embeds[query_positions, :]
+    image_states = torch.nn.functional.layer_norm(image_states, (image_states.shape[-1],))
+    query_states = torch.nn.functional.layer_norm(query_states, (query_states.shape[-1],))
+    image_norm = torch.nn.functional.normalize(image_states.float(), p=2, dim=-1)
+    query_norm = torch.nn.functional.normalize(query_states.float(), p=2, dim=-1)
+    sims = image_norm @ query_norm.transpose(0, 1)
+    if source == "query_max":
+        scores = sims.max(dim=1).values
+    elif source == "query_pooled":
+        pooled = torch.nn.functional.normalize(query_norm.mean(dim=0, keepdim=True), p=2, dim=-1)
+        scores = (image_norm @ pooled.transpose(0, 1)).squeeze(1)
+    else:
+        raise BaselineError(f"Unsupported CLIP-style map source: {source}")
+    raw = scores.detach().float().cpu().numpy().astype(np.float32).reshape(grid, grid)
+    fused = zscore_normalise(raw, grid)
+    return FusedMapResult(
+        fused_map=fused,
+        source=source,
+        layers=(0,),
+        layer_keys=(f"clip_like_input:{source}",),
+        stats=map_statistics(fused, top_ks=(16, 32, 48), grid=grid),
+        fusion_mode="clip_like",
+        selected_layer=0,
+        layer_scores={"clip_like_input": 0.0},
+    )
 
 
 def query_text_for_sample(args: argparse.Namespace, sample: dict[str, Any]) -> str:
@@ -277,7 +478,14 @@ def wandb_tags(args: argparse.Namespace, config: dict[str, Any], env: dict[str, 
         f"seed-{args.seed}",
         args.precision,
         "true-token-removal",
+        safe_slug(args.ablation_name),
+        safe_slug(args.ablation_family),
+        f"family-{args.ug_map_family}",
         f"map-{args.ug_map_source}",
+        f"fusion-{args.ug_fusion_mode}",
+        f"roles-{args.ug_role_mode}",
+        f"anchors-{args.ug_anchor_pattern}",
+        f"position-{args.position_mode}",
     ]
     if env and env.get("gpu_name"):
         tags.append(safe_slug(str(env["gpu_name"])))
@@ -395,8 +603,14 @@ def build_result_common(
         "role_labels": selection.role_labels,
         "pruning_implementation": TRUE_REMOVAL_LABEL,
         "ug_map_key": metadata.get("map_key"),
+        "ug_map_family": metadata.get("map_family"),
         "ug_map_source": metadata.get("map_source"),
         "ug_probe_layers": metadata.get("probe_layers"),
+        "ug_fusion_mode": metadata.get("fusion_mode"),
+        "ug_dynamic_layer_metric": metadata.get("dynamic_layer_metric"),
+        "ug_role_mode": metadata.get("role_mode"),
+        "ug_anchor_pattern": metadata.get("anchor_pattern"),
+        "ug_position_mode": metadata.get("position_mode"),
         "ug_budget_split": metadata.get("budget_split"),
         "ug_fused_map_stats": metadata.get("map_stats"),
         "ug_query_token_status": metadata.get("query_token_status"),
@@ -417,23 +631,12 @@ def run(args: argparse.Namespace) -> int:
     args.method = METHOD_NAME
     if args.no_wandb:
         args.wandb = False
-    layers = parse_int_tuple(args.ug_probe_layers)
+    raw_layers = args.ug_probe_layers
     anchor_bins = parse_bins(args.ug_anchor_bins)
     original_tokens = args.image_grid_size * args.image_grid_size
     tokens = target_tokens(args)
     if tokens >= original_tokens:
         raise BaselineError("UG-Prune should be run with fewer than 576 visual tokens; use the full baseline for 576.")
-    selector_config = UGPruneConfig(
-        map_source=args.ug_map_source,
-        probe_layers=layers,
-        target_ratio=args.ug_target_ratio,
-        context_ratio=args.ug_context_ratio,
-        anchor_ratio=args.ug_anchor_ratio,
-        context_radius=args.ug_context_radius,
-        anchor_bins=anchor_bins,
-        nms_radius=args.ug_nms_radius,
-    ).validate()
-    selector = UGPruneSelector(selector_config)
 
     name = run_name(args, tokens)
     run_dir = args.output_root / name
@@ -474,6 +677,34 @@ def run(args: argparse.Namespace) -> int:
             env = env_snapshot(args, model_env)
             env["model_load_latency_s"] = model_load_s
             write_json(run_dir / "run_environment.json", env)
+            final_layer = int(getattr(getattr(model.config, "text_config", None), "num_hidden_layers", 0) or 0)
+            if final_layer <= 0:
+                final_layer = int(getattr(model.config, "num_hidden_layers", 0) or 0)
+            if final_layer <= 0 and "final" in raw_layers.lower():
+                raise BaselineError("Cannot resolve --ug-probe-layers final from model config.")
+            layers = parse_probe_layers(raw_layers, final_layer=final_layer if final_layer > 0 else None)
+            selector_config = UGPruneConfig(
+                map_family=args.ug_map_family,
+                map_source=args.ug_map_source,
+                probe_layers=layers,
+                fusion_mode=args.ug_fusion_mode,
+                dynamic_layer_metric=args.ug_dynamic_layer_metric,
+                role_mode=args.ug_role_mode,
+                target_ratio=args.ug_target_ratio,
+                context_ratio=args.ug_context_ratio,
+                anchor_ratio=args.ug_anchor_ratio,
+                context_radius=args.ug_context_radius,
+                anchor_bins=anchor_bins,
+                anchor_pattern=args.ug_anchor_pattern,
+                nms_radius=args.ug_nms_radius,
+                position_mode=args.position_mode,
+            ).validate()
+            selector = UGPruneSelector(selector_config)
+            config["ug/resolved_probe_layers"] = list(layers)
+            config["ug/final_layer"] = final_layer
+            write_json(run_dir / "config.json", jsonable(config))
+            with (run_dir / "config.yaml").open("w", encoding="utf-8") as handle:
+                yaml.safe_dump(jsonable(config), handle, sort_keys=True)
             tags = wandb_tags(args, config, env)
             wandb_run = init_wandb(args, config, run_dir, tags)
             write_json(run_dir / "wandb_run.json", wandb_run_info(wandb_run, args, config))
@@ -518,17 +749,34 @@ def run(args: argparse.Namespace) -> int:
                     )
                     if not resolution.token_positions:
                         raise BaselineError(f"Query-token resolution failed for sample {sample_id}: {resolution.resolver_status}")
-                    with torch.inference_mode():
-                        hidden_outputs = forward_hidden_states(model, full_inputs)
-                    layer_maps = extract_maps_from_hidden_states(
-                        hidden_outputs.hidden_states,
-                        full_inputs["input_ids"],
-                        image_token_id,
-                        resolution.token_positions,
-                        layers,
-                        grid=args.image_grid_size,
-                    )
-                    fused = fuse_layer_maps(layer_maps, source=args.ug_map_source, layers=layers, grid=args.image_grid_size)
+                    if args.ug_map_family == "unrolled":
+                        with torch.inference_mode():
+                            hidden_outputs = forward_hidden_states(model, full_inputs)
+                        layer_maps = extract_maps_from_hidden_states(
+                            hidden_outputs.hidden_states,
+                            full_inputs["input_ids"],
+                            image_token_id,
+                            resolution.token_positions,
+                            layers,
+                            grid=args.image_grid_size,
+                        )
+                        fused = fuse_layer_maps(
+                            layer_maps,
+                            source=args.ug_map_source,
+                            layers=layers,
+                            grid=args.image_grid_size,
+                            fusion_mode=args.ug_fusion_mode,
+                            dynamic_metric=args.ug_dynamic_layer_metric,
+                        )
+                    else:
+                        fused = clip_like_map_from_inputs(
+                            torch,
+                            full_inputs,
+                            image_token_id,
+                            resolution.token_positions,
+                            source=args.ug_map_source,
+                            grid=args.image_grid_size,
+                        )
                     selection_inputs = UGPruneInputs(
                         fused_map=fused.fused_map,
                         map_stats=fused.stats,
@@ -546,7 +794,7 @@ def run(args: argparse.Namespace) -> int:
                         inputs=selection_inputs,
                     )
                     retained = selection.selected_indices
-                    raw_output, generated_count, latency, diagnostics = generate_answer_true_removal(
+                    raw_output, generated_count, latency, diagnostics = generate_answer_with_position_mode(
                         torch,
                         processor,
                         model,
@@ -556,6 +804,9 @@ def run(args: argparse.Namespace) -> int:
                         max_new_tokens,
                         retained,
                         original_tokens,
+                        position_mode=args.position_mode,
+                        full_input_ids=full_inputs["input_ids"],
+                        image_token_id=image_token_id,
                     )
                     if diagnostics.get("actual_llm_visual_tokens") != tokens:
                         raise BaselineError(f"Actual retained visual tokens {diagnostics.get('actual_llm_visual_tokens')} != target {tokens}.")
@@ -569,6 +820,8 @@ def run(args: argparse.Namespace) -> int:
                     result["ug_full_sequence_length_for_map_extraction"] = full_diag.get("compacted_input_sequence_length")
                     result["ug_query_token_debug"] = resolution.as_dict()
                     result["ug_fused_map_layer_keys"] = list(fused.layer_keys)
+                    result["ug_selected_layer"] = fused.selected_layer
+                    result["ug_layer_scores"] = fused.layer_scores
 
                     if args.task == "grounding":
                         width = int(sample.get("width") or image.size[0])
@@ -643,8 +896,16 @@ def run(args: argparse.Namespace) -> int:
             add_model_efficiency(metrics, model, torch)
             metrics["model/load_latency_s"] = model_load_s
             metrics["tokens/budget_family"] = config["tokens/budget_family"]
+            metrics["ablation/name"] = args.ablation_name
+            metrics["ablation/family"] = args.ablation_family
+            metrics["ug/map_family"] = args.ug_map_family
             metrics["ug/map_source"] = args.ug_map_source
             metrics["ug/probe_layers"] = ",".join(str(layer) for layer in layers)
+            metrics["ug/fusion_mode"] = args.ug_fusion_mode
+            metrics["ug/role_mode"] = args.ug_role_mode
+            metrics["ug/context_radius"] = args.ug_context_radius
+            metrics["ug/anchor_pattern"] = args.ug_anchor_pattern
+            metrics["ug/position_mode"] = args.position_mode
             metrics["ug/map_overlay_count"] = map_overlay_count
             estimate = runtime_estimate(args, run_duration_s)
             metrics.update({key: value for key, value in estimate.items() if key.startswith("runtime/")})

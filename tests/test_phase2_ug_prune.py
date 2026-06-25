@@ -4,7 +4,7 @@ import unittest
 
 import numpy as np
 
-from vlm_pruning.features.map_fusion import fuse_layer_maps, parse_bins, parse_int_tuple
+from vlm_pruning.features.map_fusion import fuse_layer_maps, parse_bins, parse_int_tuple, parse_probe_layers
 from vlm_pruning.features.unrolled_maps import LayerMapResult
 from vlm_pruning.geometry.grid import bin_id, rc_to_patch
 from vlm_pruning.selectors.ug_prune import (
@@ -66,6 +66,31 @@ class Phase2SelectorTests(unittest.TestCase):
         self.assertTrue(role_union.issubset(set(result.selected_indices)))
         self.assertEqual(result.metadata["map_source"], "query_max")
 
+    def test_role_modes_change_role_labels(self) -> None:
+        scores = np.arange(576, dtype=np.float32).reshape(24, 24)
+        target_only = UGPruneSelector(UGPruneConfig(role_mode="target_only")).select_from_map(
+            sample_id="sample",
+            budget=16,
+            original_tokens=576,
+            grid=24,
+            seed=0,
+            inputs=phase2_inputs(scores),
+        )
+        target_context = UGPruneSelector(UGPruneConfig(role_mode="target_context")).select_from_map(
+            sample_id="sample",
+            budget=16,
+            original_tokens=576,
+            grid=24,
+            seed=0,
+            inputs=phase2_inputs(scores),
+        )
+
+        self.assertIn("target", target_only.role_labels)
+        self.assertNotIn("context", target_only.role_labels)
+        self.assertNotIn("anchor", target_only.role_labels)
+        self.assertIn("context", target_context.role_labels)
+        self.assertNotIn("anchor", target_context.role_labels)
+
     def test_target_nms_suppresses_nearby_peak_first(self) -> None:
         scores = np.zeros(576, dtype=np.float32)
         scores[rc_to_patch(5, 5)] = 10.0
@@ -90,10 +115,29 @@ class Phase2SelectorTests(unittest.TestCase):
         anchor_bins = {bin_id(index, bins=(3, 3), grid=24) for index in result.role_labels["anchor"]}
         self.assertGreaterEqual(len(anchor_bins), 6)
 
+    def test_anchor_patterns_are_exact_budget(self) -> None:
+        scores = np.arange(576, dtype=np.float32).reshape(24, 24)
+        for pattern in ["none", "corners", "grid", "fps"]:
+            with self.subTest(pattern=pattern):
+                result = UGPruneSelector(UGPruneConfig(anchor_pattern=pattern)).select_from_map(
+                    sample_id="sample",
+                    budget=58,
+                    original_tokens=576,
+                    grid=24,
+                    seed=0,
+                    inputs=phase2_inputs(scores),
+                )
+                self.assertEqual(len(result.selected_indices), 58)
+                if pattern == "none":
+                    self.assertNotIn("anchor", result.role_labels)
+                else:
+                    self.assertIn("anchor", result.role_labels)
+
 
 class Phase2MapFusionTests(unittest.TestCase):
     def test_parse_helpers(self) -> None:
         self.assertEqual(parse_int_tuple("4,8,12"), (4, 8, 12))
+        self.assertEqual(parse_probe_layers("4,final", final_layer=32), (4, 32))
         self.assertEqual(parse_bins("3,3"), (3, 3))
         with self.assertRaises(ValueError):
             parse_bins("3")
@@ -116,6 +160,47 @@ class Phase2MapFusionTests(unittest.TestCase):
         self.assertEqual(fused.fused_map.shape, (24, 24))
         self.assertEqual(fused.layer_keys, ("layer4:query_max", "layer8:query_max", "layer12:query_max"))
         self.assertIn("entropy_norm", fused.stats)
+
+    def test_fusion_modes(self) -> None:
+        low = np.zeros((24, 24), dtype=np.float32)
+        high = np.zeros((24, 24), dtype=np.float32)
+        low[1, 1] = 2.0
+        high[10, 10] = 20.0
+        maps = [
+            LayerMapResult(4, list(range(576)), [580], {"query_max": low}, {"query_max": low}),
+            LayerMapResult(8, list(range(576)), [580], {"query_max": high}, {"query_max": high}),
+        ]
+
+        single = fuse_layer_maps(maps, source="query_max", layers=(4,), grid=24, fusion_mode="single_layer")
+        hard = fuse_layer_maps(maps, source="query_max", layers=(4, 8), grid=24, fusion_mode="hard_best")
+
+        self.assertEqual(single.selected_layer, 4)
+        self.assertEqual(hard.selected_layer, 8)
+
+
+class Phase2SweepTests(unittest.TestCase):
+    def test_sweep_smoke_generates_expected_commands(self) -> None:
+        from scripts.run_ug_prune_ablation_sweep import build_command, parse_args, selected_ablations
+
+        args = parse_args(
+            [
+                "--smoke",
+                "--datasets",
+                "refcoco",
+                "--budgets",
+                "58",
+                "--ablation-set",
+                "core",
+            ]
+        )
+        ablation = selected_ablations("core")[0]
+        command = build_command("refcoco", 58, ablation, args)
+
+        self.assertIn("--limit", command)
+        self.assertIn("5", command)
+        self.assertIn("--no-wandb", command)
+        self.assertIn("--target-visual-tokens", command)
+        self.assertIn("58", command)
 
 
 if __name__ == "__main__":

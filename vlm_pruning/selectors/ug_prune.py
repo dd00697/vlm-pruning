@@ -2,35 +2,51 @@
 
 from __future__ import annotations
 
-import hashlib
 import math
+import hashlib
 from dataclasses import asdict, dataclass
 from typing import Any, Iterable
 
 import numpy as np
 
 from vlm_pruning.features.map_stats import as_grid_map, map_statistics
-from vlm_pruning.geometry.grid import bin_id, neighbours, patch_to_rc, rc_to_patch, ring
+from vlm_pruning.geometry.grid import bin_id, patch_to_rc, rc_to_patch, ring
 
 from .base import SelectionResult, SelectorError
 
 
 @dataclass(frozen=True)
 class UGPruneConfig:
+    map_family: str = "unrolled"
     map_source: str = "query_max"
     probe_layers: tuple[int, ...] = (4, 8, 12)
+    fusion_mode: str = "soft_average"
+    dynamic_layer_metric: str = "peakiness_minus_entropy"
+    role_mode: str = "target_context_anchor"
     target_ratio: float = 0.50
     context_ratio: float = 0.30
     anchor_ratio: float = 0.20
     context_radius: int = 1
     anchor_bins: tuple[int, int] = (3, 3)
+    anchor_pattern: str = "fps"
     nms_radius: int = 1
+    position_mode: str = "compact"
 
     def validate(self) -> "UGPruneConfig":
         if not self.probe_layers:
             raise SelectorError("UG-Prune requires at least one probe layer.")
         if any(layer <= 0 for layer in self.probe_layers):
             raise SelectorError(f"Probe layers must be positive, got {self.probe_layers}.")
+        if self.map_family not in {"unrolled", "clip"}:
+            raise SelectorError(f"Unsupported map_family: {self.map_family}")
+        if self.map_source not in {"query_max", "query_pooled"}:
+            raise SelectorError(f"Unsupported map_source: {self.map_source}")
+        if self.fusion_mode not in {"soft_average", "hard_best", "single_layer"}:
+            raise SelectorError(f"Unsupported fusion_mode: {self.fusion_mode}")
+        if self.dynamic_layer_metric != "peakiness_minus_entropy":
+            raise SelectorError(f"Unsupported dynamic_layer_metric: {self.dynamic_layer_metric}")
+        if self.role_mode not in {"target_only", "target_context", "target_context_anchor"}:
+            raise SelectorError(f"Unsupported role_mode: {self.role_mode}")
         ratios = [self.target_ratio, self.context_ratio, self.anchor_ratio]
         if any(value < 0.0 for value in ratios):
             raise SelectorError(f"UG-Prune ratios must be non-negative, got {ratios}.")
@@ -42,6 +58,10 @@ class UGPruneConfig:
             raise SelectorError(f"nms_radius must be non-negative, got {self.nms_radius}.")
         if self.anchor_bins[0] <= 0 or self.anchor_bins[1] <= 0:
             raise SelectorError(f"anchor_bins must be positive, got {self.anchor_bins}.")
+        if self.anchor_pattern not in {"none", "corners", "grid", "fps"}:
+            raise SelectorError(f"Unsupported anchor_pattern: {self.anchor_pattern}")
+        if self.position_mode not in {"compact", "raster_compact", "gap_preserving"}:
+            raise SelectorError(f"Unsupported position_mode: {self.position_mode}")
         return self
 
     def as_dict(self) -> dict[str, Any]:
@@ -99,6 +119,24 @@ def budget_split(budget: int, config: UGPruneConfig) -> tuple[int, int, int]:
     config.validate()
     if budget <= 0:
         raise SelectorError(f"budget must be positive, got {budget}.")
+    if config.role_mode == "target_only":
+        return budget, 0, 0
+    if config.role_mode == "target_context" or config.anchor_pattern == "none":
+        total_tc = config.target_ratio + config.context_ratio
+        if total_tc <= 0.0:
+            return budget, 0, 0
+        target = max(1, int(math.floor(budget * config.target_ratio / total_tc)))
+        context = budget - target
+        if budget >= 16 and config.context_ratio > 0:
+            context = max(1, context)
+        while target + context > budget:
+            if context > (1 if budget >= 16 and config.context_ratio > 0 else 0):
+                context -= 1
+            else:
+                target -= 1
+        while target + context < budget:
+            target += 1
+        return target, context, 0
     total = config.target_ratio + config.context_ratio + config.anchor_ratio
     target = int(math.floor(budget * config.target_ratio / total))
     context = int(math.floor(budget * config.context_ratio / total))
@@ -168,15 +206,35 @@ def _min_distance_sq(index: int, selected: set[int], grid: int) -> float:
     return min((row - r) ** 2 + (col - c) ** 2 for r, c in (_patch_center(item, grid) for item in selected))
 
 
-def select_anchors(
-    scores: np.ndarray,
-    count: int,
-    *,
-    exclude: set[int],
-    bins: tuple[int, int],
-    grid: int,
-) -> list[int]:
-    selected: set[int] = set(exclude)
+def _append_unique(out: list[int], selected: set[int], index: int) -> bool:
+    if index in selected:
+        return False
+    out.append(index)
+    selected.add(index)
+    return True
+
+
+def _corner_candidates(grid: int) -> list[int]:
+    return [
+        rc_to_patch(0, 0, grid),
+        rc_to_patch(0, grid - 1, grid),
+        rc_to_patch(grid - 1, 0, grid),
+        rc_to_patch(grid - 1, grid - 1, grid),
+    ]
+
+
+def _grid_candidates(bins: tuple[int, int], grid: int) -> list[int]:
+    row_bins, col_bins = bins
+    candidates: list[int] = []
+    for brow in range(row_bins):
+        row = min(grid - 1, int(round((brow + 0.5) * grid / row_bins - 0.5)))
+        for bcol in range(col_bins):
+            col = min(grid - 1, int(round((bcol + 0.5) * grid / col_bins - 0.5)))
+            candidates.append(rc_to_patch(row, col, grid))
+    return candidates
+
+
+def _fps_anchors(scores: np.ndarray, count: int, *, selected: set[int], bins: tuple[int, int], grid: int) -> list[int]:
     anchors: list[int] = []
     while len(anchors) < count:
         candidates = [index for index in range(scores.size) if index not in selected]
@@ -197,6 +255,35 @@ def select_anchors(
         )
         anchors.append(best)
         selected.add(best)
+    return anchors
+
+
+def select_anchors(
+    scores: np.ndarray,
+    count: int,
+    *,
+    exclude: set[int],
+    bins: tuple[int, int],
+    grid: int,
+    pattern: str = "fps",
+) -> list[int]:
+    if count <= 0 or pattern == "none":
+        return []
+    selected: set[int] = set(exclude)
+    anchors: list[int] = []
+    if pattern == "corners":
+        for index in _corner_candidates(grid):
+            _append_unique(anchors, selected, index)
+            if len(anchors) == count:
+                return anchors
+    elif pattern == "grid":
+        for index in _grid_candidates(bins, grid):
+            _append_unique(anchors, selected, index)
+            if len(anchors) == count:
+                return anchors
+    elif pattern != "fps":
+        raise SelectorError(f"Unsupported anchor pattern: {pattern}")
+    anchors.extend(_fps_anchors(scores, count - len(anchors), selected=selected, bins=bins, grid=grid))
     return anchors
 
 
@@ -231,6 +318,7 @@ class UGPruneSelector:
             exclude=set(target) | set(context),
             bins=self.config.anchor_bins,
             grid=grid,
+            pattern=self.config.anchor_pattern,
         )
 
         roles = {
@@ -264,6 +352,7 @@ class UGPruneSelector:
                 "selector_family": "ug_prune_training_free",
                 "sample_id": sample_id,
                 "config": self.config.as_dict(),
+                "map_family": self.config.map_family,
                 "budget_split": {
                     "target": target_count,
                     "context": context_count,
@@ -273,6 +362,11 @@ class UGPruneSelector:
                 "map_key": inputs.map_key,
                 "map_source": self.config.map_source,
                 "probe_layers": list(self.config.probe_layers),
+                "fusion_mode": self.config.fusion_mode,
+                "dynamic_layer_metric": self.config.dynamic_layer_metric,
+                "role_mode": self.config.role_mode,
+                "anchor_pattern": self.config.anchor_pattern,
+                "position_mode": self.config.position_mode,
                 "map_stats": inputs.map_stats or map_statistics(scores_2d, grid=grid),
                 "query_text": inputs.query_text,
                 "query_token_status": inputs.query_token_status,
@@ -283,4 +377,3 @@ class UGPruneSelector:
             },
         )
         return result.validate()
-
