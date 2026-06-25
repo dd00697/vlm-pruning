@@ -1,0 +1,17 @@
+"""Feature extraction helpers for Phase 1 diagnostics."""
+
+from .map_stats import map_statistics, pearson_correlation, top_k_indices, zscore_normalise
+from .query_tokens import QueryTokenResolution, resolve_query_token_positions
+from .unrolled_maps import LayerMapResult, extract_maps_from_hidden_states
+
+__all__ = [
+    "LayerMapResult",
+    "QueryTokenResolution",
+    "extract_maps_from_hidden_states",
+    "map_statistics",
+    "pearson_correlation",
+    "resolve_query_token_positions",
+    "top_k_indices",
+    "zscore_normalise",
+]
+
