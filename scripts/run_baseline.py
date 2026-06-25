@@ -809,12 +809,14 @@ def init_wandb(args: argparse.Namespace, config: dict[str, Any], run_dir: Path) 
 
         return wandb.init(project=args.wandb_project, name=config["run_name"], config=config, dir=str(run_dir), reinit=True)
     except Exception as exc:
-        print(f"W&B logging unavailable; continuing with local logging ({type(exc).__name__}: {exc}).")
+        print(f"W&B logging failed; continuing with local outputs. {type(exc).__name__}: {exc}")
         return None
 
 
 def update_summary_table(config: dict[str, Any], metrics: dict[str, Any], tables_root: Path) -> None:
     tables_root.mkdir(parents=True, exist_ok=True)
+    if config.get("limit") is not None:
+        return
     is_true_removal = config.get("pruning_implementation") == TRUE_REMOVAL_LABEL
     if is_true_removal:
         table_name = "true_removal_grounding.csv" if config["task"] == "grounding" else "true_removal_vqa.csv"
