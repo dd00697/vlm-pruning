@@ -469,17 +469,24 @@ def load_model(model_id: str, offload_dir: Path, quantization: str) -> tuple[Any
         except Exception as exc:
             raise BaselineError(f"Quantized loading requested but BitsAndBytesConfig is unavailable: {exc}") from exc
         if quantization == "4bit":
+            double_quant = os.environ.get("VLM_PRUNING_BNB_4BIT_USE_DOUBLE_QUANT", "1").lower() not in {"0", "false", "no"}
+            quant_type = os.environ.get("VLM_PRUNING_BNB_4BIT_QUANT_TYPE", "nf4")
             kwargs["quantization_config"] = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_compute_dtype=dtype,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=double_quant,
+                bnb_4bit_quant_type=quant_type,
             )
         elif quantization == "8bit":
-            kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+            int8_cpu_offload = os.environ.get("VLM_PRUNING_INT8_CPU_OFFLOAD", "0").lower() in {"1", "true", "yes"}
+            kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_8bit=True,
+                llm_int8_enable_fp32_cpu_offload=int8_cpu_offload,
+            )
     if torch.cuda.is_available():
         free_bytes, _total_bytes = torch.cuda.mem_get_info()
-        gpu_limit_mib = max(1024, int((free_bytes / (1024**2)) * 0.85))
+        memory_fraction = float(os.environ.get("VLM_PRUNING_GPU_MEMORY_FRACTION", "0.85"))
+        gpu_limit_mib = max(1024, int((free_bytes / (1024**2)) * memory_fraction))
         offload_dir.mkdir(parents=True, exist_ok=True)
         kwargs["device_map"] = "auto"
         kwargs["max_memory"] = {0: f"{gpu_limit_mib}MiB", "cpu": "64GiB"}
@@ -802,17 +809,12 @@ def init_wandb(args: argparse.Namespace, config: dict[str, Any], run_dir: Path) 
 
         return wandb.init(project=args.wandb_project, name=config["run_name"], config=config, dir=str(run_dir), reinit=True)
     except Exception as exc:
-        print(f"W&B logging failed unexpectedly; continuing with local logging. Error: {type(exc).__name__}: {exc}")
-        print("To re-enable online logging, run:")
-        print("wandb login")
-        print('$env:WANDB_PROJECT="vlm-pruning"')
+        print(f"W&B logging unavailable; continuing with local logging ({type(exc).__name__}: {exc}).")
         return None
 
 
 def update_summary_table(config: dict[str, Any], metrics: dict[str, Any], tables_root: Path) -> None:
     tables_root.mkdir(parents=True, exist_ok=True)
-    if str(config.get("run_name") or "").startswith("smoke"):
-        return
     is_true_removal = config.get("pruning_implementation") == TRUE_REMOVAL_LABEL
     if is_true_removal:
         table_name = "true_removal_grounding.csv" if config["task"] == "grounding" else "true_removal_vqa.csv"
