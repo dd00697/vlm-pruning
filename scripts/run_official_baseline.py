@@ -23,6 +23,8 @@ from PIL import Image
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
@@ -39,9 +41,10 @@ from run_baseline import (  # noqa: E402
     kv_cache_memory_mb,
     llm_prefill_flops,
     parse_box,
-    retained_indices,
     save_grounding_figure,
 )
+from vlm_pruning.analysis.coverage import selection_diagnostics  # noqa: E402
+from vlm_pruning.selectors import SelectionResult, SelectorError, selector_for_method  # noqa: E402
 
 
 DEFAULT_PROJECT = "vlm-pruning"
@@ -892,7 +895,18 @@ def completed_run_matches(run_dir: Path, args: argparse.Namespace, tokens: int, 
     return all(checks)
 
 
-def build_result_common(args: argparse.Namespace, sample: dict[str, Any], image_path: Path, raw_output: str, generated_count: int, latency: float, retained: list[int], diagnostics: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+def build_result_common(
+    args: argparse.Namespace,
+    sample: dict[str, Any],
+    image_path: Path,
+    raw_output: str,
+    generated_count: int,
+    latency: float,
+    selection: SelectionResult,
+    diagnostics: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    retained = selection.selected_indices
     result = {
         "sample_id": str(sample["sample_id"]),
         "dataset": args.dataset,
@@ -908,6 +922,9 @@ def build_result_common(args: argparse.Namespace, sample: dict[str, Any], image_
         "generated_token_count": generated_count,
         "retained_indices_checksum": indices_checksum(retained),
         "retained_indices": retained,
+        "selector_name": selection.method,
+        "selector_metadata": selection.as_metadata(),
+        "role_labels": selection.role_labels,
         "pruning_implementation": TRUE_REMOVAL_LABEL,
     }
     result.update(diagnostics)
@@ -919,6 +936,10 @@ def run(args: argparse.Namespace) -> int:
     tokens = target_tokens(args)
     if args.method == "full" and tokens != original_tokens:
         raise BaselineError("Full-token runs must retain all 576 visual tokens.")
+    try:
+        selector = selector_for_method(args.method)
+    except SelectorError as exc:
+        raise BaselineError(str(exc)) from exc
     name = run_name(args, tokens)
     run_dir = args.output_root / name
     figures_dir = args.figures_root / name
@@ -939,6 +960,8 @@ def run(args: argparse.Namespace) -> int:
             config = config_payload(args, name, original_tokens, tokens, checksum)
             config["dataset/num_samples"] = len(rows)
             config["run/output_dir"] = str(run_dir)
+            config["selector/name"] = selector.name
+            config["selector/interface_version"] = "phase0"
             write_json(run_dir / "config.json", config)
             with (run_dir / "config.yaml").open("w", encoding="utf-8") as handle:
                 yaml.safe_dump(config, handle, sort_keys=True)
@@ -971,7 +994,17 @@ def run(args: argparse.Namespace) -> int:
                     sample_id = str(sample["sample_id"])
                     image_path = Path(sample["image_path"])
                     image = Image.open(image_path).convert("RGB")
-                    retained = retained_indices(args.method, tokens, original_tokens, args.seed, sample_id, args.image_grid_size)
+                    try:
+                        selection = selector.select(
+                            sample_id=sample_id,
+                            budget=tokens,
+                            original_tokens=original_tokens,
+                            grid=args.image_grid_size,
+                            seed=args.seed,
+                        )
+                    except SelectorError as exc:
+                        raise BaselineError(str(exc)) from exc
+                    retained = selection.selected_indices
                     prompt = make_prompt(args, sample)
                     raw_output, generated_count, latency, diagnostics = generate_answer_true_removal(
                         torch,
@@ -986,7 +1019,13 @@ def run(args: argparse.Namespace) -> int:
                     )
                     if diagnostics.get("actual_llm_visual_tokens") != tokens:
                         raise BaselineError(f"Actual retained visual tokens {diagnostics.get('actual_llm_visual_tokens')} != target {tokens}.")
-                    result = build_result_common(args, sample, image_path, raw_output, generated_count, latency, retained, diagnostics, config)
+                    if args.method != "full" and diagnostics.get("compacted_input_sequence_length", 0) >= diagnostics.get("original_input_sequence_length", 0):
+                        raise BaselineError(
+                            "True token removal did not shorten the input sequence: "
+                            f"original={diagnostics.get('original_input_sequence_length')} "
+                            f"compacted={diagnostics.get('compacted_input_sequence_length')}"
+                        )
+                    result = build_result_common(args, sample, image_path, raw_output, generated_count, latency, selection, diagnostics, config)
                     if args.task == "grounding":
                         width = int(sample.get("width") or image.size[0])
                         height = int(sample.get("height") or image.size[1])
@@ -1007,6 +1046,7 @@ def run(args: argparse.Namespace) -> int:
                                 "parse_failure_reason": parse_failure,
                             }
                         )
+                        result.update(selection_diagnostics(retained, sample["gt_box"], (width, height), args.image_grid_size))
                         if len(figure_paths) < args.max_figures:
                             figure_paths.append(
                                 save_grounding_figure(
