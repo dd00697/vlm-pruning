@@ -144,6 +144,30 @@ Sweep helpers:
 .\scripts\run_official_nuwa_matched_baselines.ps1 -Limit 500 -Seed 0
 ```
 
+## UG-Prune Focused Ablation Sweep
+
+Generate the 58-token focused ablation commands for RefCOCO-500, POPE-2500,
+and TextVQA-2500 without executing them:
+
+```bash
+python scripts/run_ug_prune_ablation_sweep.py \
+  --datasets refcoco,pope,textvqa \
+  --budgets 58 \
+  --ablation-set focused \
+  --precision bf16 \
+  --wandb \
+  --wandb-mode online \
+  --wandb-project vlm-pruning \
+  --wandb-group ug-prune-ablate-58-focused \
+  --wandb-job-type ablation-58 \
+  --resume \
+  --skip-existing
+```
+
+Add `--execute` to run the sweep. If W&B online is unavailable, change
+`--wandb-mode online` to `--wandb-mode offline`; individual runs also retry
+offline automatically if online W&B initialization fails.
+
 ## Summaries
 
 Aggregate official baseline tables and reports:
