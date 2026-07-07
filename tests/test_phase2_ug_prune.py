@@ -202,6 +202,66 @@ class Phase2SweepTests(unittest.TestCase):
         self.assertIn("--target-visual-tokens", command)
         self.assertIn("58", command)
 
+    def test_focused_ablation_set_matches_planned_order(self) -> None:
+        from scripts.run_ug_prune_ablation_sweep import selected_ablations
+
+        self.assertEqual(
+            [item.name for item in selected_ablations("focused")],
+            [
+                "role_target_only",
+                "role_target_context",
+                "role_target_context_anchor",
+                "map_query_max",
+                "map_query_pooled",
+                "layer_4",
+                "layer_8",
+                "layer_12",
+                "layer_soft_4_8_12",
+                "fusion_hard_best",
+                "position_compact",
+                "position_raster_compact",
+                "position_gap_preserving",
+                "anchor_none",
+                "anchor_fps",
+            ],
+        )
+
+    def test_focused_sweep_uses_existing_manifest_default_limit_and_wandb_group(self) -> None:
+        from scripts.run_ug_prune_ablation_sweep import build_command, parse_args, selected_ablations
+
+        args = parse_args(
+            [
+                "--datasets",
+                "textvqa",
+                "--budgets",
+                "58",
+                "--ablation-set",
+                "focused",
+                "--wandb",
+                "--wandb-mode",
+                "online",
+                "--wandb-group",
+                "ug-prune-ablate-58-focused",
+                "--wandb-job-type",
+                "ablation-58",
+                "--resume",
+                "--skip-existing",
+            ]
+        )
+        ablation = [item for item in selected_ablations("focused") if item.name == "position_gap_preserving"][0]
+        command = build_command("textvqa", 58, ablation, args)
+
+        self.assertEqual(
+            command[command.index("--manifest") + 1],
+            "data/manifests/official_baselines/textvqa_validation.jsonl",
+        )
+        self.assertEqual(command[command.index("--limit") + 1], "2500")
+        self.assertIn("--wandb", command)
+        self.assertEqual(command[command.index("--wandb-group") + 1], "ug-prune-ablate-58-focused")
+        self.assertEqual(command[command.index("--wandb-job-type") + 1], "ablation-58")
+        self.assertIn("--resume", command)
+        self.assertIn("--skip-existing", command)
+
 
 if __name__ == "__main__":
     unittest.main()

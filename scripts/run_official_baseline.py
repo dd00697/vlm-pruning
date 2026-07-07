@@ -36,11 +36,14 @@ from run_baseline import (  # noqa: E402
     BaselineError,
     Tee,
     box_iou,
+    cuda_sync,
+    eos_token_ids,
     generate_answer_true_removal,
     indices_checksum,
     kv_cache_memory_mb,
     llm_prefill_flops,
     parse_box,
+    prepare_compacted_inputs,
     save_grounding_figure,
 )
 from vlm_pruning.analysis.coverage import selection_diagnostics  # noqa: E402
@@ -76,6 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int)
     parser.add_argument("--max-figures", type=int, default=24)
     parser.add_argument("--box-coordinate-mode", default="normalized_0_1", choices=["normalized_0_1", "normalized_0_1000", "absolute_pixels"])
+    parser.add_argument("--position-mode", default="compact", choices=["compact", "raster_compact", "gap_preserving"])
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--wandb", action="store_true")
@@ -572,6 +576,7 @@ def config_payload(args: argparse.Namespace, name: str, original_tokens: int, to
         "run/output_dir": None,
         "pruning_implementation": TRUE_REMOVAL_LABEL,
         "pruning_location": TRUE_REMOVAL_LOCATION,
+        "position_mode": args.position_mode,
         "evaluator/name": evaluator_name(args.dataset, args.task),
         "evaluator/metric_definition": metric_definition(args.dataset, args.task),
         "limit": args.limit,
@@ -597,6 +602,143 @@ def metric_definition(dataset: str, task: str) -> str:
     if dataset.lower() == "pope":
         return "Normalize yes/no answers and compute accuracy, precision, recall, F1, and yes-rate."
     return "Dataset manifest driven scoring: multiple-choice accuracy when choices exist, otherwise normalized exact match."
+
+
+def model_forward(model: Any, kwargs: dict[str, Any], *, require_position_ids: bool = False) -> Any:
+    try:
+        return model(**kwargs, logits_to_keep=1)
+    except TypeError:
+        try:
+            return model(**kwargs)
+        except TypeError as retry_exc:
+            if require_position_ids and "position_ids" in kwargs:
+                raise BaselineError(
+                    f"Model rejected explicit position_ids required for gap_preserving mode: {retry_exc}"
+                ) from retry_exc
+            raise
+
+
+def gap_position_ids(torch: Any, full_input_ids: Any, image_token_id: int, retained: list[int]) -> Any:
+    image_positions = torch.nonzero(full_input_ids[0] == int(image_token_id), as_tuple=False).flatten()
+    keep = torch.tensor(sorted(retained), dtype=torch.long, device=full_input_ids.device)
+    keep_mask = torch.ones(full_input_ids.shape[1], dtype=torch.bool, device=full_input_ids.device)
+    keep_mask[image_positions] = False
+    keep_mask[image_positions[keep]] = True
+    selected_positions = torch.nonzero(keep_mask, as_tuple=False).flatten()
+    return selected_positions.unsqueeze(0).to(device=full_input_ids.device, dtype=torch.long)
+
+
+def greedy_decode_from_embeds_position_mode(
+    torch: Any,
+    processor: Any,
+    model: Any,
+    compacted: dict[str, Any],
+    max_new_tokens: int,
+    *,
+    require_position_ids: bool = False,
+) -> tuple[str, int, float, float]:
+    generated_ids: list[Any] = []
+    eos_ids = eos_token_ids(model, processor)
+    attention_mask = compacted["attention_mask"]
+    position_ids = compacted.get("position_ids")
+    next_position_id = None
+    if position_ids is not None:
+        next_position_id = int(position_ids[0, -1].item()) + 1
+    cuda_sync(torch)
+    prefill_start = time.perf_counter()
+    with torch.inference_mode():
+        kwargs = {
+            "inputs_embeds": compacted["inputs_embeds"],
+            "attention_mask": attention_mask,
+            "use_cache": True,
+            "return_dict": True,
+        }
+        if position_ids is not None:
+            kwargs["position_ids"] = position_ids
+        outputs = model_forward(model, kwargs, require_position_ids=require_position_ids)
+        next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+    cuda_sync(torch)
+    prefill_latency = time.perf_counter() - prefill_start
+    generated_ids.append(next_token)
+    past_key_values = outputs.past_key_values
+    finished = bool(eos_ids and int(next_token.item()) in eos_ids)
+
+    cuda_sync(torch)
+    decode_start = time.perf_counter()
+    with torch.inference_mode():
+        while len(generated_ids) < max_new_tokens and not finished:
+            attention_mask = torch.cat([attention_mask, torch.ones_like(next_token)], dim=1)
+            kwargs = {
+                "input_ids": next_token,
+                "attention_mask": attention_mask,
+                "past_key_values": past_key_values,
+                "use_cache": True,
+                "return_dict": True,
+            }
+            if next_position_id is not None:
+                kwargs["position_ids"] = torch.full_like(next_token, next_position_id)
+                next_position_id += 1
+            outputs = model_forward(model, kwargs, require_position_ids=require_position_ids)
+            past_key_values = outputs.past_key_values
+            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+            generated_ids.append(next_token)
+            finished = bool(eos_ids and int(next_token.item()) in eos_ids)
+    cuda_sync(torch)
+    decode_latency = time.perf_counter() - decode_start
+
+    generated = torch.cat(generated_ids, dim=1)[0] if generated_ids else torch.empty(0, dtype=torch.long)
+    decoded = processor.decode(generated, skip_special_tokens=True).strip()
+    return decoded, int(generated.numel()), prefill_latency, decode_latency
+
+
+def generate_answer_true_removal_position_mode(
+    torch: Any,
+    processor: Any,
+    model: Any,
+    device: Any,
+    image: Image.Image,
+    prompt: str,
+    max_new_tokens: int,
+    retained: list[int],
+    expected_original_tokens: int,
+    *,
+    position_mode: str,
+) -> tuple[str, int, float, dict[str, Any]]:
+    retained_for_mode = sorted(retained) if position_mode in {"raster_compact", "gap_preserving"} else retained
+    compacted, diagnostics = prepare_compacted_inputs(
+        torch, processor, model, device, image, prompt, retained_for_mode, expected_original_tokens
+    )
+    if position_mode == "gap_preserving":
+        compacted["position_ids"] = compacted["selected_positions"].unsqueeze(0).to(
+            device=compacted["inputs_embeds"].device,
+            dtype=torch.long,
+        )
+        diagnostics["position_ids_mode"] = "gap_preserving"
+        diagnostics["position_ids_first"] = int(compacted["position_ids"][0, 0].item())
+        diagnostics["position_ids_last"] = int(compacted["position_ids"][0, -1].item())
+    else:
+        diagnostics["position_ids_mode"] = position_mode
+    raw_output, generated_count, prefill_latency, decode_latency = greedy_decode_from_embeds_position_mode(
+        torch,
+        processor,
+        model,
+        compacted,
+        max_new_tokens,
+        require_position_ids=position_mode == "gap_preserving",
+    )
+    diagnostics["llm_prefill_latency_s"] = prefill_latency
+    diagnostics["prefill_latency_s"] = prefill_latency
+    diagnostics["time_to_first_token_s"] = prefill_latency
+    diagnostics["decode_latency_s"] = decode_latency
+    total_latency = (
+        diagnostics["vision_encoder_latency_s"]
+        + diagnostics["projector_latency_s"]
+        + diagnostics["pruning_selection_latency_s"]
+        + prefill_latency
+        + decode_latency
+    )
+    diagnostics["total_inference_latency_s"] = total_latency
+    return raw_output, generated_count, total_latency, diagnostics
 
 
 def init_wandb(args: argparse.Namespace, config: dict[str, Any], run_dir: Path, tags: list[str]) -> Any | None:
@@ -652,6 +794,7 @@ def wandb_tags(args: argparse.Namespace, config: dict[str, Any], env: dict[str, 
         args.precision,
         "llava-1.5-7b" if "1.5-7b" in args.model_path.lower() else safe_slug(args.model_path),
         "true-token-removal",
+        f"position-{args.position_mode}",
     ]
     if env and env.get("gpu_name"):
         tags.append(safe_slug(str(env["gpu_name"])))
@@ -890,6 +1033,7 @@ def completed_run_matches(run_dir: Path, args: argparse.Namespace, tokens: int, 
         int(config.get("tokens/actual_visual_tokens", -1)) == int(tokens),
         config.get("model/precision") == args.precision,
         config.get("limit") == args.limit,
+        config.get("position_mode", "compact") == args.position_mode,
         int(metrics.get("samples/evaluated", -1)) == int(row_count),
     ]
     return all(checks)
@@ -1006,7 +1150,7 @@ def run(args: argparse.Namespace) -> int:
                         raise BaselineError(str(exc)) from exc
                     retained = selection.selected_indices
                     prompt = make_prompt(args, sample)
-                    raw_output, generated_count, latency, diagnostics = generate_answer_true_removal(
+                    raw_output, generated_count, latency, diagnostics = generate_answer_true_removal_position_mode(
                         torch,
                         processor,
                         model,
@@ -1016,6 +1160,7 @@ def run(args: argparse.Namespace) -> int:
                         max_new_tokens,
                         retained,
                         original_tokens,
+                        position_mode=args.position_mode,
                     )
                     if diagnostics.get("actual_llm_visual_tokens") != tokens:
                         raise BaselineError(f"Actual retained visual tokens {diagnostics.get('actual_llm_visual_tokens')} != target {tokens}.")
@@ -1085,6 +1230,7 @@ def run(args: argparse.Namespace) -> int:
             add_model_efficiency(metrics, model, torch)
             metrics["model/load_latency_s"] = model_load_s
             metrics["tokens/budget_family"] = config["tokens/budget_family"]
+            metrics["position_mode"] = args.position_mode
             estimate = runtime_estimate(args, run_duration_s)
             metrics.update({key: value for key, value in estimate.items() if key.startswith("runtime/")})
             add_relative_metrics(metrics, config, args.tables_root)

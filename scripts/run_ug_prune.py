@@ -445,10 +445,13 @@ def init_wandb(args: argparse.Namespace, config: dict[str, Any], run_dir: Path, 
         return None
     try:
         import wandb
+    except Exception as exc:
+        print(f"W&B import failed; continuing with local outputs. {type(exc).__name__}: {exc}")
+        return None
 
+    def init_with_mode(mode: str) -> Any:
         os.environ.setdefault("WANDB_PROJECT", args.wandb_project)
-        if args.wandb_mode:
-            os.environ["WANDB_MODE"] = args.wandb_mode
+        os.environ["WANDB_MODE"] = mode
         kwargs = {
             "project": args.wandb_project,
             "name": config["run_name"],
@@ -458,11 +461,26 @@ def init_wandb(args: argparse.Namespace, config: dict[str, Any], run_dir: Path, 
             "tags": tags,
             "group": args.wandb_group or f"ug-prune-{safe_slug(args.dataset)}",
             "job_type": args.wandb_job_type or f"ug-prune-budget-{config['tokens/actual_visual_tokens']}",
+            "mode": mode,
         }
         if args.wandb_entity:
             kwargs["entity"] = args.wandb_entity
         return wandb.init(**kwargs)
+
+    try:
+        return init_with_mode(args.wandb_mode)
     except Exception as exc:
+        if args.wandb_mode == "online":
+            print(f"W&B online init failed; retrying offline. {type(exc).__name__}: {exc}")
+            try:
+                args.wandb_mode = "offline"
+                return init_with_mode("offline")
+            except Exception as offline_exc:
+                print(
+                    "W&B offline init failed; continuing with local outputs. "
+                    f"{type(offline_exc).__name__}: {offline_exc}"
+                )
+                return None
         print(f"W&B init failed; continuing with local outputs. {type(exc).__name__}: {exc}")
         return None
 

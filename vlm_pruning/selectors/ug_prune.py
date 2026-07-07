@@ -31,6 +31,8 @@ class UGPruneConfig:
     anchor_pattern: str = "fps"
     nms_radius: int = 1
     position_mode: str = "compact"
+    selection_strategy: str = "standard"
+    zip_alpha: float = 0.20
 
     def validate(self) -> "UGPruneConfig":
         if not self.probe_layers:
@@ -62,6 +64,10 @@ class UGPruneConfig:
             raise SelectorError(f"Unsupported anchor_pattern: {self.anchor_pattern}")
         if self.position_mode not in {"compact", "raster_compact", "gap_preserving"}:
             raise SelectorError(f"Unsupported position_mode: {self.position_mode}")
+        if self.selection_strategy not in {"standard", "coverage", "coverage_zip"}:
+            raise SelectorError(f"Unsupported selection_strategy: {self.selection_strategy}")
+        if not 0.0 <= float(self.zip_alpha) <= 1.0:
+            raise SelectorError(f"zip_alpha must be in [0, 1], got {self.zip_alpha}.")
         return self
 
     def as_dict(self) -> dict[str, Any]:
@@ -176,6 +182,89 @@ def select_target(scores: np.ndarray, count: int, *, nms_radius: int, grid: int)
     return selected
 
 
+def _normalised_scores(scores: np.ndarray) -> np.ndarray:
+    values = scores.astype(np.float32, copy=False).reshape(-1)
+    std = float(values.std())
+    if std < 1e-6:
+        return np.zeros_like(values, dtype=np.float32)
+    return (values - float(values.mean())) / std
+
+
+def _distance_bonus(index: int, selected: set[int], grid: int) -> float:
+    max_dist = max((2.0**0.5) * float(grid - 1), 1.0)
+    if not selected:
+        row, col = _patch_center(index, grid)
+        center = float(grid) / 2.0
+        return min(((row - center) ** 2 + (col - center) ** 2) ** 0.5 / max_dist, 1.0)
+    return min(_min_distance_sq(index, selected, grid) ** 0.5 / max_dist, 1.0)
+
+
+def _coverage_rank(
+    scores: np.ndarray,
+    candidates: Iterable[int],
+    *,
+    selected: set[int],
+    bins: tuple[int, int],
+    grid: int,
+    uncovered_weight: float = 0.35,
+    distance_weight: float = 0.15,
+) -> list[int]:
+    values = _normalised_scores(scores)
+    occupancy: dict[tuple[int, int], int] = {}
+    for index in selected:
+        key = bin_id(index, bins=bins, grid=grid)
+        occupancy[key] = occupancy.get(key, 0) + 1
+
+    return sorted(
+        {int(index) for index in candidates},
+        key=lambda idx: (
+            -(
+                float(values[idx])
+                + float(uncovered_weight) * (1.0 if occupancy.get(bin_id(idx, bins=bins, grid=grid), 0) == 0 else 0.0)
+                + float(distance_weight) * _distance_bonus(idx, selected, grid)
+            ),
+            idx,
+        ),
+    )
+
+
+def select_coverage_target(
+    scores: np.ndarray,
+    count: int,
+    *,
+    nms_radius: int,
+    bins: tuple[int, int],
+    grid: int,
+) -> list[int]:
+    selected: list[int] = []
+    selected_set: set[int] = set()
+    suppressed: set[int] = set()
+    for _ in range(int(count)):
+        candidates = [index for index in range(scores.size) if index not in suppressed]
+        if not candidates:
+            break
+        index = _coverage_rank(scores, candidates, selected=selected_set, bins=bins, grid=grid)[0]
+        selected.append(index)
+        selected_set.add(index)
+        if nms_radius > 0:
+            row, col = patch_to_rc(index, grid)
+            for candidate in range(scores.size):
+                crow, ccol = patch_to_rc(candidate, grid)
+                if max(abs(row - crow), abs(col - ccol)) <= nms_radius:
+                    suppressed.add(candidate)
+        else:
+            suppressed.add(index)
+
+    if len(selected) < int(count):
+        for index in _coverage_rank(scores, range(scores.size), selected=selected_set, bins=bins, grid=grid):
+            if index not in selected_set:
+                selected.append(index)
+                selected_set.add(index)
+                if len(selected) == int(count):
+                    break
+    return selected
+
+
 def select_context(scores: np.ndarray, target: list[int], count: int, *, radius: int, grid: int) -> list[int]:
     if count <= 0:
         return []
@@ -287,6 +376,62 @@ def select_anchors(
     return anchors
 
 
+def select_coverage_anchors(
+    scores: np.ndarray,
+    count: int,
+    *,
+    exclude: set[int],
+    bins: tuple[int, int],
+    grid: int,
+) -> list[int]:
+    selected = set(exclude)
+    anchors: list[int] = []
+    while len(anchors) < int(count):
+        candidates = [index for index in range(scores.size) if index not in selected]
+        if not candidates:
+            break
+        index = _coverage_rank(
+            scores,
+            candidates,
+            selected=selected,
+            bins=bins,
+            grid=grid,
+            uncovered_weight=0.75,
+            distance_weight=0.25,
+        )[0]
+        anchors.append(index)
+        selected.add(index)
+    return anchors
+
+
+def selected_spread_stats(indices: Iterable[int], *, bins: tuple[int, int], grid: int) -> dict[str, float | int]:
+    selected = sorted({int(index) for index in indices})
+    if not selected:
+        return {
+            "selected_occupied_bins_3x3": 0,
+            "selected_row_span": 0,
+            "selected_col_span": 0,
+            "selected_mean_pairwise_spread": 0.0,
+        }
+    rows_cols = [patch_to_rc(index, grid) for index in selected]
+    rows = np.asarray([row for row, _ in rows_cols], dtype=np.float32)
+    cols = np.asarray([col for _, col in rows_cols], dtype=np.float32)
+    coords = np.stack([rows, cols], axis=1)
+    if len(selected) > 1:
+        diffs = coords[:, None, :] - coords[None, :, :]
+        distances = np.sqrt((diffs**2).sum(axis=-1))
+        tri = distances[np.triu_indices(len(selected), k=1)]
+        spread = float(tri.mean() / ((2.0**0.5) * max(grid - 1, 1))) if tri.size else 0.0
+    else:
+        spread = 0.0
+    return {
+        "selected_occupied_bins_3x3": len({bin_id(index, bins=bins, grid=grid) for index in selected}),
+        "selected_row_span": int(rows.max() - rows.min() + 1),
+        "selected_col_span": int(cols.max() - cols.min() + 1),
+        "selected_mean_pairwise_spread": spread,
+    }
+
+
 class UGPruneSelector:
     name = "ug_prune_tf"
 
@@ -310,16 +455,34 @@ class UGPruneSelector:
         scores = scores_2d.reshape(-1)
         target_count, context_count, anchor_count = budget_split(budget, self.config)
 
-        target = select_target(scores, target_count, nms_radius=self.config.nms_radius, grid=grid)
+        if self.config.selection_strategy == "standard":
+            target = select_target(scores, target_count, nms_radius=self.config.nms_radius, grid=grid)
+        else:
+            target = select_coverage_target(
+                scores,
+                target_count,
+                nms_radius=self.config.nms_radius,
+                bins=self.config.anchor_bins,
+                grid=grid,
+            )
         context = select_context(scores, target, context_count, radius=self.config.context_radius, grid=grid)
-        anchor = select_anchors(
-            scores,
-            anchor_count,
-            exclude=set(target) | set(context),
-            bins=self.config.anchor_bins,
-            grid=grid,
-            pattern=self.config.anchor_pattern,
-        )
+        if self.config.selection_strategy == "standard":
+            anchor = select_anchors(
+                scores,
+                anchor_count,
+                exclude=set(target) | set(context),
+                bins=self.config.anchor_bins,
+                grid=grid,
+                pattern=self.config.anchor_pattern,
+            )
+        else:
+            anchor = select_coverage_anchors(
+                scores,
+                anchor_count,
+                exclude=set(target) | set(context),
+                bins=self.config.anchor_bins,
+                grid=grid,
+            )
 
         roles = {
             "target": sorted(target),
@@ -341,6 +504,8 @@ class UGPruneSelector:
                 roles[role] = sorted(index for index in values if index in keep)
             selected = keep
 
+        map_stats = dict(inputs.map_stats or map_statistics(scores_2d, grid=grid))
+        map_stats.update(selected_spread_stats(selected, bins=self.config.anchor_bins, grid=grid))
         result = SelectionResult(
             selected_indices=sorted(selected),
             method=self.name,
@@ -367,7 +532,9 @@ class UGPruneSelector:
                 "role_mode": self.config.role_mode,
                 "anchor_pattern": self.config.anchor_pattern,
                 "position_mode": self.config.position_mode,
-                "map_stats": inputs.map_stats or map_statistics(scores_2d, grid=grid),
+                "selection_strategy": self.config.selection_strategy,
+                "zip_alpha": self.config.zip_alpha,
+                "map_stats": map_stats,
                 "query_text": inputs.query_text,
                 "query_token_status": inputs.query_token_status,
                 "query_token_positions": inputs.query_token_positions,

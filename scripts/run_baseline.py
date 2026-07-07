@@ -661,6 +661,7 @@ def prepare_compacted_inputs(
         "input_ids": compacted_input_ids,
         "inputs_embeds": compacted_inputs_embeds,
         "attention_mask": compacted_attention_mask,
+        "selected_positions": selected_positions,
     }
     return compacted, diagnostics
 
