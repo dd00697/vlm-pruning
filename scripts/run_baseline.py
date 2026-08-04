@@ -47,6 +47,13 @@ class Tee:
         self.stream.flush()
         self.log_handle.flush()
 
+    def isatty(self) -> bool:
+        """Preserve terminal capability checks used by offline loggers."""
+        return bool(getattr(self.stream, "isatty", lambda: False)())
+
+    def fileno(self) -> int:
+        return int(self.stream.fileno())
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)

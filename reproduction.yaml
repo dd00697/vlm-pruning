@@ -1,0 +1,215 @@
+version: 1
+
+# This is the complete command registry for the dissertation results. The
+# Python entry point is dry-run by default, so editing this file never starts a
+# GPU job by itself.
+pipelines:
+  all: [selection, postfreeze, timing, verify]
+
+stages:
+  selection:
+    description: Registered validation selection, provenance check, and freeze
+    gpu: true
+    commands:
+      - argv: ["{python}", scripts/register_final_protocol.py]
+
+      - foreach:
+          - {map_source: query_max, role: more_context}
+          - {map_source: query_max, role: more_anchors}
+          - {map_source: query_pooled, role: more_context}
+        argv:
+          - "{python}"
+          - scripts/run_ug_prune_single_pass.py
+          - --dataset
+          - refcoco
+          - --task
+          - grounding
+          - --manifest
+          - data/manifests/final_evaluation/refcoco_val_unique.jsonl
+          - --split
+          - val
+          - --target-visual-tokens
+          - "48"
+          - --prune-after-layer
+          - "20"
+          - --position-mode
+          - gap_preserving
+          - --decode-mode
+          - layer_aware_cache
+          - --diagnostics-mode
+          - full
+          - --ug-role-preset
+          - "{role}"
+          - --ug-map-source
+          - "{map_source}"
+          - --ug-fusion-mode
+          - single_layer
+          - --precision
+          - bf16
+          - --limit
+          - "20"
+          - --run-name
+          - "final_smoke_k20_b48_{map_source}_{role}"
+          - --output-root
+          - experiments/final_evaluation/smoke/ug
+          - --figures-root
+          - experiments/final_evaluation/figures
+          - --tables-root
+          - experiments/final_evaluation/tables
+          - --max-figures
+          - "0"
+          - --resume
+          - --skip-existing
+          - --no-wandb
+
+      - argv:
+          - "{python}"
+          - scripts/run_final_evaluation.py
+          - --phase
+          - soak
+          - --execute
+          - --max-parallel
+          - "{max_parallel}"
+          - --wandb-mode
+          - disabled
+
+      - argv:
+          - "{python}"
+          - scripts/run_final_evaluation.py
+          - --phase
+          - selection
+          - --execute
+          - --max-parallel
+          - "{max_parallel}"
+          - --wandb-mode
+          - "{wandb_mode}"
+
+      - foreach:
+          - {map_source: query_max, role: more_context}
+          - {map_source: query_max, role: more_anchors}
+          - {map_source: query_pooled, role: more_context}
+          - {map_source: query_pooled, role: more_anchors}
+        argv:
+          - "{python}"
+          - scripts/run_ug_prune_single_pass.py
+          - --dataset
+          - refcoco
+          - --task
+          - grounding
+          - --manifest
+          - data/manifests/final_evaluation/refcoco_val_unique.jsonl
+          - --split
+          - val
+          - --target-visual-tokens
+          - "48"
+          - --prune-after-layer
+          - "20"
+          - --position-mode
+          - gap_preserving
+          - --decode-mode
+          - layer_aware_cache
+          - --diagnostics-mode
+          - full
+          - --ug-role-preset
+          - "{role}"
+          - --ug-map-source
+          - "{map_source}"
+          - --ug-fusion-mode
+          - single_layer
+          - --precision
+          - bf16
+          - --limit
+          - "20"
+          - --run-name
+          - "current_code_{map_source}_{role}"
+          - --output-root
+          - experiments/final_evaluation/selection_equivalence
+          - --figures-root
+          - experiments/final_evaluation/selection_equivalence/figures
+          - --tables-root
+          - experiments/final_evaluation/selection_equivalence/tables
+          - --max-figures
+          - "0"
+          - --resume
+          - --skip-existing
+          - --no-wandb
+
+      - argv: ["{python}", scripts/finalize_selection_provenance.py, --examples, "20"]
+      - argv: ["{python}", scripts/register_final_protocol.py]
+      - argv: ["{python}", scripts/freeze_final_method.py]
+
+  postfreeze:
+    description: Held-out RefCOCO and frozen-method task transfer
+    gpu: true
+    commands:
+      - argv:
+          - "{python}"
+          - scripts/run_final_postfreeze.py
+          - --phase
+          - heldout
+          - --limit
+          - "5"
+          - --execute
+          - --max-parallel
+          - "{max_parallel}"
+      - argv:
+          - "{python}"
+          - scripts/run_final_postfreeze.py
+          - --phase
+          - generalisation
+          - --limit
+          - "5"
+          - --execute
+          - --max-parallel
+          - "{max_parallel}"
+      - argv:
+          - "{python}"
+          - scripts/run_final_postfreeze.py
+          - --phase
+          - heldout
+          - --execute
+          - --max-parallel
+          - "{max_parallel}"
+          - --wandb-mode
+          - "{wandb_mode}"
+      - argv:
+          - "{python}"
+          - scripts/run_final_postfreeze.py
+          - --phase
+          - generalisation
+          - --execute
+          - --max-parallel
+          - "{max_parallel}"
+          - --wandb-mode
+          - "{wandb_mode}"
+
+  timing:
+    description: Controlled serial timing smoke and 25-trial campaign
+    gpu: true
+    commands:
+      - argv: ["{python}", scripts/prepare_final_timing_subset.py]
+      - argv: ["{python}", scripts/run_final_timing_campaign.py, --smoke, --execute]
+      - argv: ["{python}", scripts/run_final_timing_campaign.py, --execute]
+
+  verify:
+    description: Code checks and evidence rebuild from existing artifacts only
+    gpu: false
+    commands:
+      - argv: ["{python}", scripts/run_final_verification.py]
+      - argv: ["{python}", "{dissertation_root}/analysis/build_final_evaluation.py"]
+      - when: full_audit
+        argv: ["{python}", scripts/final_completion_audit.py]
+
+  ablations:
+    description: Retained Chapter 5 development ablations
+    gpu: true
+    max_parallel: 2
+    commands:
+      - argv:
+          - "{python}"
+          - scripts/run_strong_dissertation_ablations.py
+          - --execute
+          - --max-parallel
+          - "{max_parallel}"
+          - --wandb-mode
+          - "{wandb_mode}"

@@ -4,9 +4,3 @@
 [submodule "third_party/FastV"]
 	path = third_party/FastV
 	url = https://github.com/pkunlp-icler/FastV
-[submodule "third_party/Nuwa"]
-	path = third_party/Nuwa
-	url = https://github.com/Man-PaperRejected/Nuwa.git
-[submodule "third_party/LLaVA"]
-	path = third_party/LLaVA
-	url = https://github.com/haotian-liu/LLaVA.git

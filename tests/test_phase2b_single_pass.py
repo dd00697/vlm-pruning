@@ -11,15 +11,15 @@ from vlm_pruning.llava_hooks import (
     FROZEN_UG_GAP58_NAME,
     LayerAwareCacheState,
     MidLayerUGPruneForwarder,
-    confidence_decision_from_stats,
     frozen_ug_gap58_config,
     selected_positions_for_retained,
     selected_positions_for_retained_tensor,
     ug_gap58_config_for_prune_layer,
     validate_retained_indices,
 )
-from vlm_pruning.selectors import UGPruneConfig, UGPruneInputs, UGPruneSelector
-from vlm_pruning.selectors.base import SelectionResult, SelectorError
+from vlm_pruning.features import extract_maps_from_hidden_states, fuse_layer_maps
+from vlm_pruning.selectors import UGPruneInputs, UGPruneSelector
+from vlm_pruning.selectors.base import SelectorError
 
 
 class FakeCache:
@@ -92,6 +92,19 @@ class Phase2BFrozenConfigTests(unittest.TestCase):
         self.assertAlmostEqual(config.context_ratio, 0.40)
         self.assertAlmostEqual(config.anchor_ratio, 0.15)
 
+    def test_config_overrides_support_explicit_probe_layers_and_compact_positions(self) -> None:
+        config = ug_gap58_config_for_prune_layer(
+            12,
+            fusion_mode="soft_average",
+            probe_layers=(8, 12),
+            position_mode="compact",
+        )
+
+        self.assertEqual(config.probe_layers, (8, 12))
+        self.assertEqual(config.position_mode, "compact")
+        with self.assertRaises(SelectorError):
+            ug_gap58_config_for_prune_layer(12, probe_layers=(8, 16))
+
 
 class Phase2BPositionTests(unittest.TestCase):
     def test_gap_preserving_positions_keep_text_and_selected_visual_slots(self) -> None:
@@ -134,6 +147,25 @@ class Phase2BCacheStateTests(unittest.TestCase):
         self.assertEqual(proxy.get_seq_length(12), 128)
         self.assertEqual(proxy.get_mask_sizes(1, 0), (129, 0))
 
+    def test_compact_cache_state_uses_layer_specific_next_positions(self) -> None:
+        state = LayerAwareCacheState(
+            early_cache=FakeCache({0: 646}),
+            late_cache=FakeCache({12: 118}),
+            selection=SimpleNamespace(),
+            fused=None,
+            selected_positions=None,
+            early_attention_mask=SimpleNamespace(shape=(1, 646)),
+            late_attention_mask=SimpleNamespace(shape=(1, 118)),
+            full_prompt_len=646,
+            pruned_prompt_len=118,
+            prune_after_layer=12,
+            position_mode="compact",
+            generated_tokens_cached=3,
+        )
+
+        self.assertEqual(state.next_early_position_id(), 649)
+        self.assertEqual(state.next_late_position_id(), 121)
+
     def test_layer_aware_cache_state_position_and_expected_lengths(self) -> None:
         import torch
 
@@ -162,24 +194,63 @@ class Phase2BCacheStateTests(unittest.TestCase):
 
 
 class Phase2BSelectionTests(unittest.TestCase):
-    def test_confidence_rule_is_transparent_threshold_logic(self) -> None:
-        confident = confidence_decision_from_stats(
-            {"entropy_norm": 0.90, "top_58_mass": 0.25, "peakiness": 3.0},
-            entropy_norm_max=0.965,
-            top58_mass_min=0.18,
-            peakiness_min=2.0,
-        )
-        uncertain = confidence_decision_from_stats(
-            {"entropy_norm": 0.99, "top_58_mass": 0.12, "peakiness": 1.0},
-            entropy_norm_max=0.965,
-            top58_mass_min=0.18,
-            peakiness_min=2.0,
-        )
+    def test_benchmark_map_matches_reference_for_final_factorial_sources(self) -> None:
+        import torch
 
-        self.assertTrue(confident.confident)
-        self.assertEqual(confident.reasons, ("all_thresholds_passed",))
-        self.assertFalse(uncertain.confident)
-        self.assertGreaterEqual(len(uncertain.reasons), 1)
+        generator = torch.Generator().manual_seed(20260729)
+        input_ids = torch.tensor([[7] + [32000] * 576 + [11, 12, 13]])
+        hidden_states = [
+            torch.randn(1, input_ids.shape[1], 16, generator=generator)
+            for _ in range(21)
+        ]
+        query_positions = [577, 578]
+        for source in ("query_max", "query_pooled"):
+            with self.subTest(source=source):
+                config = ug_gap58_config_for_prune_layer(
+                    20,
+                    map_source=source,
+                    fusion_mode="single_layer",
+                    probe_layers=(20,),
+                    position_mode="gap_preserving",
+                )
+                forwarder = MidLayerUGPruneForwarder(
+                    torch,
+                    object(),
+                    image_token_id=32000,
+                    grid=24,
+                    prune_after_layer=20,
+                    target_visual_tokens=48,
+                    selector_config=config,
+                    diagnostics_mode="benchmark",
+                )
+                fast, _, _ = forwarder._extract_fused_map_torch(
+                    hidden_states=hidden_states,
+                    input_ids=input_ids,
+                    query_token_positions=query_positions,
+                )
+                reference_maps = extract_maps_from_hidden_states(
+                    hidden_states,
+                    input_ids,
+                    32000,
+                    query_positions,
+                    (20,),
+                    grid=24,
+                )
+                reference = fuse_layer_maps(
+                    reference_maps,
+                    source=source,
+                    layers=(20,),
+                    grid=24,
+                    fusion_mode="single_layer",
+                ).fused_map
+                self.assertTrue(
+                    np.allclose(
+                        fast.detach().cpu().numpy().reshape(24, 24),
+                        reference,
+                        rtol=1e-5,
+                        atol=1e-5,
+                    )
+                )
 
     def test_forwarder_selector_matches_direct_frozen_selector(self) -> None:
         import torch
@@ -338,135 +409,6 @@ class Phase2BSelectionTests(unittest.TestCase):
                 self.assertEqual(len(set(fast.selected_indices)), budget)
                 self.assertIn(f"top_{budget}_mass", fast.metadata["map_stats"])
 
-    def test_coverage_strategy_keeps_exact_budget_and_spreads_selection(self) -> None:
-        scores = np.zeros((24, 24), dtype=np.float32)
-        scores[:4, :4] = 10.0
-        scores[18, 18] = 9.8
-        standard = UGPruneSelector(frozen_ug_gap58_config()).select_from_map(
-            sample_id="sample",
-            budget=48,
-            original_tokens=576,
-            grid=24,
-            seed=0,
-            inputs=UGPruneInputs(
-                fused_map=scores,
-                map_stats={},
-                map_key="map",
-                query_text="text",
-                query_token_status="matched",
-                query_token_positions=[1],
-            ),
-        )
-        coverage_config = UGPruneConfig(**{**frozen_ug_gap58_config().as_dict(), "selection_strategy": "coverage"})
-        coverage = UGPruneSelector(coverage_config).select_from_map(
-            sample_id="sample",
-            budget=48,
-            original_tokens=576,
-            grid=24,
-            seed=0,
-            inputs=UGPruneInputs(
-                fused_map=scores,
-                map_stats={},
-                map_key="map",
-                query_text="text",
-                query_token_status="matched",
-                query_token_positions=[1],
-            ),
-        )
-
-        self.assertEqual(len(coverage.selected_indices), 48)
-        self.assertEqual(len(set(coverage.selected_indices)), 48)
-        self.assertGreaterEqual(
-            coverage.metadata["map_stats"].get("selected_occupied_bins_3x3", 0),
-            standard.metadata["map_stats"].get("selected_occupied_bins_3x3", 0),
-        )
-        self.assertEqual(coverage.metadata["selection_strategy"], "coverage")
-
-    def test_fast_torch_coverage_selector_matches_reference(self) -> None:
-        import torch
-
-        rng = np.random.default_rng(23)
-        scores = rng.normal(size=(24, 24)).astype(np.float32)
-        scores[:3, :3] += 6.0
-        config = UGPruneConfig(**{**frozen_ug_gap58_config().as_dict(), "selection_strategy": "coverage"})
-        inputs = UGPruneInputs(
-            fused_map=scores,
-            map_stats={},
-            map_key="map",
-            query_text="text",
-            query_token_status="matched",
-            query_token_positions=[1],
-        )
-        direct = UGPruneSelector(config).select_from_map(
-            sample_id="sample",
-            budget=58,
-            original_tokens=576,
-            grid=24,
-            seed=0,
-            inputs=inputs,
-        )
-        forwarder = MidLayerUGPruneForwarder(
-            torch,
-            object(),
-            image_token_id=32000,
-            prune_after_layer=12,
-            target_visual_tokens=58,
-            selector_config=config,
-            diagnostics_mode="benchmark",
-        )
-        flat = torch.tensor(scores.reshape(-1))
-        fast, fast_tensor = forwarder._selection_from_fused_torch(
-            scores=flat,
-            sample_id="sample",
-            original_tokens=576,
-            seed=0,
-            map_key="map",
-            map_stats=forwarder._score_map_stats_torch(flat),
-            query_text="text",
-            query_token_status="matched",
-            query_token_positions=[1],
-        )
-
-        self.assertEqual(fast.selected_indices, direct.selected_indices)
-        self.assertEqual(fast.role_labels, direct.role_labels)
-        self.assertEqual(fast_tensor.numel(), 58)
-        self.assertEqual(fast.metadata["selection_strategy"], "coverage")
-
-    def test_coverage_zip_keeps_shape_and_does_not_merge_into_targets(self) -> None:
-        import torch
-
-        image_token_id = 32000
-        input_ids = torch.tensor([[7, image_token_id, image_token_id, image_token_id, image_token_id, image_token_id, image_token_id, 8]])
-        hidden = torch.arange(8 * 4, dtype=torch.float32).reshape(1, 8, 4)
-        selection = SelectionResult(
-            selected_indices=[0, 1, 2],
-            method="test",
-            budget=3,
-            original_tokens=6,
-            grid=3,
-            role_labels={"target": [0], "context": [1], "anchor": [2]},
-        ).validate()
-        config = UGPruneConfig(selection_strategy="coverage_zip", zip_alpha=0.5)
-        forwarder = MidLayerUGPruneForwarder(
-            torch,
-            object(),
-            image_token_id=image_token_id,
-            prune_after_layer=12,
-            target_visual_tokens=3,
-            selector_config=config,
-        )
-
-        out, diagnostics = forwarder._apply_coverage_zip(hidden, input_ids, selection, None, config)
-
-        self.assertEqual(tuple(out.shape), tuple(hidden.shape))
-        self.assertTrue(diagnostics["ug/zip_enabled"])
-        self.assertEqual(diagnostics["ug/zip_discarded_tokens"], 3)
-        self.assertTrue(torch.equal(out[:, 1, :], hidden[:, 1, :]))
-        self.assertTrue(
-            bool((out[:, [2, 3], :] != hidden[:, [2, 3], :]).any()),
-            "coverage_zip should update at least one non-target merge destination.",
-        )
-
     def test_benchmark_result_keeps_required_metrics_and_omits_heavy_fields(self) -> None:
         from scripts.run_ug_prune_single_pass import build_result
 
@@ -502,7 +444,7 @@ class Phase2BSelectionTests(unittest.TestCase):
         self.assertTrue(row["retained_indices_checksum"])
         self.assertEqual(row["actual_llm_visual_tokens"], 58)
         self.assertEqual(row["ug/selection_backend"], "torch_fast")
-        self.assertNotIn("retained_indices", row)
+        self.assertEqual(row["retained_indices"], selection.selected_indices)
         self.assertNotIn("selector_metadata", row)
         self.assertNotIn("role_labels", row)
         self.assertNotIn("ug_fused_map_stats", row)

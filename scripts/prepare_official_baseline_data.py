@@ -92,6 +92,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--bbox-format", choices=["xywh", "xyxy"], default="xywh")
     parser.add_argument("--all-expressions", action="store_true")
+    parser.add_argument(
+        "--strict-split",
+        action="store_true",
+        help="Require the upstream dataset to contain the exact requested split; disable aliases and single-split fallback.",
+    )
     return parser.parse_args()
 
 
@@ -99,10 +104,16 @@ def normalize_dataset_name(value: str) -> str:
     return value.lower().replace("-", "_")
 
 
-def choose_split(dataset: Any, requested: str) -> tuple[Any, str]:
+def choose_split(dataset: Any, requested: str, *, strict: bool = False) -> tuple[Any, str]:
     if not hasattr(dataset, "keys"):
         return dataset, requested
     keys = list(dataset.keys())
+    if strict:
+        if requested not in dataset:
+            raise DataPreparationError(
+                f"Strict split '{requested}' not found. Available splits: {keys}"
+            )
+        return dataset[requested], requested
     candidates = [requested]
     if requested == "val":
         candidates += ["validation", "valid", "dev", "test"]
@@ -118,7 +129,13 @@ def choose_split(dataset: Any, requested: str) -> tuple[Any, str]:
     raise DataPreparationError(f"Requested split '{requested}' not found. Available splits: {keys}")
 
 
-def load_hf_dataset(dataset: str, split: str, *, streaming: bool = False) -> tuple[Iterable[Any], str, str]:
+def load_hf_dataset(
+    dataset: str,
+    split: str,
+    *,
+    streaming: bool = False,
+    strict_split: bool = False,
+) -> tuple[Iterable[Any], str, str]:
     try:
         from datasets import load_dataset
     except Exception as exc:
@@ -130,7 +147,7 @@ def load_hf_dataset(dataset: str, split: str, *, streaming: bool = False) -> tup
                 loaded = load_dataset(dataset_id, config_name, streaming=streaming)
             else:
                 loaded = load_dataset(dataset_id, streaming=streaming)
-            selected, actual_split = choose_split(loaded, split)
+            selected, actual_split = choose_split(loaded, split, strict=strict_split)
             return selected, f"{dataset_id}:{config_name}" if config_name else dataset_id, actual_split
         except Exception as exc:
             errors.append(f"{dataset_id}{('/' + config_name) if config_name else ''}: {type(exc).__name__}: {exc}")
@@ -565,7 +582,16 @@ def main() -> int:
             raise DataPreparationError(
                 f"No local loader for {args.raw_root}; provide a JSONL --raw-root or allow --download."
             )
-        rows, source, actual_split = load_hf_dataset(name, args.split, streaming=not args.no_streaming)
+        rows, source, actual_split = load_hf_dataset(
+            name,
+            args.split,
+            streaming=not args.no_streaming,
+            strict_split=bool(args.strict_split),
+        )
+        if args.strict_split and actual_split != args.split:
+            raise DataPreparationError(
+                f"Strict split mismatch: requested '{args.split}', resolved '{actual_split}'."
+            )
         if name in GROUNDING_DATASETS:
             count = prepare_grounding(args, rows, source, actual_split)
         else:

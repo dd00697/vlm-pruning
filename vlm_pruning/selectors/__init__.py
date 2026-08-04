@@ -3,7 +3,6 @@
 from .base import SelectionResult, SelectorError, VisualTokenSelector
 from .baselines import FullSelector, RandomSelector, UniformSelector, selector_for_method
 from .ug_prune import UGPruneConfig, UGPruneInputs, UGPruneSelector
-from .ug_prune_lite import UGPruneLiteConfig, UGPruneLiteSelector
 
 __all__ = [
     "FullSelector",
@@ -12,8 +11,6 @@ __all__ = [
     "SelectorError",
     "UGPruneConfig",
     "UGPruneInputs",
-    "UGPruneLiteConfig",
-    "UGPruneLiteSelector",
     "UGPruneSelector",
     "UniformSelector",
     "VisualTokenSelector",

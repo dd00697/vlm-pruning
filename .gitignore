@@ -6,6 +6,8 @@ wandb/
 .cache/
 docs/papers/
 *.pdf
+*.docx
+project_handbook_extracted.txt
 
 # Local notes and handoff files
 GOAL.md

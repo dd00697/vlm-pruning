@@ -2,7 +2,6 @@
 
 from .mid_layer_pruning import (
     CacheLengthProxy,
-    ConfidenceDecision,
     FROZEN_UG_GAP58_NAME,
     LayerAwareCacheState,
     LayerAwareGenerationResult,
@@ -10,7 +9,6 @@ from .mid_layer_pruning import (
     MidLayerForwardResult,
     MidLayerUGPruneForwarder,
     SelectionPipelineResult,
-    confidence_decision_from_stats,
     frozen_ug_gap58_config,
     selected_positions_for_retained,
     selected_positions_for_retained_tensor,
@@ -20,7 +18,6 @@ from .mid_layer_pruning import (
 
 __all__ = [
     "CacheLengthProxy",
-    "ConfidenceDecision",
     "FROZEN_UG_GAP58_NAME",
     "LayerAwareCacheState",
     "LayerAwareGenerationResult",
@@ -28,7 +25,6 @@ __all__ = [
     "MidLayerForwardResult",
     "MidLayerUGPruneForwarder",
     "SelectionPipelineResult",
-    "confidence_decision_from_stats",
     "frozen_ug_gap58_config",
     "selected_positions_for_retained",
     "selected_positions_for_retained_tensor",

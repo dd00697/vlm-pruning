@@ -1,18 +1,19 @@
-accelerate
-datasets
-einops
-huggingface_hub
-matplotlib
-numpy
-opencv-python-headless
-pandas
-pillow
-protobuf
-pyyaml
-safetensors
-scikit-learn
-seaborn
-sentencepiece
-tqdm
-transformers
-wandb
+# Direct environment pins recovered from the final W&B run artifacts. CUDA
+# 12.4 wheels are required for the registered PyTorch build.
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+accelerate==1.14.0
+datasets==4.8.5
+huggingface_hub==1.25.1
+matplotlib==3.11.1
+numpy==1.26.3
+pandas==3.0.5
+pillow==10.2.0
+protobuf==7.35.1
+PyYAML==6.0.2
+safetensors==0.8.0
+torch==2.4.1+cu124
+torchvision==0.19.1+cu124
+tqdm==4.70.0
+transformers==5.12.1
+wandb==0.28.1

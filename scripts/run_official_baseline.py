@@ -35,6 +35,7 @@ from run_baseline import (  # noqa: E402
     TRUE_REMOVAL_LOCATION,
     BaselineError,
     Tee,
+    apply_chat_template,
     box_iou,
     cuda_sync,
     eos_token_ids,
@@ -48,6 +49,19 @@ from run_baseline import (  # noqa: E402
 )
 from vlm_pruning.analysis.coverage import selection_diagnostics  # noqa: E402
 from vlm_pruning.selectors import SelectionResult, SelectorError, selector_for_method  # noqa: E402
+from vlm_pruning.llava_hooks.mid_layer_pruning import (  # noqa: E402
+    MidLayerUGPruneForwarder,
+    ug_gap58_config_for_prune_layer,
+)
+from vlm_pruning.efficiency import cache_tensor_bytes  # noqa: E402
+from vlm_pruning.mme import score_mme  # noqa: E402
+from vlm_pruning.prior_methods import (  # noqa: E402
+    FASTV_COMMIT,
+    FASTV_SOURCE,
+    VISIONZIP_COMMIT,
+    VISIONZIP_SOURCE,
+    visionzip_compress,
+)
 
 
 DEFAULT_PROJECT = "vlm-pruning"
@@ -62,7 +76,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--task", required=True, choices=["vqa", "grounding"])
     parser.add_argument("--manifest", required=True, type=Path)
-    parser.add_argument("--method", required=True, choices=["full", "random", "uniform"])
+    parser.add_argument(
+        "--method",
+        required=True,
+        choices=["full", "random", "uniform", "fastv", "visionzip"],
+    )
     parser.add_argument("--target-visual-tokens", "--token-budget", dest="target_visual_tokens", type=int)
     parser.add_argument("--keep-ratio", type=float)
     parser.add_argument("--seed", type=int, default=0)
@@ -80,6 +98,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-figures", type=int, default=24)
     parser.add_argument("--box-coordinate-mode", default="normalized_0_1", choices=["normalized_0_1", "normalized_0_1000", "absolute_pixels"])
     parser.add_argument("--position-mode", default="compact", choices=["compact", "raster_compact", "gap_preserving"])
+    parser.add_argument(
+        "--prompt-profile",
+        default="registered",
+        choices=["registered", "paper"],
+        help="Use the fixed dissertation prompt or the benchmark question verbatim for paper-parity runs.",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--wandb", action="store_true")
@@ -183,6 +207,7 @@ def torch_dtype(torch: Any, precision: str) -> Any:
 def load_model(model_path: str, precision: str) -> tuple[Any, Any, Any, Any, dict[str, Any]]:
     try:
         import torch
+        import transformers
         from transformers import AutoProcessor, LlavaForConditionalGeneration
     except Exception as exc:
         raise BaselineError(f"Missing model dependency: {type(exc).__name__}: {exc}") from exc
@@ -196,6 +221,7 @@ def load_model(model_path: str, precision: str) -> tuple[Any, Any, Any, Any, dic
         "gpu_total_memory_gb": total_bytes / 1024**3,
         "gpu_free_memory_gb_at_load_start": free_bytes / 1024**3,
         "torch_version": torch.__version__,
+        "transformers_version": transformers.__version__,
         "cuda_version": torch.version.cuda,
         "precision": precision,
         "torch_dtype": str(dtype),
@@ -212,6 +238,25 @@ def load_model(model_path: str, precision: str) -> tuple[Any, Any, Any, Any, dic
     except Exception as exc:
         raise BaselineError(f"Full-precision LLaVA load failed for '{model_path}': {type(exc).__name__}: {exc}") from exc
     return torch, processor, model, device, env
+
+
+def clip_vision_backbone(tower: Any) -> Any:
+    """Return the CLIP backbone across supported Transformers LLaVA layouts.
+
+    Some Transformers releases expose ``model.model.vision_tower`` as a
+    ``CLIPVisionModel`` directly, while wrapper variants expose the same model
+    through ``vision_tower.vision_model``.  VisionZip needs the encoder layer
+    modules for its selected-layer key hook, so resolve both layouts without
+    changing the selection calculation.
+    """
+    backbone = getattr(tower, "vision_model", tower)
+    encoder = getattr(backbone, "encoder", None)
+    if encoder is None or not hasattr(encoder, "layers"):
+        raise BaselineError(
+            "VisionZip could not resolve CLIP encoder layers from the LLaVA "
+            f"vision tower type {type(tower).__name__}."
+        )
+    return backbone
 
 
 def write_json(path: Path, payload: Any) -> None:
@@ -237,6 +282,221 @@ def canonical_text(value: Any) -> str:
     text = re.sub(r"[^a-z0-9 ]+", "", text)
     articles = {"a", "an", "the"}
     return " ".join(word for word in text.split() if word not in articles)
+
+
+VQA_CONTRACTIONS = {
+    "aint": "ain't",
+    "arent": "aren't",
+    "cant": "can't",
+    "couldnt": "couldn't",
+    "couldve": "could've",
+    "didnt": "didn't",
+    "doesnt": "doesn't",
+    "dont": "don't",
+    "hadnt": "hadn't",
+    "hasnt": "hasn't",
+    "havent": "haven't",
+    "hes": "he's",
+    "im": "i'm",
+    "isnt": "isn't",
+    "itll": "it'll",
+    "ive": "i've",
+    "shes": "she's",
+    "shouldnt": "shouldn't",
+    "shouldve": "should've",
+    "thats": "that's",
+    "theyll": "they'll",
+    "theyre": "they're",
+    "theyve": "they've",
+    "wasnt": "wasn't",
+    "werent": "weren't",
+    "whats": "what's",
+    "wheres": "where's",
+    "whos": "who's",
+    "wont": "won't",
+    "wouldnt": "wouldn't",
+    "wouldve": "would've",
+    "youll": "you'll",
+    "youre": "you're",
+    "youve": "you've",
+}
+VQA_CONTRACTIONS.update(
+    {
+        "couldn'tve": "couldn't've",
+        "couldnt've": "couldn't've",
+        "hadnt've": "hadn't've",
+        "hadn'tve": "hadn't've",
+        "hed": "he'd",
+        "hed've": "he'd've",
+        "he'dve": "he'd've",
+        "howd": "how'd",
+        "howll": "how'll",
+        "hows": "how's",
+        "Id've": "I'd've",
+        "I'dve": "I'd've",
+        "Im": "I'm",
+        "Ive": "I've",
+        "itd": "it'd",
+        "itd've": "it'd've",
+        "it'dve": "it'd've",
+        "let's": "let's",
+        "maam": "ma'am",
+        "mightnt": "mightn't",
+        "mightnt've": "mightn't've",
+        "mightn'tve": "mightn't've",
+        "mightve": "might've",
+        "mustnt": "mustn't",
+        "mustve": "must've",
+        "neednt": "needn't",
+        "notve": "not've",
+        "oclock": "o'clock",
+        "oughtnt": "oughtn't",
+        "ow's'at": "'ow's'at",
+        "'ows'at": "'ow's'at",
+        "'ow'sat": "'ow's'at",
+        "shant": "shan't",
+        "shed've": "she'd've",
+        "she'dve": "she'd've",
+        "she's": "she's",
+        "shouldnt've": "shouldn't've",
+        "shouldn'tve": "shouldn't've",
+        "somebody'd": "somebodyd",
+        "somebodyd've": "somebody'd've",
+        "somebody'dve": "somebody'd've",
+        "somebodyll": "somebody'll",
+        "somebodys": "somebody's",
+        "someoned": "someone'd",
+        "someoned've": "someone'd've",
+        "someone'dve": "someone'd've",
+        "someonell": "someone'll",
+        "someones": "someone's",
+        "somethingd": "something'd",
+        "somethingd've": "something'd've",
+        "something'dve": "something'd've",
+        "somethingll": "something'll",
+        "thered": "there'd",
+        "thered've": "there'd've",
+        "there'dve": "there'd've",
+        "therere": "there're",
+        "theres": "there's",
+        "theyd": "they'd",
+        "theyd've": "they'd've",
+        "they'dve": "they'd've",
+        "twas": "'twas",
+        "wed've": "we'd've",
+        "we'dve": "we'd've",
+        "weve": "we've",
+        "whatll": "what'll",
+        "whatre": "what're",
+        "whatve": "what've",
+        "whens": "when's",
+        "whered": "where'd",
+        "whereve": "where've",
+        "whod": "who'd",
+        "whod've": "who'd've",
+        "who'dve": "who'd've",
+        "wholl": "who'll",
+        "whove": "who've",
+        "whyll": "why'll",
+        "whyre": "why're",
+        "whys": "why's",
+        "wouldnt've": "wouldn't've",
+        "wouldn'tve": "wouldn't've",
+        "yall": "y'all",
+        "yall'll": "y'all'll",
+        "y'allll": "y'all'll",
+        "yall'd've": "y'all'd've",
+        "y'alld've": "y'all'd've",
+        "y'all'dve": "y'all'd've",
+        "youd": "you'd",
+        "youd've": "you'd've",
+        "you'dve": "you'd've",
+    }
+)
+for _non_official_lowercase_key in ("im", "ive", "shes"):
+    VQA_CONTRACTIONS.pop(_non_official_lowercase_key, None)
+VQA_NUMBER_WORDS = {
+    "none": "0",
+    "zero": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10",
+}
+VQA_ARTICLES = {"a", "an", "the"}
+VQA_PERIOD_STRIP = re.compile(r"(?!<=\d)(\.)(?!\d)")
+VQA_COMMA_STRIP = re.compile(r"(?<=\d)(\,)+(?=\d)")
+VQA_PUNCT = (
+    ";",
+    "/",
+    "[",
+    "]",
+    '"',
+    "{",
+    "}",
+    "(",
+    ")",
+    "=",
+    "+",
+    "\\",
+    "_",
+    "-",
+    ">",
+    "<",
+    "@",
+    "`",
+    ",",
+    "?",
+    "!",
+)
+
+
+def vqa_normalize_answer(value: Any) -> str:
+    """Apply TextVQA's official EvalAI answer processor."""
+    text = str(value if value is not None else "").lower()
+    text = text.replace(",", "").replace("?", "").replace("'s", " 's").strip()
+    text = text.replace("\n", " ").replace("\t", " ").strip()
+    punctuated = text
+    for punctuation in VQA_PUNCT:
+        if (
+            punctuation + " " in text
+            or " " + punctuation in text
+            or VQA_COMMA_STRIP.search(text) is not None
+        ):
+            punctuated = punctuated.replace(punctuation, "")
+        else:
+            punctuated = punctuated.replace(punctuation, " ")
+    punctuated = VQA_PERIOD_STRIP.sub("", punctuated)
+    words: list[str] = []
+    for word in punctuated.lower().split():
+        word = VQA_NUMBER_WORDS.get(word, word)
+        if word in VQA_ARTICLES:
+            continue
+        words.append(VQA_CONTRACTIONS.get(word, word))
+    return " ".join(words)
+
+
+def vqa_soft_accuracy(prediction: Any, answers: list[Any]) -> float:
+    """Compute official leave-one-annotator-out VQA consensus accuracy."""
+    normalized_prediction = vqa_normalize_answer(prediction)
+    normalized_answers = [vqa_normalize_answer(answer) for answer in answers]
+    if not normalized_prediction or not normalized_answers:
+        return 0.0
+    scores: list[float] = []
+    for index in range(len(normalized_answers)):
+        matching_others = sum(
+            answer == normalized_prediction
+            for other_index, answer in enumerate(normalized_answers)
+            if other_index != index
+        )
+        scores.append(min(1.0, float(matching_others) / 3.0))
+    return sum(scores) / len(scores)
 
 
 def normalise_yes_no(text: str) -> tuple[str | None, bool]:
@@ -272,6 +532,29 @@ def answer_mode(sample: dict[str, Any], dataset: str) -> str:
     return "open"
 
 
+def registered_prompt_template(args: argparse.Namespace) -> str | None:
+    """Return the fixed final-protocol template when the task has one."""
+    if args.task == "grounding":
+        if args.box_coordinate_mode == "normalized_0_1":
+            coord = "normalized 0-1 image coordinates"
+        elif args.box_coordinate_mode == "normalized_0_1000":
+            coord = "normalized 0-1000 image coordinates"
+        else:
+            coord = "absolute image pixel coordinates"
+        return (
+            'Identify the target described by this referring expression: "{query}".\n'
+            f"Return exactly one bounding box in {coord} as "
+            "[x_min, y_min, x_max, y_max]. Do not include any other text."
+        )
+    if args.dataset.lower() == "mme" and args.prompt_profile == "paper":
+        return "{question}"
+    if args.dataset.lower() in {"pope", "mme"}:
+        return "{question}\nAnswer with exactly one word: yes or no."
+    if args.dataset.lower() == "textvqa":
+        return "{question}\nAnswer as briefly as possible."
+    return None
+
+
 def make_prompt(args: argparse.Namespace, sample: dict[str, Any]) -> str:
     if args.task == "grounding":
         if args.box_coordinate_mode == "normalized_0_1":
@@ -286,6 +569,8 @@ def make_prompt(args: argparse.Namespace, sample: dict[str, Any]) -> str:
             "Do not include any other text."
         )
     question = str(sample["question"]).strip()
+    if args.dataset.lower() == "mme" and args.prompt_profile == "paper":
+        return question
     mode = answer_mode(sample, args.dataset)
     if mode == "yes_no":
         return f"{question}\nAnswer with exactly one word: yes or no."
@@ -371,15 +656,24 @@ def score_vqa(sample: dict[str, Any], raw: str, dataset: str) -> dict[str, Any]:
             "invalid_reason": "choice_extraction_failed" if pred_label is None and pred_text is None else None,
         }
     target_values = answer if isinstance(answer, list) else [answer]
-    pred_canon = canonical_text(raw)
-    target_canons = [canonical_text(value) for value in target_values if value is not None]
-    correct = bool(pred_canon and pred_canon in target_canons)
+    if dataset.lower() == "textvqa":
+        pred_canon = vqa_normalize_answer(raw)
+        target_canons = [vqa_normalize_answer(value) for value in target_values if value is not None]
+        correct = bool(pred_canon and pred_canon in target_canons)
+        soft_score = vqa_soft_accuracy(raw, target_values)
+    else:
+        pred_canon = canonical_text(raw)
+        target_canons = [canonical_text(value) for value in target_values if value is not None]
+        correct = bool(pred_canon and pred_canon in target_canons)
+        soft_score = 1.0 if correct else 0.0
     return {
         "answer_mode": mode,
         "prediction": raw.strip(),
         "target": target_values,
         "correct": correct,
-        "score": 1.0 if correct else 0.0,
+        "score": soft_score,
+        "normalized_exact_match": 1.0 if correct else 0.0,
+        "vqa_soft_score": soft_score if dataset.lower() == "textvqa" else None,
         "invalid": not bool(pred_canon),
         "invalid_reason": "empty_prediction" if not pred_canon else None,
     }
@@ -448,7 +742,9 @@ def base_metrics(results: list[dict[str, Any]], wall_time_s: float, peak_alloc_m
     metrics["efficiency/time_per_output_token_s"] = decode_total / gen if gen else None
     mean_latency = metrics["efficiency/mean_latency_s"]
     mean_pruning = metrics["efficiency/pruning_selection_latency_s"]
-    metrics["efficiency/pruning_overhead_fraction"] = mean_pruning / mean_latency if mean_latency else None
+    metrics["efficiency/pruning_overhead_fraction"] = (
+        mean_pruning / mean_latency if mean_latency and mean_pruning is not None else None
+    )
     original_seq = metrics["efficiency/original_sequence_length"]
     compact_seq = metrics["efficiency/sequence_length"]
     reduction = metrics["efficiency/sequence_length_reduction"]
@@ -479,14 +775,13 @@ def add_model_efficiency(metrics: dict[str, Any], model: Any, torch: Any) -> Non
 def aggregate(results: list[dict[str, Any]], args: argparse.Namespace, wall_time_s: float, peak_alloc_mb: float | None, peak_reserved_mb: float | None) -> dict[str, Any]:
     metrics = base_metrics(results, wall_time_s, peak_alloc_mb, peak_reserved_mb)
     if args.task == "grounding":
-        valid = [row for row in results if row.get("valid")]
-        ious = [float(row.get("box_iou") or 0.0) for row in valid]
+        ious = [float(row.get("box_iou") or 0.0) for row in results]
         metrics.update(
             {
-                "quality/main_score": sum(1 for row in valid if row.get("success_iou_0_5")) / len(results) if results else 0.0,
+                "quality/main_score": sum(1 for row in results if row.get("success_iou_0_5")) / len(results) if results else 0.0,
                 "quality/mean_iou": sum(ious) / len(ious) if ious else 0.0,
                 "quality/median_iou": statistics.median(ious) if ious else 0.0,
-                "quality/acc_at_0_5": sum(1 for row in valid if row.get("success_iou_0_5")) / len(results) if results else 0.0,
+                "quality/acc_at_0_5": sum(1 for row in results if row.get("success_iou_0_5")) / len(results) if results else 0.0,
                 "quality/parsed_box_rate": sum(1 for row in results if row.get("raw_parsed_box") is not None) / len(results) if results else 0.0,
             }
         )
@@ -512,6 +807,72 @@ def aggregate(results: list[dict[str, Any]], args: argparse.Namespace, wall_time
                 "quality/yes_rate": pred_yes / len(yes_rows) if yes_rows else None,
             }
         )
+        if args.dataset.lower() == "textvqa":
+            soft_scores = [float(row.get("vqa_soft_score") or 0.0) for row in results]
+            exact_scores = [float(row.get("normalized_exact_match") or 0.0) for row in results]
+            metrics["quality/vqa_accuracy"] = sum(soft_scores) / len(soft_scores) if soft_scores else 0.0
+            metrics["quality/normalized_exact_match"] = (
+                sum(exact_scores) / len(exact_scores) if exact_scores else 0.0
+            )
+            metrics["quality/main_score"] = metrics["quality/vqa_accuracy"]
+            metrics["quality/accuracy"] = metrics["quality/vqa_accuracy"]
+        if args.dataset.lower() == "pope":
+            categories = ("random", "popular", "adversarial")
+            for category in categories:
+                subset = [row for row in results if str(row.get("category") or "").lower() == category]
+                yes_subset = [row for row in subset if row.get("answer_mode") == "yes_no"]
+                category_correct = sum(1 for row in subset if row.get("correct"))
+                category_tp = sum(
+                    1 for row in yes_subset if row.get("prediction") == "yes" and row.get("target") == "yes"
+                )
+                category_fp = sum(
+                    1 for row in yes_subset if row.get("prediction") == "yes" and row.get("target") == "no"
+                )
+                category_fn = sum(
+                    1 for row in yes_subset if row.get("prediction") == "no" and row.get("target") == "yes"
+                )
+                category_precision = (
+                    category_tp / (category_tp + category_fp) if category_tp + category_fp else None
+                )
+                category_recall = (
+                    category_tp / (category_tp + category_fn) if category_tp + category_fn else None
+                )
+                category_f1 = (
+                    2 * category_precision * category_recall / (category_precision + category_recall)
+                    if category_precision is not None
+                    and category_recall is not None
+                    and category_precision + category_recall
+                    else None
+                )
+                prefix = f"quality/pope/{category}"
+                metrics[f"{prefix}/samples"] = len(subset)
+                metrics[f"{prefix}/accuracy"] = category_correct / len(subset) if subset else None
+                metrics[f"{prefix}/precision"] = category_precision
+                metrics[f"{prefix}/recall"] = category_recall
+                metrics[f"{prefix}/f1"] = category_f1
+                metrics[f"{prefix}/yes_rate"] = (
+                    sum(1 for row in yes_subset if row.get("prediction") == "yes") / len(yes_subset)
+                    if yes_subset
+                    else None
+                )
+                metrics[f"{prefix}/invalid_rate"] = (
+                    sum(1 for row in subset if row.get("invalid")) / len(subset) if subset else None
+                )
+        if args.dataset.lower() == "mme" and args.limit is None:
+            mme = score_mme(results)
+            metrics.update(
+                {
+                    "quality/main_score": mme["total"],
+                    "quality/mme/perception": mme["perception"],
+                    "quality/mme/cognition": mme["cognition"],
+                    "quality/mme/total": mme["total"],
+                    "quality/mme/question_accuracy": mme["question_accuracy"],
+                    "quality/mme/valid_output_rate": mme["valid_output_rate"],
+                }
+            )
+            for category, values in mme["categories"].items():
+                for field in ("accuracy", "accuracy_plus", "score"):
+                    metrics[f"quality/mme/{category}/{field}"] = values[field]
     return metrics
 
 
@@ -560,6 +921,9 @@ def config_payload(args: argparse.Namespace, name: str, original_tokens: int, to
         "model/name": args.model_path,
         "model/stack": "huggingface_llava",
         "model/precision": args.precision,
+        "model/decoding": "deterministic_greedy",
+        "model/max_new_tokens": args.max_new_tokens
+        or (48 if args.task == "grounding" else 16),
         "dataset/name": args.dataset,
         "dataset/split": split,
         "dataset/manifest": str(args.manifest),
@@ -574,12 +938,43 @@ def config_payload(args: argparse.Namespace, name: str, original_tokens: int, to
         "tokens/budget_family": budget_family(tokens, original_tokens),
         "run/is_limited": args.limit is not None,
         "run/output_dir": None,
-        "pruning_implementation": TRUE_REMOVAL_LABEL,
-        "pruning_location": TRUE_REMOVAL_LOCATION,
+        "pruning_implementation": (
+            "fastv_pinned_hf_adapter"
+            if args.method == "fastv"
+            else "visionzip_pinned_hf_adapter"
+            if args.method == "visionzip"
+            else TRUE_REMOVAL_LABEL
+        ),
+        "pruning_location": (
+            "in_llm_after_layer_3"
+            if args.method == "fastv"
+            else "pre_llm_vision_encoder_compression"
+            if args.method == "visionzip"
+            else TRUE_REMOVAL_LOCATION
+        ),
         "position_mode": args.position_mode,
         "evaluator/name": evaluator_name(args.dataset, args.task),
         "evaluator/metric_definition": metric_definition(args.dataset, args.task),
+        "prompt/template": registered_prompt_template(args),
+        "prompt/profile": args.prompt_profile,
         "limit": args.limit,
+        "published_baseline/source": (
+            FASTV_SOURCE if args.method == "fastv" else VISIONZIP_SOURCE if args.method == "visionzip" else None
+        ),
+        "published_baseline/commit": (
+            FASTV_COMMIT if args.method == "fastv" else VISIONZIP_COMMIT if args.method == "visionzip" else None
+        ),
+        "published_baseline/fastv_k": 3 if args.method == "fastv" else None,
+        "published_baseline/fastv_r": (
+            1.0 - tokens / original_tokens if args.method == "fastv" else None
+        ),
+        "published_baseline/visionzip_recipe": (
+            "40 dominant (1 CLS + 39 patches) + 8 contextual; proportional official 54+10 recipe"
+            if args.method == "visionzip" and tokens == 48
+            else "54 dominant (1 CLS + 53 patches) + 10 contextual; official 64-token recipe"
+            if args.method == "visionzip" and tokens == 64
+            else None
+        ),
     }
 
 
@@ -587,20 +982,27 @@ def evaluator_name(dataset: str, task: str) -> str:
     if task == "grounding":
         return "box_iou_acc_at_0_5"
     name = dataset.lower()
-    if name == "pope":
+    if name in {"pope", "mme"}:
         return "yes_no_accuracy_f1"
     if name in {"aokvqa", "a-okvqa", "scienceqa_img", "scienceqa", "mmmu", "seed_bench", "seed-bench"}:
         return "multiple_choice_accuracy"
-    if name in {"ocr_vqa", "ocr-vqa", "textvqa"}:
+    if name in {"ocr_vqa", "ocr-vqa"}:
         return "normalized_exact_match"
+    if name == "textvqa":
+        return "vqa_soft_accuracy"
     return "manifest_accuracy"
 
 
 def metric_definition(dataset: str, task: str) -> str:
     if task == "grounding":
         return "Parse one predicted box and compute mean IoU, median IoU, and Acc@0.5 against manifest gt_box."
-    if dataset.lower() == "pope":
+    if dataset.lower() in {"pope", "mme"}:
         return "Normalize yes/no answers and compute accuracy, precision, recall, F1, and yes-rate."
+    if dataset.lower() == "textvqa":
+        return (
+            "Apply standard VQA answer normalisation and leave-one-annotator-out soft "
+            "consensus accuracy; retain normalized exact match as a secondary diagnostic."
+        )
     return "Dataset manifest driven scoring: multiple-choice accuracy when choices exist, otherwise normalized exact match."
 
 
@@ -636,7 +1038,7 @@ def greedy_decode_from_embeds_position_mode(
     max_new_tokens: int,
     *,
     require_position_ids: bool = False,
-) -> tuple[str, int, float, float]:
+) -> tuple[str, int, float, float, dict[str, int]]:
     generated_ids: list[Any] = []
     eos_ids = eos_token_ids(model, processor)
     attention_mask = compacted["attention_mask"]
@@ -661,6 +1063,7 @@ def greedy_decode_from_embeds_position_mode(
     prefill_latency = time.perf_counter() - prefill_start
     generated_ids.append(next_token)
     past_key_values = outputs.past_key_values
+    prompt_cache_bytes = cache_tensor_bytes(past_key_values)
     finished = bool(eos_ids and int(next_token.item()) in eos_ids)
 
     cuda_sync(torch)
@@ -688,7 +1091,11 @@ def greedy_decode_from_embeds_position_mode(
 
     generated = torch.cat(generated_ids, dim=1)[0] if generated_ids else torch.empty(0, dtype=torch.long)
     decoded = processor.decode(generated, skip_special_tokens=True).strip()
-    return decoded, int(generated.numel()), prefill_latency, decode_latency
+    final_cache_bytes = cache_tensor_bytes(past_key_values)
+    return decoded, int(generated.numel()), prefill_latency, decode_latency, {
+        "cache/prompt_total_bytes": prompt_cache_bytes,
+        "cache/final_total_bytes": final_cache_bytes,
+    }
 
 
 def generate_answer_true_removal_position_mode(
@@ -718,7 +1125,7 @@ def generate_answer_true_removal_position_mode(
         diagnostics["position_ids_last"] = int(compacted["position_ids"][0, -1].item())
     else:
         diagnostics["position_ids_mode"] = position_mode
-    raw_output, generated_count, prefill_latency, decode_latency = greedy_decode_from_embeds_position_mode(
+    raw_output, generated_count, prefill_latency, decode_latency, cache_diagnostics = greedy_decode_from_embeds_position_mode(
         torch,
         processor,
         model,
@@ -730,6 +1137,7 @@ def generate_answer_true_removal_position_mode(
     diagnostics["prefill_latency_s"] = prefill_latency
     diagnostics["time_to_first_token_s"] = prefill_latency
     diagnostics["decode_latency_s"] = decode_latency
+    diagnostics.update(cache_diagnostics)
     total_latency = (
         diagnostics["vision_encoder_latency_s"]
         + diagnostics["projector_latency_s"]
@@ -739,6 +1147,297 @@ def generate_answer_true_removal_position_mode(
     )
     diagnostics["total_inference_latency_s"] = total_latency
     return raw_output, generated_count, total_latency, diagnostics
+
+
+def _move_processor_inputs(
+    torch: Any,
+    processor: Any,
+    model: Any,
+    device: Any,
+    image: Image.Image,
+    prompt: str,
+) -> dict[str, Any]:
+    inputs = processor(
+        images=image,
+        text=apply_chat_template(processor, prompt),
+        return_tensors="pt",
+    )
+    dtype = next(model.parameters()).dtype
+    return {
+        key: (
+            value.to(device=device, dtype=dtype)
+            if key == "pixel_values"
+            else value.to(device=device)
+        )
+        if hasattr(value, "to")
+        else value
+        for key, value in inputs.items()
+    }
+
+
+def _set_eager_attention(module: Any) -> None:
+    """Select eager attention so the published selectors receive real weights."""
+    candidates = [module, getattr(module, "config", None)]
+    if hasattr(module, "modules"):
+        for child in module.modules():
+            candidates.extend([child, getattr(child, "config", None)])
+    for candidate in candidates:
+        if candidate is not None:
+            try:
+                candidate._attn_implementation = "eager"
+            except Exception:
+                pass
+
+
+def generate_fastv_answer(
+    torch: Any,
+    processor: Any,
+    model: Any,
+    device: Any,
+    image: Image.Image,
+    prompt: str,
+    max_new_tokens: int,
+    original_tokens: int,
+    retained_tokens: int,
+    *,
+    synchronise_subtimings: bool = False,
+) -> tuple[str, int, float, dict[str, Any], SelectionResult]:
+    """Run FastV's official K=3 attention rule with cached in-LLM removal."""
+    full_inputs, prep = prepare_compacted_inputs(
+        torch,
+        processor,
+        model,
+        device,
+        image,
+        prompt,
+        list(range(original_tokens)),
+        original_tokens,
+    )
+    _set_eager_attention(model.model.language_model)
+    config = ug_gap58_config_for_prune_layer(
+        3,
+        fusion_mode="single_layer",
+        probe_layers=(3,),
+        position_mode="gap_preserving",
+    )
+    forwarder = MidLayerUGPruneForwarder(
+        torch,
+        model,
+        image_token_id=int(getattr(model.config, "image_token_index", 32000)),
+        grid=int(round(original_tokens**0.5)),
+        prune_after_layer=3,
+        target_visual_tokens=retained_tokens,
+        selector_config=config,
+        diagnostics_mode="benchmark",
+        synchronise_subtimings=synchronise_subtimings,
+    )
+    generated = forwarder.generate_with_layer_aware_cache(
+        inputs_embeds=full_inputs["inputs_embeds"],
+        input_ids=full_inputs["input_ids"],
+        attention_mask=full_inputs["attention_mask"],
+        sample_id="fastv",
+        original_tokens=original_tokens,
+        seed=0,
+        query_text="",
+        query_token_status="not_used",
+        query_token_positions=(),
+        max_new_tokens=max_new_tokens,
+        eos_ids=eos_token_ids(model, processor),
+        selection_mode="fastv",
+    )
+    raw = processor.decode(generated.generated_ids, skip_special_tokens=True).strip()
+    selector_s = float(generated.diagnostics.get("mid_layer/selection_latency_s") or 0.0)
+    total = (
+        float(prep["vision_encoder_latency_s"])
+        + float(prep["projector_latency_s"])
+        + float(generated.diagnostics["llm_prefill_latency_s"])
+        + float(generated.diagnostics["decode_latency_s"])
+    )
+    selected_len = int(generated.diagnostics["mid_layer/selected_sequence_length"])
+    diagnostics = {
+        **generated.diagnostics,
+        "vision_encoder_latency_s": prep["vision_encoder_latency_s"],
+        "projector_latency_s": prep["projector_latency_s"],
+        "pruning_selection_latency_s": selector_s,
+        "total_inference_latency_s": total,
+        "original_visual_tokens": original_tokens,
+        "expected_retained_visual_tokens": retained_tokens,
+        "actual_retained_visual_tokens": retained_tokens,
+        "actual_llm_visual_tokens": retained_tokens,
+        "original_input_sequence_length": int(full_inputs["input_ids"].shape[1]),
+        "compacted_input_sequence_length": selected_len,
+        "sequence_length_reduction": int(full_inputs["input_ids"].shape[1]) - selected_len,
+        "retained_indices_checksum": indices_checksum(generated.selection.selected_indices),
+        "pruning_implementation": "fastv_pinned_hf_adapter",
+        "pruning_location": "in_llm_after_layer_3",
+        "third_party_source": FASTV_SOURCE,
+        "third_party_commit_sha": FASTV_COMMIT,
+        "position_ids_mode": "gap_preserving",
+    }
+    return raw, int(generated.generated_ids.numel()), total, diagnostics, generated.selection
+
+
+def generate_visionzip_answer(
+    torch: Any,
+    processor: Any,
+    model: Any,
+    device: Any,
+    image: Image.Image,
+    prompt: str,
+    max_new_tokens: int,
+    original_tokens: int,
+    retained_tokens: int,
+) -> tuple[str, int, float, dict[str, Any], SelectionResult]:
+    """Run pinned VisionZip dominant/contextual compression before the LLM."""
+    moved = _move_processor_inputs(torch, processor, model, device, image, prompt)
+    tower = model.model.vision_tower
+    _set_eager_attention(tower)
+    vision_backbone = clip_vision_backbone(tower)
+    selected_layer = int(getattr(model.config, "vision_feature_layer", -2))
+    layer_count = len(vision_backbone.encoder.layers)
+    layer_index = selected_layer if selected_layer >= 0 else layer_count + selected_layer
+    if not 0 <= layer_index < layer_count:
+        raise BaselineError(
+            f"VisionZip selected CLIP layer {selected_layer} resolves outside {layer_count} layers."
+        )
+    vision_layer = vision_backbone.encoder.layers[layer_index]
+    captured_keys: dict[str, Any] = {}
+
+    def capture_keys(_module: Any, _inputs: Any, output: Any) -> None:
+        captured_keys["raw"] = output
+
+    key_hook = vision_layer.self_attn.k_proj.register_forward_hook(capture_keys)
+    cuda_sync(torch)
+    vision_start = time.perf_counter()
+    try:
+        with torch.inference_mode():
+            outputs = tower(
+                moved["pixel_values"],
+                output_hidden_states=True,
+                output_attentions=True,
+                return_dict=True,
+            )
+    finally:
+        key_hook.remove()
+    cuda_sync(torch)
+    vision_latency = time.perf_counter() - vision_start
+    selected_hidden = outputs.hidden_states[selected_layer]
+    cls_hidden = selected_hidden[:, :1, :]
+    patch_hidden = selected_hidden[:, 1:, :]
+    attention = outputs.attentions[selected_layer]
+    if attention is None:
+        raise BaselineError("VisionZip requires CLIP attention weights, but none were returned.")
+    cls_attention = attention[:, :, 0, 1:]
+    raw_keys = captured_keys.get("raw")
+    if raw_keys is None:
+        raise BaselineError("VisionZip failed to capture the selected CLIP layer's raw keys.")
+    cuda_sync(torch)
+    selector_start = time.perf_counter()
+    batch, sequence, embed = raw_keys.shape
+    heads = int(vision_layer.self_attn.num_heads)
+    if embed % heads:
+        raise BaselineError(
+            f"VisionZip key width {embed} is not divisible by {heads} attention heads."
+        )
+    key_metric = (
+        raw_keys.view(batch, sequence, heads, embed // heads)
+        .transpose(1, 2)
+        .mean(dim=1)[:, 1:, :]
+    )
+    with torch.inference_mode():
+        compressed_hidden, representative_indices, method_diag = visionzip_compress(
+            torch,
+            patch_hidden,
+            cls_attention,
+            output_tokens=retained_tokens,
+            cls_hidden=cls_hidden,
+            merge_metric=key_metric,
+        )
+    method_diag["visionzip_key_metric_capture"] = (
+        "forward hook on selected CLIP layer k_proj; no projection recomputation"
+    )
+    cuda_sync(torch)
+    selector_latency = time.perf_counter() - selector_start
+    cuda_sync(torch)
+    projector_start = time.perf_counter()
+    with torch.inference_mode():
+        compressed_features = model.model.multi_modal_projector(compressed_hidden)
+    cuda_sync(torch)
+    projector_latency = time.perf_counter() - projector_start
+
+    input_ids = moved["input_ids"]
+    attention_mask = moved.get("attention_mask")
+    if attention_mask is None:
+        attention_mask = torch.ones_like(input_ids)
+    image_token_id = int(getattr(model.config, "image_token_index", 32000))
+    image_positions = torch.nonzero(input_ids[0] == image_token_id, as_tuple=False).flatten()
+    if int(image_positions.numel()) != original_tokens:
+        raise BaselineError(
+            f"VisionZip expected {original_tokens} image placeholders, found {int(image_positions.numel())}."
+        )
+    image_start = int(image_positions[0].item())
+    image_end = int(image_positions[-1].item()) + 1
+    text_embeds = model.get_input_embeddings()(input_ids).to(dtype=next(model.parameters()).dtype)
+    compacted = {
+        "inputs_embeds": torch.cat(
+            [text_embeds[:, :image_start], compressed_features, text_embeds[:, image_end:]],
+            dim=1,
+        ),
+        "attention_mask": torch.cat(
+            [
+                attention_mask[:, :image_start],
+                torch.ones(
+                    (1, retained_tokens),
+                    device=attention_mask.device,
+                    dtype=attention_mask.dtype,
+                ),
+                attention_mask[:, image_end:],
+            ],
+            dim=1,
+        ),
+    }
+    raw, generated_count, prefill_latency, decode_latency, cache_diagnostics = greedy_decode_from_embeds_position_mode(
+        torch, processor, model, compacted, max_new_tokens
+    )
+    compacted_len = int(compacted["inputs_embeds"].shape[1])
+    total = vision_latency + selector_latency + projector_latency + prefill_latency + decode_latency
+    selection = SelectionResult(
+        selected_indices=representative_indices,
+        method="visionzip",
+        budget=retained_tokens,
+        original_tokens=original_tokens,
+        grid=int(round(original_tokens**0.5)),
+        role_labels={},
+        metadata={
+            **method_diag,
+            "selection_backend": "pinned_visionzip_semantics",
+        },
+    ).validate()
+    diagnostics = {
+        **method_diag,
+        "vision_encoder_latency_s": vision_latency,
+        "projector_latency_s": projector_latency,
+        "pruning_selection_latency_s": selector_latency,
+        "llm_prefill_latency_s": prefill_latency,
+        "prefill_latency_s": prefill_latency,
+        "decode_latency_s": decode_latency,
+        "total_inference_latency_s": total,
+        "original_visual_tokens": original_tokens,
+        "expected_retained_visual_tokens": retained_tokens,
+        "actual_retained_visual_tokens": retained_tokens,
+        "actual_llm_visual_tokens": retained_tokens,
+        "original_input_sequence_length": int(input_ids.shape[1]),
+        "compacted_input_sequence_length": compacted_len,
+        "sequence_length_reduction": int(input_ids.shape[1]) - compacted_len,
+        "retained_indices_checksum": indices_checksum(representative_indices),
+        "pruning_implementation": "visionzip_pinned_hf_adapter",
+        "pruning_location": "pre_llm_vision_encoder_compression",
+        "third_party_source": VISIONZIP_SOURCE,
+        "third_party_commit_sha": VISIONZIP_COMMIT,
+        "position_ids_mode": "compact",
+        **cache_diagnostics,
+    }
+    return raw, generated_count, total, diagnostics, selection
 
 
 def init_wandb(args: argparse.Namespace, config: dict[str, Any], run_dir: Path, tags: list[str]) -> Any | None:
@@ -1034,6 +1733,7 @@ def completed_run_matches(run_dir: Path, args: argparse.Namespace, tokens: int, 
         config.get("model/precision") == args.precision,
         config.get("limit") == args.limit,
         config.get("position_mode", "compact") == args.position_mode,
+        config.get("prompt/profile", "registered") == args.prompt_profile,
         int(metrics.get("samples/evaluated", -1)) == int(row_count),
     ]
     return all(checks)
@@ -1051,12 +1751,15 @@ def build_result_common(
     config: dict[str, Any],
 ) -> dict[str, Any]:
     retained = selection.selected_indices
+    sample_metadata = sample.get("metadata") if isinstance(sample.get("metadata"), dict) else {}
     result = {
         "sample_id": str(sample["sample_id"]),
         "dataset": args.dataset,
         "split": sample.get("split") or args.split,
+        "category": sample.get("category"),
         "image_path": str(image_path.as_posix()),
         "image_id": sample.get("image_id"),
+        "mme_pair_id": sample.get("mme_pair_id") or sample_metadata.get("mme_pair_id"),
         "method": args.method,
         "seed": args.seed,
         "target_visual_tokens": config["tokens/target_visual_tokens"],
@@ -1080,10 +1783,12 @@ def run(args: argparse.Namespace) -> int:
     tokens = target_tokens(args)
     if args.method == "full" and tokens != original_tokens:
         raise BaselineError("Full-token runs must retain all 576 visual tokens.")
-    try:
-        selector = selector_for_method(args.method)
-    except SelectorError as exc:
-        raise BaselineError(str(exc)) from exc
+    selector = None
+    if args.method not in {"fastv", "visionzip"}:
+        try:
+            selector = selector_for_method(args.method)
+        except SelectorError as exc:
+            raise BaselineError(str(exc)) from exc
     name = run_name(args, tokens)
     run_dir = args.output_root / name
     figures_dir = args.figures_root / name
@@ -1104,8 +1809,12 @@ def run(args: argparse.Namespace) -> int:
             config = config_payload(args, name, original_tokens, tokens, checksum)
             config["dataset/num_samples"] = len(rows)
             config["run/output_dir"] = str(run_dir)
-            config["selector/name"] = selector.name
-            config["selector/interface_version"] = "phase0"
+            config["selector/name"] = (
+                selector.name if selector is not None else f"{args.method}_pinned_adapter"
+            )
+            config["selector/interface_version"] = (
+                "final_published_adapter_v1" if selector is None else "phase0"
+            )
             write_json(run_dir / "config.json", config)
             with (run_dir / "config.yaml").open("w", encoding="utf-8") as handle:
                 yaml.safe_dump(config, handle, sort_keys=True)
@@ -1138,30 +1847,56 @@ def run(args: argparse.Namespace) -> int:
                     sample_id = str(sample["sample_id"])
                     image_path = Path(sample["image_path"])
                     image = Image.open(image_path).convert("RGB")
-                    try:
-                        selection = selector.select(
-                            sample_id=sample_id,
-                            budget=tokens,
-                            original_tokens=original_tokens,
-                            grid=args.image_grid_size,
-                            seed=args.seed,
-                        )
-                    except SelectorError as exc:
-                        raise BaselineError(str(exc)) from exc
-                    retained = selection.selected_indices
                     prompt = make_prompt(args, sample)
-                    raw_output, generated_count, latency, diagnostics = generate_answer_true_removal_position_mode(
-                        torch,
-                        processor,
-                        model,
-                        device,
-                        image,
-                        prompt,
-                        max_new_tokens,
-                        retained,
-                        original_tokens,
-                        position_mode=args.position_mode,
-                    )
+                    if args.method == "fastv":
+                        raw_output, generated_count, latency, diagnostics, selection = generate_fastv_answer(
+                            torch,
+                            processor,
+                            model,
+                            device,
+                            image,
+                            prompt,
+                            max_new_tokens,
+                            original_tokens,
+                            tokens,
+                        )
+                    elif args.method == "visionzip":
+                        raw_output, generated_count, latency, diagnostics, selection = generate_visionzip_answer(
+                            torch,
+                            processor,
+                            model,
+                            device,
+                            image,
+                            prompt,
+                            max_new_tokens,
+                            original_tokens,
+                            tokens,
+                        )
+                    else:
+                        try:
+                            assert selector is not None
+                            selection = selector.select(
+                                sample_id=sample_id,
+                                budget=tokens,
+                                original_tokens=original_tokens,
+                                grid=args.image_grid_size,
+                                seed=args.seed,
+                            )
+                        except SelectorError as exc:
+                            raise BaselineError(str(exc)) from exc
+                        raw_output, generated_count, latency, diagnostics = generate_answer_true_removal_position_mode(
+                            torch,
+                            processor,
+                            model,
+                            device,
+                            image,
+                            prompt,
+                            max_new_tokens,
+                            selection.selected_indices,
+                            original_tokens,
+                            position_mode=args.position_mode,
+                        )
+                    retained = selection.selected_indices
                     if diagnostics.get("actual_llm_visual_tokens") != tokens:
                         raise BaselineError(f"Actual retained visual tokens {diagnostics.get('actual_llm_visual_tokens')} != target {tokens}.")
                     if args.method != "full" and diagnostics.get("compacted_input_sequence_length", 0) >= diagnostics.get("original_input_sequence_length", 0):

@@ -8,7 +8,6 @@ import json
 import os
 import sys
 import time
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -42,12 +41,15 @@ from run_official_baseline import (  # noqa: E402
     aggregate,
     budget_family,
     env_snapshot,
+    evaluator_name,
     keep_ratio,
     load_existing_results,
     load_manifest,
     load_model,
     make_prompt,
     manifest_checksum,
+    metric_definition,
+    registered_prompt_template,
     runtime_estimate,
     safe_slug,
     score_vqa,
@@ -58,18 +60,13 @@ from run_official_baseline import (  # noqa: E402
 )
 from run_ug_prune import init_wandb, log_wandb, wandb_run_info  # noqa: E402
 from vlm_pruning.analysis.coverage import selection_diagnostics  # noqa: E402
-from vlm_pruning.controllers import (  # noqa: E402
-    AdaptiveAction,
-    LoadedUGPrunePolicy,
-    build_selector_config,
-    coerce_role_preset,
-    parse_action_config,
-    role_ratios,
-)
 from vlm_pruning.features import resolve_query_token_positions  # noqa: E402
-from vlm_pruning.geometry.grid import patch_bounds, ring  # noqa: E402
-from vlm_pruning.llava_hooks import FROZEN_UG_GAP58_NAME, MidLayerUGPruneForwarder  # noqa: E402
-from vlm_pruning.selectors.base import SelectionResult  # noqa: E402
+from vlm_pruning.llava_hooks import (  # noqa: E402
+    FROZEN_UG_GAP58_NAME,
+    MidLayerUGPruneForwarder,
+    ug_gap58_config_for_prune_layer,
+)
+from vlm_pruning.selectors import selector_for_method  # noqa: E402
 
 
 DEFAULT_PROJECT = "vlm-pruning"
@@ -77,6 +74,11 @@ METHOD_NAME = "ug_prune_gap58_mid_layer_single_pass"
 OUTPUT_ROOT = Path("experiments/runs_ug_prune_single_pass")
 FIGURES_ROOT = Path("experiments/figures_ug_prune_single_pass")
 TABLES_ROOT = Path("experiments/tables/ug_prune_single_pass")
+ROLE_PRESETS: dict[str, tuple[float, float, float]] = {
+    "default": (0.50, 0.30, 0.20),
+    "more_context": (0.45, 0.40, 0.15),
+    "more_anchors": (0.45, 0.25, 0.30),
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -99,27 +101,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-figures", type=int, default=8)
     parser.add_argument("--box-coordinate-mode", default="normalized_0_1", choices=["normalized_0_1", "normalized_0_1000", "absolute_pixels"])
     parser.add_argument("--prune-after-layer", type=int, default=12)
-    parser.add_argument("--position-mode", default="gap_preserving", choices=["gap_preserving"])
+    parser.add_argument(
+        "--selection-method",
+        default="ug",
+        choices=["ug", "random", "uniform"],
+        help="Selection rule applied at the configured mid-layer boundary.",
+    )
+    parser.add_argument("--position-mode", default="gap_preserving", choices=["gap_preserving", "compact"])
     parser.add_argument("--ug-map-source", default="query_max", choices=["query_max", "query_pooled"])
     parser.add_argument("--ug-fusion-mode", default="soft_average", choices=["soft_average", "single_layer"])
-    parser.add_argument("--ug-role-preset", default="default", choices=["default", "more_context", "more_anchors"])
-    parser.add_argument("--ug-selection-strategy", default="standard", choices=["standard", "coverage", "coverage_zip"])
-    parser.add_argument("--ug-zip-alpha", type=float, default=0.20)
     parser.add_argument(
-        "--ug-oracle-mode",
-        default="none",
-        choices=["none", "target_box", "target_context_ring", "target_context_anchor"],
-        help="Use RefCOCO ground-truth boxes to preselect retained visual tokens for oracle upper-bound ablations.",
+        "--ug-probe-layers",
+        default=None,
+        help="Optional comma-separated probe layers, for example 8,12. Defaults are derived from the pruning layer.",
     )
+    parser.add_argument("--ug-role-preset", default="default", choices=["default", "more_context", "more_anchors"])
     parser.add_argument("--decode-mode", default="no_cache_recompute", choices=["no_cache_recompute", "layer_aware_cache"])
     parser.add_argument("--diagnostics-mode", default="full", choices=["full", "benchmark"])
-    parser.add_argument("--adaptive-confidence-rule", action="store_true")
-    parser.add_argument("--adaptive-early-layer", type=int, default=10)
-    parser.add_argument("--adaptive-fallback-layer", type=int, default=12)
-    parser.add_argument("--adaptive-entropy-norm-max", type=float, default=0.965)
-    parser.add_argument("--adaptive-top58-mass-min", type=float, default=0.18)
-    parser.add_argument("--adaptive-peakiness-min", type=float, default=2.0)
-    parser.add_argument("--ug-policy-checkpoint", type=Path, default=None)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--wandb", action="store_true")
@@ -158,65 +156,36 @@ def target_tokens(args: argparse.Namespace) -> int:
     return max(1, min(original, int(args.target_visual_tokens)))
 
 
+def coerce_role_preset(value: str) -> str:
+    key = str(value or "default").strip().lower().replace("-", "_")
+    if key in {"default", "current", "target_context_anchor"}:
+        return "default"
+    if key in {"more_context", "context"}:
+        return "more_context"
+    if key in {"more_anchor", "more_anchors"}:
+        return "more_anchors"
+    raise BaselineError(f"Unsupported role preset: {value}")
+
+
+def role_ratios(role_preset: str) -> tuple[float, float, float]:
+    return ROLE_PRESETS[coerce_role_preset(role_preset)]
+
+
 def selector_config_from_args(args: argparse.Namespace):
-    config = build_selector_config(
-        AdaptiveAction(
-            prune_after_layer=args.prune_after_layer,
-            target_visual_tokens=target_tokens(args),
-            map_source=args.ug_map_source,
-            fusion_mode=args.ug_fusion_mode,
-            role_preset=args.ug_role_preset,
-        )
+    target_ratio, context_ratio, anchor_ratio = role_ratios(args.ug_role_preset)
+    probe_layers = None
+    if args.ug_probe_layers:
+        probe_layers = tuple(int(item.strip()) for item in args.ug_probe_layers.split(",") if item.strip())
+    return ug_gap58_config_for_prune_layer(
+        args.prune_after_layer,
+        map_source=args.ug_map_source,
+        fusion_mode=args.ug_fusion_mode,
+        probe_layers=probe_layers,
+        position_mode=args.position_mode,
+        target_ratio=target_ratio,
+        context_ratio=context_ratio,
+        anchor_ratio=anchor_ratio,
     )
-    return replace(
-        config,
-        selection_strategy=args.ug_selection_strategy,
-        zip_alpha=float(args.ug_zip_alpha),
-    ).validate()
-
-
-class MidLayerPolicyController:
-    """Bridge an offline-trained policy checkpoint into the mid-layer forwarder."""
-
-    def __init__(self, checkpoint_path: Path, *, device: Any) -> None:
-        self.policy = LoadedUGPrunePolicy(checkpoint_path, device=device)
-        self.feature_action = self.policy.feature_action
-        parsed_feature = parse_action_config(self.feature_action)
-        self.feature_target_visual_tokens = int(parsed_feature.target_visual_tokens)
-        self.feature_selector_config = build_selector_config(
-            AdaptiveAction(
-                prune_after_layer=int(parsed_feature.prune_after_layer),
-                target_visual_tokens=int(parsed_feature.target_visual_tokens),
-                map_source=parsed_feature.map_source,
-                fusion_mode=parsed_feature.fusion_mode,
-                role_preset=parsed_feature.role_preset,
-                selection_strategy=parsed_feature.selection_strategy,
-                zip_alpha=float(parsed_feature.zip_alpha),
-            )
-        )
-
-    def choose_action(self, feature_row: dict[str, Any]) -> dict[str, Any]:
-        decision = self.policy.predict_action(feature_row)
-        parsed = decision["action_config"]
-        if int(parsed.prune_after_layer) != 12:
-            # The current online hook is intentionally K=12-only.
-            raise BaselineError(f"Online policy only supports K=12 actions, got {decision['action']}.")
-        selector_config = build_selector_config(
-            AdaptiveAction(
-                prune_after_layer=int(parsed.prune_after_layer),
-                target_visual_tokens=int(parsed.target_visual_tokens),
-                map_source=parsed.map_source,
-                fusion_mode=parsed.fusion_mode,
-                role_preset=parsed.role_preset,
-                selection_strategy=parsed.selection_strategy,
-                zip_alpha=float(parsed.zip_alpha),
-            )
-        )
-        return {
-            **decision,
-            "selector_config": selector_config,
-            "target_visual_tokens": int(parsed.target_visual_tokens),
-        }
 
 
 def run_name(args: argparse.Namespace, tokens: int) -> str:
@@ -225,189 +194,25 @@ def run_name(args: argparse.Namespace, tokens: int) -> str:
     suffix = f"limit{args.limit}_" if args.limit is not None else ""
     mode = "" if args.decode_mode == "no_cache_recompute" else f"_{safe_slug(args.decode_mode)}"
     diag = "" if args.diagnostics_mode == "full" else f"_{safe_slug(args.diagnostics_mode)}"
-    adaptive = ""
-    if args.adaptive_confidence_rule:
-        adaptive = f"_adaptive_l{args.adaptive_early_layer}_l{args.adaptive_fallback_layer}"
     variants = []
+    if args.selection_method != "ug":
+        variants.append(args.selection_method)
     if args.ug_map_source != "query_max":
         variants.append(args.ug_map_source)
     if args.ug_fusion_mode != "soft_average":
         variants.append(args.ug_fusion_mode)
+    if args.ug_probe_layers:
+        variants.append(f"probes_{args.ug_probe_layers.replace(',', '_')}")
+    if args.position_mode != "gap_preserving":
+        variants.append(args.position_mode)
     if coerce_role_preset(args.ug_role_preset) != "default":
         variants.append(coerce_role_preset(args.ug_role_preset))
-    if args.ug_selection_strategy != "standard":
-        variants.append(args.ug_selection_strategy)
-    if args.ug_selection_strategy == "coverage_zip" and abs(float(args.ug_zip_alpha) - 0.20) > 1e-9:
-        variants.append(f"zipa{str(args.ug_zip_alpha).replace('.', 'p')}")
-    if args.ug_oracle_mode != "none":
-        variants.append(f"oracle_{args.ug_oracle_mode}")
     variant = "" if not variants else "_" + "_".join(safe_slug(item) for item in variants)
-    return f"{suffix}{safe_slug(args.dataset)}_ug_gap58_mid_layer_l{args.prune_after_layer}{adaptive}_tokens{tokens}{variant}_seed{args.seed}_{args.precision}{mode}{diag}"
+    return f"{suffix}{safe_slug(args.dataset)}_ug_gap58_mid_layer_l{args.prune_after_layer}_tokens{tokens}{variant}_seed{args.seed}_{args.precision}{mode}{diag}"
 
 
 def query_text_for_sample(args: argparse.Namespace, sample: dict[str, Any]) -> str:
     return str(sample["query"] if args.task == "grounding" else sample["question"])
-
-
-def _box_area(box: tuple[float, float, float, float] | list[float]) -> float:
-    return max(0.0, float(box[2]) - float(box[0])) * max(0.0, float(box[3]) - float(box[1]))
-
-
-def _box_intersection(
-    a: tuple[float, float, float, float] | list[float],
-    b: tuple[float, float, float, float] | list[float],
-) -> float:
-    x0 = max(float(a[0]), float(b[0]))
-    y0 = max(float(a[1]), float(b[1]))
-    x1 = min(float(a[2]), float(b[2]))
-    y1 = min(float(a[3]), float(b[3]))
-    return max(0.0, x1 - x0) * max(0.0, y1 - y0)
-
-
-def _patch_center(index: int, width: int, height: int, grid: int) -> tuple[float, float]:
-    x0, y0, x1, y1 = patch_bounds(index, width, height, grid)
-    return (x0 + x1) / 2.0, (y0 + y1) / 2.0
-
-
-def _normalised_distance_sq(
-    index: int,
-    center: tuple[float, float],
-    width: int,
-    height: int,
-    grid: int,
-) -> float:
-    px, py = _patch_center(index, width, height, grid)
-    scale_x = max(float(width), 1.0)
-    scale_y = max(float(height), 1.0)
-    return ((px - center[0]) / scale_x) ** 2 + ((py - center[1]) / scale_y) ** 2
-
-
-def _append_unique(selected: list[int], candidates: list[int], budget: int) -> list[int]:
-    seen = set(selected)
-    for index in candidates:
-        idx = int(index)
-        if idx in seen:
-            continue
-        selected.append(idx)
-        seen.add(idx)
-        if len(selected) >= budget:
-            break
-    return selected
-
-
-def _fps_order(candidates: list[int], seeds: list[int], width: int, height: int, grid: int) -> list[int]:
-    remaining = [int(index) for index in candidates]
-    if not remaining:
-        return []
-    seed_points = [_patch_center(index, width, height, grid) for index in seeds]
-    if not seed_points:
-        seed_points = [(width / 2.0, height / 2.0)]
-    ordered: list[int] = []
-    while remaining:
-        best_index = remaining[0]
-        best_score = -1.0
-        all_points = seed_points + [_patch_center(index, width, height, grid) for index in ordered]
-        for index in remaining:
-            px, py = _patch_center(index, width, height, grid)
-            score = min((px - sx) ** 2 + (py - sy) ** 2 for sx, sy in all_points)
-            if score > best_score or (score == best_score and index < best_index):
-                best_index = index
-                best_score = score
-        ordered.append(best_index)
-        remaining.remove(best_index)
-    return ordered
-
-
-def oracle_selection_for_sample(
-    *,
-    args: argparse.Namespace,
-    sample: dict[str, Any],
-    width: int,
-    height: int,
-    budget: int,
-    original_tokens: int,
-) -> SelectionResult | None:
-    mode = str(args.ug_oracle_mode)
-    if mode == "none":
-        return None
-    if args.task != "grounding" or args.dataset.lower() != "refcoco":
-        raise BaselineError("--ug-oracle-mode is only supported for RefCOCO grounding runs.")
-    if not sample.get("gt_box"):
-        raise BaselineError(f"Oracle mode requires gt_box for sample {sample.get('sample_id')}.")
-    grid = int(args.image_grid_size)
-    box = [float(value) for value in sample["gt_box"]]
-    if _box_area(box) <= 0.0:
-        raise BaselineError(f"Oracle mode got an empty gt_box for sample {sample.get('sample_id')}: {box}")
-
-    box_center = ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
-    all_indices = list(range(original_tokens))
-    overlap_rows = []
-    for index in all_indices:
-        patch = patch_bounds(index, width, height, grid)
-        overlap = _box_intersection(patch, box)
-        if overlap > 0.0:
-            overlap_rows.append((index, overlap, _normalised_distance_sq(index, box_center, width, height, grid)))
-    target_order = [index for index, _, _ in sorted(overlap_rows, key=lambda row: (-row[1], row[2], row[0]))]
-    nearest_order = sorted(all_indices, key=lambda index: (_normalised_distance_sq(index, box_center, width, height, grid), index))
-
-    selected: list[int] = []
-    roles: dict[str, list[int]] = {"target": [], "context": [], "anchor": [], "fill": []}
-
-    before = len(selected)
-    _append_unique(selected, target_order, budget)
-    roles["target"] = selected[before:].copy()
-
-    if mode in {"target_context_ring", "target_context_anchor"} and len(selected) < budget:
-        context_candidates = sorted(
-            ring(set(target_order), radius=1, grid=grid),
-            key=lambda index: (_normalised_distance_sq(index, box_center, width, height, grid), index),
-        )
-        before = len(selected)
-        _append_unique(selected, context_candidates, budget)
-        roles["context"] = selected[before:].copy()
-
-    if mode == "target_context_anchor" and len(selected) < budget:
-        anchor_candidates = [index for index in all_indices if index not in set(selected)]
-        before = len(selected)
-        _append_unique(selected, _fps_order(anchor_candidates, selected, width, height, grid), budget)
-        roles["anchor"] = selected[before:].copy()
-
-    if len(selected) < budget:
-        before = len(selected)
-        _append_unique(selected, nearest_order, budget)
-        roles["fill"] = selected[before:].copy()
-
-    selected = sorted(selected)
-    roles = {role: sorted(values) for role, values in roles.items() if values}
-    result = SelectionResult(
-        selected_indices=selected,
-        method=f"oracle_{mode}",
-        budget=budget,
-        original_tokens=original_tokens,
-        grid=grid,
-        role_labels=roles,
-        metadata={
-            "selector_family": "oracle_gt_box",
-            "selection_backend": "oracle_gt_box",
-            "sample_id": str(sample.get("sample_id")),
-            "map_family": "oracle_gt_box",
-            "map_source": mode,
-            "probe_layers": [],
-            "fusion_mode": "oracle",
-            "dynamic_layer_metric": None,
-            "role_mode": mode,
-            "anchor_pattern": "fps" if mode == "target_context_anchor" else None,
-            "position_mode": args.position_mode,
-            "selection_strategy": "oracle",
-            "zip_alpha": None,
-            "budget_split": {role: len(values) for role, values in roles.items()},
-            "target_patch_count": len(target_order),
-            "target_checksum": indices_checksum(roles.get("target", [])),
-            "context_checksum": indices_checksum(roles.get("context", [])),
-            "anchor_checksum": indices_checksum(roles.get("anchor", [])),
-        },
-    )
-    return result.validate()
 
 
 def config_payload(args: argparse.Namespace, name: str, original_tokens: int, tokens: int, checksum: str) -> dict[str, Any]:
@@ -421,13 +226,17 @@ def config_payload(args: argparse.Namespace, name: str, original_tokens: int, to
         "model/name": args.model_path,
         "model/stack": "huggingface_llava",
         "model/precision": args.precision,
+        "model/decoding": "deterministic_greedy",
+        "model/max_new_tokens": args.max_new_tokens
+        or (48 if args.task == "grounding" else 16),
         "dataset/name": args.dataset,
         "dataset/split": split,
         "dataset/manifest": str(args.manifest),
         "dataset/manifest_checksum": checksum,
         "task": args.task,
-        "method/name": METHOD_NAME,
+        "method/name": METHOD_NAME if args.selection_method == "ug" else f"{args.selection_method}_mid_layer",
         "method/seed": args.seed,
+        "selection/method": args.selection_method,
         "tokens/original_visual_tokens": original_tokens,
         "tokens/target_visual_tokens": tokens,
         "tokens/actual_visual_tokens": tokens,
@@ -452,19 +261,9 @@ def config_payload(args: argparse.Namespace, name: str, original_tokens: int, to
         "ug/context_radius": selector_config.context_radius,
         "ug/anchor_pattern": selector_config.anchor_pattern,
         "ug/position_mode": selector_config.position_mode,
-        "ug/selection_strategy": selector_config.selection_strategy,
-        "ug/zip_alpha": float(selector_config.zip_alpha),
-        "ug/oracle_mode": args.ug_oracle_mode,
         "ug/prune_after_layer": args.prune_after_layer,
         "ug/decode_mode": args.decode_mode,
         "ug/diagnostics_mode": args.diagnostics_mode,
-        "ug/adaptive_enabled": bool(args.adaptive_confidence_rule),
-        "ug/adaptive_early_layer": args.adaptive_early_layer if args.adaptive_confidence_rule else None,
-        "ug/adaptive_fallback_layer": args.adaptive_fallback_layer if args.adaptive_confidence_rule else None,
-        "ug/adaptive_entropy_norm_max": args.adaptive_entropy_norm_max if args.adaptive_confidence_rule else None,
-        "ug/adaptive_top58_mass_min": args.adaptive_top58_mass_min if args.adaptive_confidence_rule else None,
-        "ug/adaptive_peakiness_min": args.adaptive_peakiness_min if args.adaptive_confidence_rule else None,
-        "ug/policy_checkpoint": str(args.ug_policy_checkpoint) if args.ug_policy_checkpoint is not None else None,
         "ug/cache_implementation": (
             "layer_aware_two_bank_dynamic_cache"
             if args.decode_mode == "layer_aware_cache"
@@ -475,6 +274,9 @@ def config_payload(args: argparse.Namespace, name: str, original_tokens: int, to
             if args.decode_mode == "layer_aware_cache"
             else "layer_specific_kv_cache_not_used_in_v1"
         ),
+        "evaluator/name": evaluator_name(args.dataset, args.task),
+        "evaluator/metric_definition": metric_definition(args.dataset, args.task),
+        "prompt/template": registered_prompt_template(args),
     }
 
 
@@ -491,25 +293,22 @@ def completed_run_matches(run_dir: Path, args: argparse.Namespace, tokens: int, 
     checks = [
         config.get("dataset/manifest_checksum") == checksum,
         int(config.get("dataset/num_samples", -1)) == int(row_count),
-        config.get("method/name") == METHOD_NAME,
+        config.get("method/name")
+        == (METHOD_NAME if args.selection_method == "ug" else f"{args.selection_method}_mid_layer"),
+        config.get("selection/method", "ug") == args.selection_method,
         int(config.get("method/seed", -1)) == int(args.seed),
         int(config.get("tokens/target_visual_tokens", -1)) == int(tokens),
         int(config.get("tokens/actual_visual_tokens", -1)) == int(tokens),
         int(config.get("ug/prune_after_layer", -1)) == int(args.prune_after_layer),
         config.get("ug/map_source", "query_max") == args.ug_map_source,
         config.get("ug/fusion_mode", "soft_average") == args.ug_fusion_mode,
+        config.get("ug/probe_layers") == ",".join(
+            str(layer) for layer in selector_config_from_args(args).probe_layers
+        ),
         config.get("ug/role_preset", "default") == coerce_role_preset(args.ug_role_preset),
-        config.get("ug/selection_strategy", "standard") == args.ug_selection_strategy,
-        float(config.get("ug/zip_alpha", 0.20)) == float(args.ug_zip_alpha),
-        config.get("ug/oracle_mode", "none") == args.ug_oracle_mode,
+        config.get("position_mode", "gap_preserving") == args.position_mode,
         config.get("ug/decode_mode") == args.decode_mode,
         config.get("ug/diagnostics_mode", "full") == args.diagnostics_mode,
-        bool(config.get("ug/adaptive_enabled", False)) == bool(args.adaptive_confidence_rule),
-        int(config.get("ug/adaptive_early_layer") or args.adaptive_early_layer) == int(args.adaptive_early_layer),
-        int(config.get("ug/adaptive_fallback_layer") or args.adaptive_fallback_layer) == int(args.adaptive_fallback_layer),
-        float(config.get("ug/adaptive_entropy_norm_max") or args.adaptive_entropy_norm_max) == float(args.adaptive_entropy_norm_max),
-        float(config.get("ug/adaptive_top58_mass_min") or args.adaptive_top58_mass_min) == float(args.adaptive_top58_mass_min),
-        float(config.get("ug/adaptive_peakiness_min") or args.adaptive_peakiness_min) == float(args.adaptive_peakiness_min),
         config.get("model/precision") == args.precision,
         config.get("limit") == args.limit,
         int(metrics.get("samples/evaluated", -1)) == int(row_count),
@@ -522,6 +321,7 @@ def wandb_tags(args: argparse.Namespace, config: dict[str, Any], env: dict[str, 
         "phase2b",
         "ug-prune",
         "single-pass-pilot",
+        f"selection-{args.selection_method}",
         safe_slug(args.dataset),
         args.task,
         f"tokens-{config['tokens/actual_visual_tokens']}",
@@ -530,17 +330,13 @@ def wandb_tags(args: argparse.Namespace, config: dict[str, Any], env: dict[str, 
         f"fusion-{args.ug_fusion_mode}",
         f"role-{coerce_role_preset(args.ug_role_preset)}",
         args.precision,
-        "gap-preserving",
+        safe_slug(args.position_mode),
         safe_slug(args.decode_mode),
         safe_slug(args.diagnostics_mode),
     ]
     if env and env.get("gpu_name"):
         tags.append(safe_slug(str(env["gpu_name"])))
     tags.extend(safe_slug(item) for item in args.wandb_tags.split(",") if item.strip())
-    if args.adaptive_confidence_rule:
-        tags.append("adaptive-confidence")
-    if args.ug_oracle_mode != "none":
-        tags.append(f"oracle-{safe_slug(args.ug_oracle_mode)}")
     return tags
 
 
@@ -568,21 +364,13 @@ def generate_mid_layer_answer(
     original_tokens: int,
     forwarder: MidLayerUGPruneForwarder,
     decode_mode: str,
-    policy_context: dict[str, Any] | None = None,
-    adaptive_confidence_rule: bool = False,
-    adaptive_early_layer: int = 10,
-    adaptive_fallback_layer: int = 12,
-    adaptive_entropy_norm_max: float = 0.965,
-    adaptive_top58_mass_min: float = 0.18,
-    adaptive_peakiness_min: float = 2.0,
-    precomputed_selection: SelectionResult | None = None,
+    selection: Any | None = None,
+    selection_mode: str = "ug",
 ) -> tuple[str, int, float, Any, dict[str, Any]]:
     if int(full_inputs["input_ids"].shape[0]) != 1:
         raise BaselineError("Phase 2B pilot currently supports batch size 1.")
     if prep_diag.get("actual_llm_visual_tokens") != original_tokens:
         raise BaselineError("Mid-layer UG-Prune must start from all visual tokens.")
-    if precomputed_selection is not None and adaptive_confidence_rule:
-        raise BaselineError("Precomputed oracle selections are not compatible with adaptive confidence runs.")
 
     input_ids = full_inputs["input_ids"]
     inputs_embeds = full_inputs["inputs_embeds"]
@@ -590,42 +378,21 @@ def generate_mid_layer_answer(
     eos_ids = eos_token_ids(model, processor)
 
     if decode_mode == "layer_aware_cache":
-        if adaptive_confidence_rule:
-            generated_result = forwarder.generate_with_adaptive_layer_aware_cache(
-                inputs_embeds=inputs_embeds,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                sample_id=sample_id,
-                original_tokens=original_tokens,
-                seed=seed,
-                query_text=query_text,
-                query_token_status=query_token_status,
-                query_token_positions=query_token_positions,
-                policy_context=policy_context,
-                max_new_tokens=max_new_tokens,
-                eos_ids=eos_ids,
-                early_prune_layer=adaptive_early_layer,
-                fallback_prune_layer=adaptive_fallback_layer,
-                entropy_norm_max=adaptive_entropy_norm_max,
-                top58_mass_min=adaptive_top58_mass_min,
-                peakiness_min=adaptive_peakiness_min,
-            )
-        else:
-            generated_result = forwarder.generate_with_layer_aware_cache(
-                inputs_embeds=inputs_embeds,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                sample_id=sample_id,
-                original_tokens=original_tokens,
-                seed=seed,
-                query_text=query_text,
-                query_token_status=query_token_status,
-                query_token_positions=query_token_positions,
-                policy_context=policy_context,
-                max_new_tokens=max_new_tokens,
-                eos_ids=eos_ids,
-                selection=precomputed_selection,
-            )
+        generated_result = forwarder.generate_with_layer_aware_cache(
+            inputs_embeds=inputs_embeds,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            sample_id=sample_id,
+            original_tokens=original_tokens,
+            seed=seed,
+            query_text=query_text,
+            query_token_status=query_token_status,
+            query_token_positions=query_token_positions,
+            max_new_tokens=max_new_tokens,
+            eos_ids=eos_ids,
+            selection=selection,
+            selection_mode=selection_mode,
+        )
         generated = generated_result.generated_ids
         decoded = processor.decode(generated, skip_special_tokens=True).strip()
         retained = generated_result.selection.selected_indices
@@ -633,11 +400,6 @@ def generate_mid_layer_answer(
         selection_overhead = float(generated_result.diagnostics.get("mid_layer/map_extraction_latency_s") or 0.0) + float(
             generated_result.diagnostics.get("mid_layer/selection_latency_s") or 0.0
         )
-        if generated_result.diagnostics.get("ug/adaptive_enabled") and not generated_result.diagnostics.get(
-            "ug/adaptive_confident_at_early_layer"
-        ):
-            selection_overhead += float(generated_result.diagnostics.get("mid_layer/early_map_extraction_latency_s") or 0.0)
-            selection_overhead += float(generated_result.diagnostics.get("mid_layer/early_selection_latency_s") or 0.0)
         total_latency = (
             float(prep_diag["vision_encoder_latency_s"])
             + float(prep_diag["projector_latency_s"])
@@ -659,7 +421,7 @@ def generate_mid_layer_answer(
             "compacted_input_sequence_length": compacted_len,
             "sequence_length_reduction": int(full_inputs["input_ids"].shape[1]) - compacted_len,
             "retained_indices_checksum": indices_checksum(retained),
-            "position_ids_mode": "gap_preserving",
+            "position_ids_mode": str(generated_result.diagnostics.get("ug/position_mode", "gap_preserving")),
             "position_ids_first": int(generated_result.diagnostics["mid_layer/selected_positions_first"]),
             "position_ids_last": int(generated_result.diagnostics["mid_layer/selected_positions_last"]),
             "decode_mode": "layer_aware_cache",
@@ -668,8 +430,6 @@ def generate_mid_layer_answer(
 
     if decode_mode != "no_cache_recompute":
         raise BaselineError(f"Unsupported decode mode: {decode_mode}")
-    if adaptive_confidence_rule:
-        raise BaselineError("Adaptive confidence rule currently requires --decode-mode layer_aware_cache.")
 
     generated_ids: list[Any] = []
     selection = None
@@ -689,7 +449,7 @@ def generate_mid_layer_answer(
             query_text=query_text,
             query_token_status=query_token_status,
             query_token_positions=query_token_positions,
-            selection=precomputed_selection,
+            selection=selection,
         )
         next_token = torch.argmax(result.logits[:, -1, :], dim=-1, keepdim=True)
     cuda_sync(torch)
@@ -757,7 +517,7 @@ def generate_mid_layer_answer(
         "compacted_input_sequence_length": compacted_len,
         "sequence_length_reduction": int(full_inputs["input_ids"].shape[1]) - compacted_len,
         "retained_indices_checksum": indices_checksum(retained),
-        "position_ids_mode": "gap_preserving",
+        "position_ids_mode": str(first_diag.get("ug/position_mode", "gap_preserving")),
         "position_ids_first": int(first_diag["mid_layer/selected_positions_first"]),
         "position_ids_last": int(first_diag["mid_layer/selected_positions_last"]),
         "decode_mode": "no_cache_recompute",
@@ -790,17 +550,16 @@ def build_result(
     sample_metadata = sample.get("metadata") if isinstance(sample.get("metadata"), dict) else {}
     category = sample.get("category") or sample_metadata.get("category")
     source_row = sample_metadata.get("source_row")
-    policy_sample_id = f"{args.dataset}:{category or ''}:{sample.get('sample_id')}:{'' if source_row is None else source_row}"
     result = {
         "sample_id": str(sample["sample_id"]),
-        "policy_sample_id": policy_sample_id,
         "dataset": args.dataset,
         "split": sample.get("split") or args.split,
         "category": category,
         "source_row": source_row,
         "image_path": str(image_path.as_posix()),
         "image_id": sample.get("image_id"),
-        "method": METHOD_NAME,
+        "mme_pair_id": sample.get("mme_pair_id") or sample_metadata.get("mme_pair_id"),
+        "method": config.get("method/name", METHOD_NAME),
         "seed": args.seed,
         "target_visual_tokens": selected_budget,
         "keep_ratio": keep_ratio(selected_budget, original_visual_tokens),
@@ -808,6 +567,10 @@ def build_result(
         "latency_s": latency,
         "generated_token_count": generated_count,
         "retained_indices_checksum": indices_checksum(retained),
+        # The exact indices are lightweight (48 integers in final runs) and
+        # remain essential for budget validation and qualitative overlays even
+        # when heavy map diagnostics are disabled.
+        "retained_indices": retained,
         "selector_name": selection.method,
         "selection/exact_budget": float(exact_budget),
         "selection/duplicate_count": float(duplicate_count),
@@ -822,8 +585,6 @@ def build_result(
         "ug_role_mode": selector_metadata.get("role_mode"),
         "ug_anchor_pattern": selector_metadata.get("anchor_pattern"),
         "ug_position_mode": selector_metadata.get("position_mode"),
-        "ug_selection_strategy": selector_metadata.get("selection_strategy"),
-        "ug_zip_alpha": selector_metadata.get("zip_alpha"),
         "ug_budget_split": selector_metadata.get("budget_split"),
         "ug_query_token_status": selector_metadata.get("query_token_status"),
         "ug_query_token_positions": selector_metadata.get("query_token_positions"),
@@ -832,7 +593,6 @@ def build_result(
     if args.diagnostics_mode == "full":
         result.update(
             {
-                "retained_indices": retained,
                 "selector_metadata": selection.as_metadata(),
                 "role_labels": selection.role_labels,
                 "ug_fused_map_stats": selector_metadata.get("map_stats"),
@@ -846,25 +606,6 @@ def run(args: argparse.Namespace) -> int:
     args.method = METHOD_NAME
     if args.no_wandb:
         args.wandb = False
-    if args.ug_policy_checkpoint is not None:
-        if args.decode_mode != "layer_aware_cache":
-            raise BaselineError("UG policy mode requires --decode-mode layer_aware_cache.")
-        if int(args.prune_after_layer) != 12:
-            raise BaselineError("UG policy mode currently supports only --prune-after-layer 12.")
-    if args.ug_oracle_mode != "none":
-        if args.task != "grounding" or args.dataset.lower() != "refcoco":
-            raise BaselineError("--ug-oracle-mode is only supported for RefCOCO grounding runs.")
-        if args.ug_policy_checkpoint is not None:
-            raise BaselineError("--ug-oracle-mode cannot be combined with --ug-policy-checkpoint.")
-        if args.adaptive_confidence_rule:
-            raise BaselineError("--ug-oracle-mode cannot be combined with --adaptive-confidence-rule.")
-    if args.adaptive_confidence_rule:
-        if args.decode_mode != "layer_aware_cache":
-            raise BaselineError("Adaptive confidence rule requires --decode-mode layer_aware_cache.")
-        if int(args.prune_after_layer) != int(args.adaptive_fallback_layer):
-            raise BaselineError("--prune-after-layer must match --adaptive-fallback-layer for adaptive runs.")
-        if int(args.adaptive_early_layer) >= int(args.adaptive_fallback_layer):
-            raise BaselineError("--adaptive-early-layer must be earlier than --adaptive-fallback-layer.")
     original_tokens = args.image_grid_size * args.image_grid_size
     tokens = target_tokens(args)
     selector_config = selector_config_from_args(args)
@@ -912,11 +653,6 @@ def run(args: argparse.Namespace) -> int:
                 torch.cuda.reset_peak_memory_stats()
 
             image_token_id = int(getattr(model.config, "image_token_index", 32000))
-            policy_controller = (
-                MidLayerPolicyController(args.ug_policy_checkpoint, device=device)
-                if args.ug_policy_checkpoint is not None
-                else None
-            )
             forwarder = MidLayerUGPruneForwarder(
                 torch,
                 model,
@@ -926,10 +662,14 @@ def run(args: argparse.Namespace) -> int:
                 target_visual_tokens=tokens,
                 selector_config=selector_config,
                 diagnostics_mode=args.diagnostics_mode,
-                policy_controller=policy_controller,
             )
 
             tokenizer = getattr(processor, "tokenizer", processor)
+            baseline_selector = (
+                selector_for_method(args.selection_method)
+                if args.selection_method in {"random", "uniform"}
+                else None
+            )
             results = list(existing)
             figure_paths: list[Path] = []
             max_new_tokens = args.max_new_tokens or (48 if args.task == "grounding" else 16)
@@ -956,24 +696,32 @@ def run(args: argparse.Namespace) -> int:
                         list(range(original_tokens)),
                         original_tokens,
                     )
-                    resolution = resolve_query_token_positions(
-                        tokenizer,
-                        text_prompt,
-                        query_text,
-                        input_ids=full_inputs["input_ids"][0].detach().cpu().tolist(),
-                        image_token_id=image_token_id,
-                    )
-                    if not resolution.token_positions:
-                        raise BaselineError(f"Query-token resolution failed for sample {sample_id}: {resolution.resolver_status}")
+                    if baseline_selector is None:
+                        resolution = resolve_query_token_positions(
+                            tokenizer,
+                            text_prompt,
+                            query_text,
+                            input_ids=full_inputs["input_ids"][0].detach().cpu().tolist(),
+                            image_token_id=image_token_id,
+                        )
+                        if not resolution.token_positions:
+                            raise BaselineError(
+                                f"Query-token resolution failed for sample {sample_id}: {resolution.resolver_status}"
+                            )
+                        query_token_status = resolution.resolver_status
+                        query_token_positions = resolution.token_positions
+                        precomputed_selection = None
+                    else:
+                        query_token_status = "not_required_for_baseline_control"
+                        query_token_positions = []
+                        precomputed_selection = baseline_selector.select(
+                            sample_id=sample_id,
+                            budget=tokens,
+                            original_tokens=original_tokens,
+                            grid=args.image_grid_size,
+                            seed=args.seed,
+                        )
 
-                    precomputed_selection = oracle_selection_for_sample(
-                        args=args,
-                        sample=sample,
-                        width=width,
-                        height=height,
-                        budget=tokens,
-                        original_tokens=original_tokens,
-                    )
                     raw_output, generated_count, latency, selection, diagnostics = generate_mid_layer_answer(
                         torch,
                         processor,
@@ -982,36 +730,25 @@ def run(args: argparse.Namespace) -> int:
                         prep_diag=prep_diag,
                         sample_id=sample_id,
                         query_text=query_text,
-                        query_token_status=resolution.resolver_status,
-                        query_token_positions=resolution.token_positions,
-                        policy_context={
-                            "dataset": args.dataset,
-                            "task": args.task,
-                            "task_family": "grounding" if args.task == "grounding" else ("yes_no_vqa" if args.dataset.lower() == "pope" else "open_vqa"),
-                            "question": sample.get("question"),
-                        },
+                        query_token_status=query_token_status,
+                        query_token_positions=query_token_positions,
                         seed=args.seed,
                         max_new_tokens=max_new_tokens,
                         original_tokens=original_tokens,
                         forwarder=forwarder,
                         decode_mode=args.decode_mode,
-                        adaptive_confidence_rule=args.adaptive_confidence_rule,
-                        adaptive_early_layer=args.adaptive_early_layer,
-                        adaptive_fallback_layer=args.adaptive_fallback_layer,
-                        adaptive_entropy_norm_max=args.adaptive_entropy_norm_max,
-                        adaptive_top58_mass_min=args.adaptive_top58_mass_min,
-                        adaptive_peakiness_min=args.adaptive_peakiness_min,
-                        precomputed_selection=precomputed_selection,
+                        selection=precomputed_selection,
+                        selection_mode=args.selection_method,
                     )
                     expected_tokens = int(getattr(selection, "budget", tokens))
                     if int(diagnostics.get("actual_llm_visual_tokens") or -1) != expected_tokens:
                         raise BaselineError(
                             f"Actual retained visual tokens {diagnostics.get('actual_llm_visual_tokens')} != selected budget {expected_tokens}."
                         )
-                    if args.ug_policy_checkpoint is None and expected_tokens != tokens:
+                    if expected_tokens != tokens:
                         raise BaselineError(f"Selected budget {expected_tokens} != target {tokens}.")
                     result = build_result(args, sample, image_path, raw_output, generated_count, latency, selection, diagnostics, config)
-                    if args.diagnostics_mode == "full":
+                    if args.diagnostics_mode == "full" and baseline_selector is None:
                         result["ug_query_token_debug"] = resolution.as_dict()
 
                     if args.task == "grounding":
@@ -1065,7 +802,7 @@ def run(args: argparse.Namespace) -> int:
                     results.append(result)
                     handle.write(json.dumps(result, ensure_ascii=True) + "\n")
                     done = len(existing) + index + 1
-                    if done % 1 == 0:
+                    if done % 50 == 0 or done == len(rows):
                         print(f"Processed {done}/{len(rows)} samples")
 
             run_duration_s = time.perf_counter() - run_start
@@ -1091,9 +828,6 @@ def run(args: argparse.Namespace) -> int:
             metrics["ug/map_source"] = config["ug/map_source"]
             metrics["ug/fusion_mode"] = config["ug/fusion_mode"]
             metrics["ug/role_preset"] = config["ug/role_preset"]
-            metrics["ug/selection_strategy"] = config["ug/selection_strategy"]
-            metrics["ug/zip_alpha"] = config["ug/zip_alpha"]
-            metrics["ug/oracle_mode"] = config["ug/oracle_mode"]
             metrics["ug/target_ratio"] = config["ug/target_ratio"]
             metrics["ug/context_ratio"] = config["ug/context_ratio"]
             metrics["ug/anchor_ratio"] = config["ug/anchor_ratio"]
@@ -1108,59 +842,10 @@ def run(args: argparse.Namespace) -> int:
                 "ug/map_top_96_mass",
                 "ug/map_selected_occupied_bins_3x3",
                 "ug/map_selected_mean_pairwise_spread",
-                "ug/zip_discarded_tokens",
-                "ug/zip_merge_target_tokens",
-                "ug/zip_assigned_tokens",
-                "ug/zip_nonempty_merge_targets",
             ):
                 values = [float(row[field]) for row in results if row.get(field) is not None]
                 if values:
                     metrics[f"{field}_mean"] = sum(values) / len(values)
-            metrics["ug/adaptive_enabled"] = bool(args.adaptive_confidence_rule)
-            metrics["ug/policy_enabled"] = args.ug_policy_checkpoint is not None
-            if args.ug_policy_checkpoint is not None:
-                policy_counts: dict[str, int] = {}
-                policy_raw_counts: dict[str, int] = {}
-                policy_budgets: dict[str, int] = {}
-                b96_blocked = 0
-                for row in results:
-                    action = row.get("ug/policy_selected_action")
-                    if action is not None:
-                        key = str(action)
-                        policy_counts[key] = policy_counts.get(key, 0) + 1
-                    raw_action = row.get("ug/policy_raw_action")
-                    if raw_action is not None:
-                        key = str(raw_action)
-                        policy_raw_counts[key] = policy_raw_counts.get(key, 0) + 1
-                    decision = row.get("ug/policy_constraint_decision")
-                    if isinstance(decision, dict) and decision.get("raw_best_action") != decision.get("selected_action"):
-                        b96_blocked += 1
-                    budget = row.get("ug/policy_selected_budget")
-                    if budget is not None:
-                        key = str(int(budget))
-                        policy_budgets[key] = policy_budgets.get(key, 0) + 1
-                metrics["ug/policy_checkpoint"] = str(args.ug_policy_checkpoint)
-                metrics["ug/policy_action_counts"] = policy_counts
-                metrics["ug/policy_raw_action_counts"] = policy_raw_counts
-                metrics["ug/policy_budget_counts"] = policy_budgets
-                metrics["ug/policy_b96_blocked_count"] = b96_blocked
-            if args.adaptive_confidence_rule:
-                chosen_layers: dict[str, int] = {}
-                confident_count = 0
-                for row in results:
-                    chosen = row.get("ug/adaptive_chosen_layer")
-                    if chosen is not None:
-                        key = str(int(chosen))
-                        chosen_layers[key] = chosen_layers.get(key, 0) + 1
-                    if row.get("ug/adaptive_confident_at_early_layer"):
-                        confident_count += 1
-                metrics["ug/adaptive_early_layer"] = args.adaptive_early_layer
-                metrics["ug/adaptive_fallback_layer"] = args.adaptive_fallback_layer
-                metrics["ug/adaptive_chosen_layer_counts"] = chosen_layers
-                metrics["ug/adaptive_confident_rate"] = confident_count / len(results) if results else None
-                metrics["ug/adaptive_entropy_norm_max"] = args.adaptive_entropy_norm_max
-                metrics["ug/adaptive_top58_mass_min"] = args.adaptive_top58_mass_min
-                metrics["ug/adaptive_peakiness_min"] = args.adaptive_peakiness_min
             backends = sorted({str(row.get("ug/selection_backend")) for row in results if row.get("ug/selection_backend")})
             metrics["ug/selection_backend"] = ",".join(backends) if backends else None
             metrics["ug/cache_implementation"] = (
