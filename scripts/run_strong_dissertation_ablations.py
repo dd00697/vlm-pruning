@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from vlm_pruning.artifacts import validate_completed_run
+
 
 MANIFEST = "data/manifests/official_baselines/refcoco_val.jsonl"
 RUNS_ROOT = Path("experiments/runs_ug_prune_single_pass")
@@ -245,18 +247,31 @@ def latency_runs(args: argparse.Namespace) -> list[Run]:
     return runs
 
 
-def evaluated_rows(run: Run) -> int:
-    path = run.run_dir / "metrics.json"
-    if not path.exists():
-        return -1
+def run_integrity(run: Run) -> dict[str, Any]:
+    config_path = run.run_dir / "config.json"
+    if not config_path.exists():
+        return {"status": "fail", "issues": ["missing config.json"]}
     try:
-        return int(json.loads(path.read_text(encoding="utf-8")).get("samples/evaluated", -1))
-    except Exception:
-        return -1
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        manifest_path = Path(str(config["dataset/manifest"]))
+        manifest_rows = [json.loads(line) for line in manifest_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if config.get("limit") is not None:
+            manifest_rows = manifest_rows[: int(config["limit"])]
+        return validate_completed_run(
+            run.run_dir,
+            manifest_rows,
+            budget=int(config["tokens/target_visual_tokens"]),
+            original_tokens=int(config["tokens/original_visual_tokens"]),
+            task=str(config["task"]),
+            strategy=config.get("selection/strategy") if config.get("selection/method", "ug") == "ug" else None,
+        )
+    except Exception as exc:
+        return {"status": "fail", "issues": [str(exc)]}
 
 
 def is_complete(run: Run) -> bool:
-    return evaluated_rows(run) == run.expected_rows
+    report = run_integrity(run)
+    return report.get("status") == "pass" and report.get("rows", {}).get("actual_rows") == run.expected_rows
 
 
 def write_json(path: Path, payload: Any) -> None:

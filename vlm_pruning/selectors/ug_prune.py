@@ -17,6 +17,7 @@ from .base import SelectionResult, SelectorError
 
 @dataclass(frozen=True)
 class UGPruneConfig:
+    selector_strategy: str = "structured_tca"
     map_family: str = "unrolled"
     map_source: str = "query_max"
     probe_layers: tuple[int, ...] = (4, 8, 12)
@@ -33,6 +34,8 @@ class UGPruneConfig:
     position_mode: str = "compact"
 
     def validate(self) -> "UGPruneConfig":
+        if self.selector_strategy not in {"query_topk", "target_nms_only", "structured_tca"}:
+            raise SelectorError(f"Unsupported selector_strategy: {self.selector_strategy}")
         if not self.probe_layers:
             raise SelectorError("UG-Prune requires at least one probe layer.")
         if any(layer <= 0 for layer in self.probe_layers):
@@ -119,7 +122,9 @@ def budget_split(budget: int, config: UGPruneConfig) -> tuple[int, int, int]:
     config.validate()
     if budget <= 0:
         raise SelectorError(f"budget must be positive, got {budget}.")
-    if config.role_mode == "target_only":
+    if config.selector_strategy == "query_topk":
+        return 0, 0, 0
+    if config.selector_strategy == "target_nms_only" or config.role_mode == "target_only":
         return budget, 0, 0
     if config.role_mode == "target_context" or config.anchor_pattern == "none":
         total_tc = config.target_ratio + config.context_ratio
@@ -162,18 +167,26 @@ def budget_split(budget: int, config: UGPruneConfig) -> tuple[int, int, int]:
 
 
 def select_target(scores: np.ndarray, count: int, *, nms_radius: int, grid: int) -> list[int]:
+    selected, _ = select_target_with_fallback(scores, count, nms_radius=nms_radius, grid=grid)
+    return selected
+
+
+def select_target_with_fallback(
+    scores: np.ndarray, count: int, *, nms_radius: int, grid: int
+) -> tuple[list[int], int]:
     selected: list[int] = []
     for index in _rank_indices(scores):
         if not _is_near_any(index, selected, nms_radius, grid):
             selected.append(index)
             if len(selected) == count:
-                return selected
+                return selected, 0
+    nms_count = len(selected)
     for index in _rank_indices(scores):
         if index not in selected:
             selected.append(index)
             if len(selected) == count:
                 break
-    return selected
+    return selected, len(selected) - nms_count
 
 
 def select_context(scores: np.ndarray, target: list[int], count: int, *, radius: int, grid: int) -> list[int]:
@@ -338,24 +351,33 @@ class UGPruneSelector:
         scores = scores_2d.reshape(-1)
         target_count, context_count, anchor_count = budget_split(budget, self.config)
 
-        target = select_target(scores, target_count, nms_radius=self.config.nms_radius, grid=grid)
-        context = select_context(scores, target, context_count, radius=self.config.context_radius, grid=grid)
-        anchor = select_anchors(
-            scores,
-            anchor_count,
-            exclude=set(target) | set(context),
-            bins=self.config.anchor_bins,
-            grid=grid,
-            pattern=self.config.anchor_pattern,
-        )
+        nms_fallback_count = 0
+        if self.config.selector_strategy == "query_topk":
+            target, context, anchor = [], [], []
+            query_topk = _rank_indices(scores)[:budget]
+        else:
+            target, nms_fallback_count = select_target_with_fallback(
+                scores, target_count, nms_radius=self.config.nms_radius, grid=grid
+            )
+            context = select_context(scores, target, context_count, radius=self.config.context_radius, grid=grid)
+            anchor = select_anchors(
+                scores,
+                anchor_count,
+                exclude=set(target) | set(context),
+                bins=self.config.anchor_bins,
+                grid=grid,
+                pattern=self.config.anchor_pattern,
+            )
+            query_topk = []
 
         roles = {
             "target": sorted(target),
             "context": sorted(context),
             "anchor": sorted(anchor),
+            "query_topk": sorted(query_topk),
             "fill": [],
         }
-        selected = set(target) | set(context) | set(anchor)
+        selected = set(target) | set(context) | set(anchor) | set(query_topk)
         if len(selected) < budget:
             for index in _rank_indices(scores):
                 if index not in selected:
@@ -380,15 +402,20 @@ class UGPruneSelector:
             role_labels={role: sorted(values) for role, values in roles.items() if values},
             metadata={
                 "selector_family": "ug_prune_training_free",
+                "selector_strategy": self.config.selector_strategy,
                 "sample_id": sample_id,
                 "config": self.config.as_dict(),
                 "map_family": self.config.map_family,
                 "budget_split": {
+                    "query_topk": budget if self.config.selector_strategy == "query_topk" else 0,
                     "target": target_count,
                     "context": context_count,
                     "anchor": anchor_count,
                     "fill": len(roles["fill"]),
                 },
+                "realised_role_counts": {role: len(values) for role, values in roles.items()},
+                "nms_fallback_count": nms_fallback_count,
+                "nms_radius": self.config.nms_radius,
                 "map_key": inputs.map_key,
                 "map_source": self.config.map_source,
                 "probe_layers": list(self.config.probe_layers),

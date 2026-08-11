@@ -135,6 +135,7 @@ def ug_gap58_config_for_prune_layer(
     target_ratio: float | None = None,
     context_ratio: float | None = None,
     anchor_ratio: float | None = None,
+    selector_strategy: str | None = None,
 ) -> UGPruneConfig:
     """Return the UG-Gap-58 config using only probe layers available before pruning."""
     layer = int(prune_after_layer)
@@ -161,6 +162,7 @@ def ug_gap58_config_for_prune_layer(
     if len(probes) == 1:
         requested_fusion = "single_layer"
     return UGPruneConfig(
+        selector_strategy=selector_strategy or base.selector_strategy,
         map_family=base.map_family,
         map_source=map_source or base.map_source,
         probe_layers=probes,
@@ -524,7 +526,7 @@ class MidLayerUGPruneForwarder:
             and config.map_family == "unrolled"
             and config.map_source in {"query_max", "query_pooled"}
             and config.fusion_mode in {"soft_average", "single_layer"}
-            and config.role_mode == "target_context_anchor"
+            and config.selector_strategy in {"query_topk", "target_nms_only", "structured_tca"}
             and config.context_radius == 1
             and config.anchor_pattern == "fps"
             and config.position_mode in {"gap_preserving", "compact", "raster_compact"}
@@ -655,7 +657,7 @@ class MidLayerUGPruneForwarder:
         selected = ranked[mask.index_select(0, ranked)]
         return selected[: int(count)]
 
-    def _select_target_torch(self, scores: Any, ranked: Any, count: int, grid_tensors: dict[str, Any]) -> Any:
+    def _select_target_torch(self, scores: Any, ranked: Any, count: int, grid_tensors: dict[str, Any]) -> tuple[Any, int]:
         torch = self.torch
         selected_mask = torch.zeros_like(scores, dtype=torch.bool)
         suppressed = torch.zeros_like(scores, dtype=torch.bool)
@@ -668,13 +670,14 @@ class MidLayerUGPruneForwarder:
             selected.append(index)
             selected_mask[index] = True
             suppressed |= grid_tensors["near_mask"][index]
+        nms_count = len(selected)
         if len(selected) < int(count):
             fill = self._select_top_ranked(ranked, ~selected_mask, int(count) - len(selected))
             if int(fill.numel()):
                 selected.extend(fill.unbind(0))
         if not selected:
-            return ranked.new_empty((0,), dtype=self.torch.long)
-        return torch.stack(selected).to(dtype=torch.long)
+            return ranked.new_empty((0,), dtype=self.torch.long), 0
+        return torch.stack(selected).to(dtype=torch.long), len(selected) - nms_count
 
     def _select_context_torch(self, ranked: Any, target: Any, count: int, grid_tensors: dict[str, Any]) -> Any:
         torch = self.torch
@@ -755,18 +758,27 @@ class MidLayerUGPruneForwarder:
         target_count, context_count, anchor_count = budget_split(target_budget, config)
         ranked = torch.argsort(scores, descending=True, stable=True)
         grid_tensors = self._grid_tensors(scores.device)
-        target = self._select_target_torch(scores, ranked, target_count, grid_tensors)
-        context = self._select_context_torch(ranked, target, context_count, grid_tensors)
-        anchor = self._select_fps_anchors_torch(
-            scores,
-            anchor_count,
-            exclude=torch.cat([target, context], dim=0),
-            grid_tensors=grid_tensors,
-        )
+        if config.selector_strategy == "query_topk":
+            query_topk = ranked[:target_budget]
+            target = ranked.new_empty((0,), dtype=torch.long)
+            context = ranked.new_empty((0,), dtype=torch.long)
+            anchor = ranked.new_empty((0,), dtype=torch.long)
+            nms_fallback_count = 0
+        else:
+            query_topk = ranked.new_empty((0,), dtype=torch.long)
+            target, nms_fallback_count = self._select_target_torch(scores, ranked, target_count, grid_tensors)
+            context = self._select_context_torch(ranked, target, context_count, grid_tensors)
+            anchor = self._select_fps_anchors_torch(
+                scores,
+                anchor_count,
+                exclude=torch.cat([target, context], dim=0),
+                grid_tensors=grid_tensors,
+            )
         selected_mask = torch.zeros(scores.shape[0], dtype=torch.bool, device=scores.device)
         selected_mask[target] = True
         selected_mask[context] = True
         selected_mask[anchor] = True
+        selected_mask[query_topk] = True
         selected_count = int(selected_mask.sum().item())
         fill = ranked.new_empty((0,), dtype=torch.long)
         if selected_count < target_budget:
@@ -788,6 +800,7 @@ class MidLayerUGPruneForwarder:
             "target": [int(index) for index in target.sort().values.detach().cpu().tolist()],
             "context": [int(index) for index in context.sort().values.detach().cpu().tolist()],
             "anchor": [int(index) for index in anchor.sort().values.detach().cpu().tolist()],
+            "query_topk": [int(index) for index in query_topk.sort().values.detach().cpu().tolist()],
             "fill": [int(index) for index in fill.sort().values.detach().cpu().tolist()],
         }
         result = SelectionResult(
@@ -799,15 +812,20 @@ class MidLayerUGPruneForwarder:
             role_labels={role: values for role, values in roles.items() if values},
             metadata={
                 "selector_family": "ug_prune_training_free_torch_fast",
+                "selector_strategy": config.selector_strategy,
                 "sample_id": sample_id,
                 "config": config.as_dict(),
                 "map_family": config.map_family,
                 "budget_split": {
+                    "query_topk": target_budget if config.selector_strategy == "query_topk" else 0,
                     "target": target_count,
                     "context": context_count,
                     "anchor": anchor_count,
                     "fill": len(roles["fill"]),
                 },
+                "realised_role_counts": {role: len(values) for role, values in roles.items()},
+                "nms_fallback_count": nms_fallback_count,
+                "nms_radius": config.nms_radius,
                 "map_key": map_key,
                 "map_source": config.map_source,
                 "probe_layers": list(config.probe_layers),

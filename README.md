@@ -112,6 +112,29 @@ python scripts/reproduce.py ablations          # plan only
 python scripts/reproduce.py ablations --execute
 ```
 
+The final retrospective selector-mechanism ladder and artefact-repair campaign
+has its own strict controller. It compares raw query top-k, target NMS only,
+and structured target/context/anchor selection at K=12 and K=20 without
+changing the already-frozen method. Run its gates in order:
+
+```bash
+python scripts/audit_dissertation_artifacts.py
+python scripts/run_final_selector_campaign.py --phase register
+python scripts/run_final_selector_campaign.py --phase serial --execute
+python scripts/run_final_selector_campaign.py --phase soak --execute
+python scripts/run_final_selector_campaign.py --phase full --execute --max-parallel 3
+python scripts/analyse_final_selector_campaign.py
+python scripts/final_selector_completion_audit.py
+```
+
+The full phase refuses a dirty source tree and caps concurrency at the result
+of the three-process A40 soak. Each job appends only to
+`per_sample_results.partial.jsonl`; the canonical result JSONL is published
+atomically in manifest order after strict row, ID, token, configuration, and
+metric validation. The repair jobs preserve the historical validation row
+order through the equivalent unique-ID manifest, because the original manifest
+contains duplicate sample IDs that cannot satisfy safe resume semantics.
+
 Each stage can also be invoked directly:
 
 ```bash
@@ -187,6 +210,13 @@ reproducibility that the artefacts cannot establish.
 - `scripts/run_final_timing_campaign.py`: repeated serial efficiency campaign.
 - `scripts/run_strong_dissertation_ablations.py`: retained development
   ablations.
+- `scripts/run_final_selector_campaign.py`: the retrospective mechanism,
+  incomplete-run repair, clean-provenance, smoke and GPU-soak controller.
+- `scripts/audit_dissertation_artifacts.py` and
+  `scripts/final_selector_completion_audit.py`: pre-launch and independent
+  final artefact audits.
+- `scripts/analyse_final_selector_campaign.py`: paired bootstrap and spatial
+  mechanism analysis plus the supersession ledger.
 - `scripts/reproduce.py` and `reproduction.yaml`: the single dry-run-first
   reproduction interface and its declarative command registry.
 - `tests/test_phase2_ug_prune.py` and `tests/test_phase2b_single_pass.py`:

@@ -60,6 +60,13 @@ from run_official_baseline import (  # noqa: E402
 )
 from run_ug_prune import init_wandb, log_wandb, wandb_run_info  # noqa: E402
 from vlm_pruning.analysis.coverage import selection_diagnostics  # noqa: E402
+from vlm_pruning.artifacts import (  # noqa: E402
+    ArtifactIntegrityError,
+    finalize_partial_jsonl,
+    load_resume_rows,
+    source_provenance,
+    validate_completed_run,
+)
 from vlm_pruning.features import resolve_query_token_positions  # noqa: E402
 from vlm_pruning.llava_hooks import (  # noqa: E402
     FROZEN_UG_GAP58_NAME,
@@ -116,6 +123,12 @@ def parse_args() -> argparse.Namespace:
         help="Optional comma-separated probe layers, for example 8,12. Defaults are derived from the pruning layer.",
     )
     parser.add_argument("--ug-role-preset", default="default", choices=["default", "more_context", "more_anchors"])
+    parser.add_argument(
+        "--selector-strategy",
+        default="structured_tca",
+        choices=["query_topk", "target_nms_only", "structured_tca"],
+        help="Explicit query-map selector mechanism used when --selection-method=ug.",
+    )
     parser.add_argument("--decode-mode", default="no_cache_recompute", choices=["no_cache_recompute", "layer_aware_cache"])
     parser.add_argument("--diagnostics-mode", default="full", choices=["full", "benchmark"])
     parser.add_argument("--resume", action="store_true")
@@ -185,6 +198,7 @@ def selector_config_from_args(args: argparse.Namespace):
         target_ratio=target_ratio,
         context_ratio=context_ratio,
         anchor_ratio=anchor_ratio,
+        selector_strategy=args.selector_strategy,
     )
 
 
@@ -197,6 +211,8 @@ def run_name(args: argparse.Namespace, tokens: int) -> str:
     variants = []
     if args.selection_method != "ug":
         variants.append(args.selection_method)
+    elif args.selector_strategy != "structured_tca":
+        variants.append(args.selector_strategy)
     if args.ug_map_source != "query_max":
         variants.append(args.ug_map_source)
     if args.ug_fusion_mode != "soft_average":
@@ -220,8 +236,17 @@ def config_payload(args: argparse.Namespace, name: str, original_tokens: int, to
     selector_config = selector_config_from_args(args)
     role_preset = coerce_role_preset(args.ug_role_preset)
     target_ratio, context_ratio, anchor_ratio = role_ratios(role_preset)
+    provenance = source_provenance(REPO_ROOT, [
+        Path("scripts/run_ug_prune_single_pass.py"),
+        Path("vlm_pruning/selectors/ug_prune.py"),
+        Path("vlm_pruning/llava_hooks/mid_layer_pruning.py"),
+        Path("vlm_pruning/artifacts.py"),
+    ])
     return {
         "run_name": name,
+        "source/git_commit": provenance["git_commit"],
+        "source/git_dirty": provenance["git_dirty"],
+        "source/sha256": provenance["source_sha256"],
         "created_at_utc": utc_now(),
         "model/name": args.model_path,
         "model/stack": "huggingface_llava",
@@ -237,6 +262,7 @@ def config_payload(args: argparse.Namespace, name: str, original_tokens: int, to
         "method/name": METHOD_NAME if args.selection_method == "ug" else f"{args.selection_method}_mid_layer",
         "method/seed": args.seed,
         "selection/method": args.selection_method,
+        "selection/strategy": selector_config.selector_strategy if args.selection_method == "ug" else "not_applicable",
         "tokens/original_visual_tokens": original_tokens,
         "tokens/target_visual_tokens": tokens,
         "tokens/actual_visual_tokens": tokens,
@@ -259,6 +285,7 @@ def config_payload(args: argparse.Namespace, name: str, original_tokens: int, to
         "ug/context_ratio": context_ratio,
         "ug/anchor_ratio": anchor_ratio,
         "ug/context_radius": selector_config.context_radius,
+        "ug/nms_radius": selector_config.nms_radius,
         "ug/anchor_pattern": selector_config.anchor_pattern,
         "ug/position_mode": selector_config.position_mode,
         "ug/prune_after_layer": args.prune_after_layer,
@@ -280,7 +307,13 @@ def config_payload(args: argparse.Namespace, name: str, original_tokens: int, to
     }
 
 
-def completed_run_matches(run_dir: Path, args: argparse.Namespace, tokens: int, row_count: int, checksum: str) -> bool:
+def completed_run_matches(
+    run_dir: Path,
+    args: argparse.Namespace,
+    tokens: int,
+    manifest_rows: list[dict[str, Any]],
+    checksum: str,
+) -> bool:
     metrics_path = run_dir / "metrics.json"
     config_path = run_dir / "config.json"
     if not metrics_path.exists() or not config_path.exists():
@@ -292,10 +325,12 @@ def completed_run_matches(run_dir: Path, args: argparse.Namespace, tokens: int, 
         return False
     checks = [
         config.get("dataset/manifest_checksum") == checksum,
-        int(config.get("dataset/num_samples", -1)) == int(row_count),
+        int(config.get("dataset/num_samples", -1)) == len(manifest_rows),
         config.get("method/name")
         == (METHOD_NAME if args.selection_method == "ug" else f"{args.selection_method}_mid_layer"),
         config.get("selection/method", "ug") == args.selection_method,
+        config.get("selection/strategy", "structured_tca")
+        == (args.selector_strategy if args.selection_method == "ug" else "not_applicable"),
         int(config.get("method/seed", -1)) == int(args.seed),
         int(config.get("tokens/target_visual_tokens", -1)) == int(tokens),
         int(config.get("tokens/actual_visual_tokens", -1)) == int(tokens),
@@ -311,9 +346,19 @@ def completed_run_matches(run_dir: Path, args: argparse.Namespace, tokens: int, 
         config.get("ug/diagnostics_mode", "full") == args.diagnostics_mode,
         config.get("model/precision") == args.precision,
         config.get("limit") == args.limit,
-        int(metrics.get("samples/evaluated", -1)) == int(row_count),
+        int(metrics.get("samples/evaluated", -1)) == len(manifest_rows),
     ]
-    return all(checks)
+    if not all(checks):
+        return False
+    report = validate_completed_run(
+        run_dir,
+        manifest_rows,
+        budget=tokens,
+        original_tokens=args.image_grid_size * args.image_grid_size,
+        task=args.task,
+        strategy=args.selector_strategy if args.selection_method == "ug" else None,
+    )
+    return report["status"] == "pass"
 
 
 def wandb_tags(args: argparse.Namespace, config: dict[str, Any], env: dict[str, Any] | None = None) -> list[str]:
@@ -556,6 +601,7 @@ def build_result(
         "split": sample.get("split") or args.split,
         "category": category,
         "source_row": source_row,
+        "original_sample_id": sample_metadata.get("original_sample_id", str(sample["sample_id"])),
         "image_path": str(image_path.as_posix()),
         "image_id": sample.get("image_id"),
         "mme_pair_id": sample.get("mme_pair_id") or sample_metadata.get("mme_pair_id"),
@@ -586,6 +632,13 @@ def build_result(
         "ug_anchor_pattern": selector_metadata.get("anchor_pattern"),
         "ug_position_mode": selector_metadata.get("position_mode"),
         "ug_budget_split": selector_metadata.get("budget_split"),
+        "selector_strategy": selector_metadata.get(
+            "selector_strategy", "structured_tca" if getattr(args, "selection_method", "ug") == "ug" else "not_applicable"
+        ),
+        "ug_nms_radius": selector_metadata.get("nms_radius"),
+        "ug_nms_fallback_count": selector_metadata.get("nms_fallback_count", 0),
+        "ug_realised_role_counts": selector_metadata.get("realised_role_counts"),
+        "ug_role_labels": selection.role_labels,
         "ug_query_token_status": selector_metadata.get("query_token_status"),
         "ug_query_token_positions": selector_metadata.get("query_token_positions"),
         **diagnostics,
@@ -623,7 +676,7 @@ def run(args: argparse.Namespace) -> int:
             split = args.split or str(rows[0].get("split") or "unknown")
             args.split = split
             checksum = manifest_checksum(args.manifest)
-            if args.skip_existing and completed_run_matches(run_dir, args, tokens, len(rows), checksum):
+            if args.skip_existing and completed_run_matches(run_dir, args, tokens, rows, checksum):
                 print(f"Skipping existing completed run: {run_dir}")
                 return 0
 
@@ -635,7 +688,8 @@ def run(args: argparse.Namespace) -> int:
                 yaml.safe_dump(jsonable(config), handle, sort_keys=True)
 
             per_sample_path = run_dir / "per_sample_results.jsonl"
-            existing = load_existing_results(per_sample_path, rows) if args.resume else []
+            partial_path = run_dir / "per_sample_results.partial.jsonl"
+            existing = load_resume_rows(partial_path, rows) if args.resume else []
             completed = {str(row["sample_id"]) for row in existing}
             pending = [row for row in rows if str(row["sample_id"]) not in completed]
             print(f"Loaded {len(rows)} samples from {args.manifest}; pending={len(pending)} completed={len(existing)}")
@@ -674,8 +728,8 @@ def run(args: argparse.Namespace) -> int:
             figure_paths: list[Path] = []
             max_new_tokens = args.max_new_tokens or (48 if args.task == "grounding" else 16)
             run_start = time.perf_counter()
-            sample_mode = "a" if args.resume and per_sample_path.exists() else "w"
-            with per_sample_path.open(sample_mode, encoding="utf-8") as handle:
+            sample_mode = "a" if args.resume and partial_path.exists() else "w"
+            with partial_path.open(sample_mode, encoding="utf-8") as handle:
                 for index, sample in enumerate(pending):
                     sample_id = str(sample["sample_id"])
                     image_path = Path(sample["image_path"])
@@ -801,10 +855,19 @@ def run(args: argparse.Namespace) -> int:
                     result = jsonable(result)
                     results.append(result)
                     handle.write(json.dumps(result, ensure_ascii=True) + "\n")
+                    handle.flush()
                     done = len(existing) + index + 1
                     if done % 50 == 0 or done == len(rows):
                         print(f"Processed {done}/{len(rows)} samples")
 
+            results, final_integrity = finalize_partial_jsonl(
+                partial_path,
+                per_sample_path,
+                rows,
+                budget=tokens,
+                original_tokens=original_tokens,
+                strategy=args.selector_strategy if args.selection_method == "ug" else None,
+            )
             run_duration_s = time.perf_counter() - run_start
             peak_alloc = torch.cuda.max_memory_allocated() / 1024**2 if torch.cuda.is_available() else None
             peak_reserved = torch.cuda.max_memory_reserved() / 1024**2 if torch.cuda.is_available() else None
@@ -862,6 +925,18 @@ def run(args: argparse.Namespace) -> int:
             metrics.update({key: value for key, value in estimate.items() if key.startswith("runtime/")})
             add_relative_metrics(metrics, config, args.tables_root)
             write_json(run_dir / "metrics.json", jsonable(metrics))
+            completion = validate_completed_run(
+                run_dir,
+                rows,
+                budget=tokens,
+                original_tokens=original_tokens,
+                task=args.task,
+                strategy=args.selector_strategy if args.selection_method == "ug" else None,
+            )
+            completion["finalization"] = final_integrity
+            write_json(run_dir / "integrity_report.json", jsonable(completion))
+            if completion["status"] != "pass":
+                raise ArtifactIntegrityError("Final run integrity failed: " + "; ".join(completion["issues"]))
             update_tables(config, metrics, args)
             update_runtime_files(args.tables_root, estimate)
             log_wandb(wandb_run, metrics, results, run_dir, figure_paths)

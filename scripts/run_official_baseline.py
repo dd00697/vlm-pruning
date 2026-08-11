@@ -48,6 +48,13 @@ from run_baseline import (  # noqa: E402
     save_grounding_figure,
 )
 from vlm_pruning.analysis.coverage import selection_diagnostics  # noqa: E402
+from vlm_pruning.artifacts import (  # noqa: E402
+    ArtifactIntegrityError,
+    finalize_partial_jsonl,
+    load_resume_rows,
+    source_provenance,
+    validate_completed_run,
+)
 from vlm_pruning.selectors import SelectionResult, SelectorError, selector_for_method  # noqa: E402
 from vlm_pruning.llava_hooks.mid_layer_pruning import (  # noqa: E402
     MidLayerUGPruneForwarder,
@@ -103,6 +110,10 @@ def parse_args() -> argparse.Namespace:
         default="registered",
         choices=["registered", "paper"],
         help="Use the fixed dissertation prompt or the benchmark question verbatim for paper-parity runs.",
+    )
+    parser.add_argument(
+        "--selector-id-mode", default="sample_id", choices=["sample_id", "original_sample_id"],
+        help="Identity used by seeded selectors; output IDs always remain the manifest sample_id.",
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
@@ -164,7 +175,7 @@ def manifest_checksum(path: Path) -> str:
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
-    return digest.hexdigest()[:16]
+    return digest.hexdigest()
 
 
 def target_tokens(args: argparse.Namespace) -> int:
@@ -915,8 +926,16 @@ def env_snapshot(args: argparse.Namespace, model_env: dict[str, Any] | None = No
 
 def config_payload(args: argparse.Namespace, name: str, original_tokens: int, tokens: int, checksum: str) -> dict[str, Any]:
     split = args.split or "unknown"
+    provenance = source_provenance(REPO_ROOT, [
+        Path("scripts/run_official_baseline.py"),
+        Path("scripts/run_baseline.py"),
+        Path("vlm_pruning/artifacts.py"),
+    ])
     return {
         "run_name": name,
+        "source/git_commit": provenance["git_commit"],
+        "source/git_dirty": provenance["git_dirty"],
+        "source/sha256": provenance["source_sha256"],
         "created_at_utc": utc_now(),
         "model/name": args.model_path,
         "model/stack": "huggingface_llava",
@@ -931,6 +950,7 @@ def config_payload(args: argparse.Namespace, name: str, original_tokens: int, to
         "task": args.task,
         "method/name": args.method,
         "method/seed": args.seed,
+        "selector/id_mode": args.selector_id_mode,
         "tokens/original_visual_tokens": original_tokens,
         "tokens/target_visual_tokens": tokens,
         "tokens/actual_visual_tokens": tokens,
@@ -1712,7 +1732,13 @@ def update_tables(config: dict[str, Any], metrics: dict[str, Any], args: argpars
         update_csv(args.tables_root / "vqa_budget_retention.csv", config, metrics)
 
 
-def completed_run_matches(run_dir: Path, args: argparse.Namespace, tokens: int, row_count: int, checksum: str) -> bool:
+def completed_run_matches(
+    run_dir: Path,
+    args: argparse.Namespace,
+    tokens: int,
+    manifest_rows: list[dict[str, Any]],
+    checksum: str,
+) -> bool:
     metrics_path = run_dir / "metrics.json"
     config_path = run_dir / "config.json"
     if not metrics_path.exists() or not config_path.exists():
@@ -1725,7 +1751,7 @@ def completed_run_matches(run_dir: Path, args: argparse.Namespace, tokens: int, 
     expected_seed = args.seed if args.method == "random" else 0
     checks = [
         config.get("dataset/manifest_checksum") == checksum,
-        int(config.get("dataset/num_samples", -1)) == int(row_count),
+        int(config.get("dataset/num_samples", -1)) == len(manifest_rows),
         config.get("method/name") == args.method,
         int(config.get("method/seed", -1)) == int(expected_seed),
         int(config.get("tokens/target_visual_tokens", -1)) == int(tokens),
@@ -1734,9 +1760,18 @@ def completed_run_matches(run_dir: Path, args: argparse.Namespace, tokens: int, 
         config.get("limit") == args.limit,
         config.get("position_mode", "compact") == args.position_mode,
         config.get("prompt/profile", "registered") == args.prompt_profile,
-        int(metrics.get("samples/evaluated", -1)) == int(row_count),
+        config.get("selector/id_mode", "sample_id") == args.selector_id_mode,
+        int(metrics.get("samples/evaluated", -1)) == len(manifest_rows),
     ]
-    return all(checks)
+    if not all(checks):
+        return False
+    return validate_completed_run(
+        run_dir,
+        manifest_rows,
+        budget=tokens,
+        original_tokens=args.image_grid_size * args.image_grid_size,
+        task=args.task,
+    )["status"] == "pass"
 
 
 def build_result_common(
@@ -1754,6 +1789,8 @@ def build_result_common(
     sample_metadata = sample.get("metadata") if isinstance(sample.get("metadata"), dict) else {}
     result = {
         "sample_id": str(sample["sample_id"]),
+        "original_sample_id": sample_metadata.get("original_sample_id", str(sample["sample_id"])),
+        "source_row": sample_metadata.get("source_row"),
         "dataset": args.dataset,
         "split": sample.get("split") or args.split,
         "category": sample.get("category"),
@@ -1803,7 +1840,7 @@ def run(args: argparse.Namespace) -> int:
             split = args.split or str(rows[0].get("split") or "unknown")
             args.split = split
             checksum = manifest_checksum(args.manifest)
-            if args.skip_existing and completed_run_matches(run_dir, args, tokens, len(rows), checksum):
+            if args.skip_existing and completed_run_matches(run_dir, args, tokens, rows, checksum):
                 print(f"Skipping existing completed run: {run_dir}")
                 return 0
             config = config_payload(args, name, original_tokens, tokens, checksum)
@@ -1820,7 +1857,8 @@ def run(args: argparse.Namespace) -> int:
                 yaml.safe_dump(config, handle, sort_keys=True)
 
             per_sample_path = run_dir / "per_sample_results.jsonl"
-            existing = load_existing_results(per_sample_path, rows) if args.resume else []
+            partial_path = run_dir / "per_sample_results.partial.jsonl"
+            existing = load_resume_rows(partial_path, rows) if args.resume else []
             completed = {str(row["sample_id"]) for row in existing}
             pending = [row for row in rows if str(row["sample_id"]) not in completed]
             print(f"Loaded {len(rows)} samples from {args.manifest}; pending={len(pending)} completed={len(existing)}")
@@ -1841,10 +1879,13 @@ def run(args: argparse.Namespace) -> int:
             figure_paths: list[Path] = []
             max_new_tokens = args.max_new_tokens or (48 if args.task == "grounding" else 16)
             run_start = time.perf_counter()
-            sample_mode = "a" if args.resume and per_sample_path.exists() else "w"
-            with per_sample_path.open(sample_mode, encoding="utf-8") as handle:
+            sample_mode = "a" if args.resume and partial_path.exists() else "w"
+            with partial_path.open(sample_mode, encoding="utf-8") as handle:
                 for index, sample in enumerate(pending):
                     sample_id = str(sample["sample_id"])
+                    selector_sample_id = sample_id
+                    if args.selector_id_mode == "original_sample_id":
+                        selector_sample_id = str((sample.get("metadata") or {}).get("original_sample_id") or sample_id)
                     image_path = Path(sample["image_path"])
                     image = Image.open(image_path).convert("RGB")
                     prompt = make_prompt(args, sample)
@@ -1876,7 +1917,7 @@ def run(args: argparse.Namespace) -> int:
                         try:
                             assert selector is not None
                             selection = selector.select(
-                                sample_id=sample_id,
+                                sample_id=selector_sample_id,
                                 budget=tokens,
                                 original_tokens=original_tokens,
                                 grid=args.image_grid_size,
@@ -1906,6 +1947,7 @@ def run(args: argparse.Namespace) -> int:
                             f"compacted={diagnostics.get('compacted_input_sequence_length')}"
                         )
                     result = build_result_common(args, sample, image_path, raw_output, generated_count, latency, selection, diagnostics, config)
+                    result["selection_sample_id"] = selector_sample_id
                     if args.task == "grounding":
                         width = int(sample.get("width") or image.size[0])
                         height = int(sample.get("height") or image.size[1])
@@ -1954,10 +1996,18 @@ def run(args: argparse.Namespace) -> int:
                         )
                     results.append(result)
                     handle.write(json.dumps(result, ensure_ascii=True) + "\n")
+                    handle.flush()
                     done = len(existing) + index + 1
                     if done % 10 == 0 or done == len(rows):
                         print(f"Processed {done}/{len(rows)} samples")
 
+            results, final_integrity = finalize_partial_jsonl(
+                partial_path,
+                per_sample_path,
+                rows,
+                budget=tokens,
+                original_tokens=original_tokens,
+            )
             run_duration_s = time.perf_counter() - run_start
             peak_alloc = torch.cuda.max_memory_allocated() / 1024**2 if torch.cuda.is_available() else None
             peak_reserved = torch.cuda.max_memory_reserved() / 1024**2 if torch.cuda.is_available() else None
@@ -1970,6 +2020,17 @@ def run(args: argparse.Namespace) -> int:
             metrics.update({key: value for key, value in estimate.items() if key.startswith("runtime/")})
             add_relative_metrics(metrics, config, args.tables_root)
             write_json(run_dir / "metrics.json", metrics)
+            completion = validate_completed_run(
+                run_dir,
+                rows,
+                budget=tokens,
+                original_tokens=original_tokens,
+                task=args.task,
+            )
+            completion["finalization"] = final_integrity
+            write_json(run_dir / "integrity_report.json", completion)
+            if completion["status"] != "pass":
+                raise ArtifactIntegrityError("Final run integrity failed: " + "; ".join(completion["issues"]))
             update_tables(config, metrics, args)
             update_runtime_files(args.tables_root, estimate)
             log_wandb(wandb_run, metrics, results, run_dir, figure_paths)
