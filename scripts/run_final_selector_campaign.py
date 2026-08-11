@@ -25,6 +25,7 @@ FINAL_MANIFESTS = {
 }
 OFFICIAL_VAL = ROOT / "data/manifests/official_baselines/refcoco_val.jsonl"
 EXPECTED = {"val": 8811, "testA": 5657, "testB": 5095}
+DEFAULT_INFERENCE_PYTHON = Path("/workspace/.followup_venv/bin/python")
 
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -110,6 +111,9 @@ def output_root(phase: str) -> Path:
 
 def command(cell: Cell, *, phase: str, run_id: str | None = None, limit: int | None = None) -> list[str]:
     name = run_id or cell.run_id
+    inference_python = Path(os.environ.get("VLM_CAMPAIGN_PYTHON", str(DEFAULT_INFERENCE_PYTHON)))
+    if not inference_python.is_file():
+        inference_python = Path(sys.executable)
     common = [
         "--dataset", "refcoco", "--task", "grounding", "--manifest", str(cell.manifest.relative_to(ROOT)),
         "--split", cell.split, "--target-visual-tokens", str(cell.budget), "--seed", "0", "--precision", "bf16",
@@ -125,12 +129,12 @@ def command(cell: Cell, *, phase: str, run_id: str | None = None, limit: int | N
         "--wandb-job-type", cell.family, "--wandb-tags", f"final-repair,{cell.family},{cell.split}",
     ]
     if cell.runner == "official":
-        return [sys.executable, "scripts/run_official_baseline.py", *common, "--method", cell.selection_method,
+        return [str(inference_python), "scripts/run_official_baseline.py", *common, "--method", cell.selection_method,
                 "--position-mode", cell.position, "--prompt-profile", "registered",
                 "--selector-id-mode", "original_sample_id",
                 "--reports-root", str((CAMPAIGN / "reports").relative_to(ROOT)), *provenance]
     return [
-        sys.executable, "scripts/run_ug_prune_single_pass.py", *common,
+        str(inference_python), "scripts/run_ug_prune_single_pass.py", *common,
         "--prune-after-layer", str(cell.layer), "--position-mode", cell.position,
         "--selection-method", cell.selection_method, "--selector-strategy", cell.strategy,
         "--ug-map-source", cell.map_source, "--ug-fusion-mode", cell.fusion,

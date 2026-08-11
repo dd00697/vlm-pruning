@@ -134,6 +134,8 @@ atomically in manifest order after strict row, ID, token, configuration, and
 metric validation. The repair jobs preserve the historical validation row
 order through the equivalent unique-ID manifest, because the original manifest
 contains duplicate sample IDs that cannot satisfy safe resume semantics.
+Set `VLM_CAMPAIGN_PYTHON` to the inference-environment interpreter when it is
+not available at the local default `/workspace/.followup_venv/bin/python`.
 
 Each stage can also be invoked directly:
 
