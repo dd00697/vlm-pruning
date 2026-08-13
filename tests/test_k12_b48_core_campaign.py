@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import unittest
 
-from scripts.run_k12_b48_core_campaign import broad_cells, command, refcoco_repair_cells
+from scripts.run_k12_b48_core_campaign import (
+    MODEL_SNAPSHOT,
+    broad_cells,
+    command,
+    execution_env,
+    refcoco_repair_cells,
+)
 
 
 class CoreCampaignTests(unittest.TestCase):
@@ -30,6 +36,11 @@ class CoreCampaignTests(unittest.TestCase):
         cells = refcoco_repair_cells()
         self.assertEqual({cell.method for cell in cells}, {"full", "random", "uniform", "structured_compact"})
         self.assertTrue(all(cell.split == "val" for cell in cells))
+
+    def test_execution_uses_pinned_local_snapshot_offline(self) -> None:
+        environment = execution_env()
+        self.assertEqual(environment["VLM_LOCAL_MODEL_PATH"], str(MODEL_SNAPSHOT))
+        self.assertEqual(environment["HF_HUB_OFFLINE"], "1")
 
 
 if __name__ == "__main__":

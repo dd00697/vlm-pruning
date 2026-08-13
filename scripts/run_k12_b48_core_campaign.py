@@ -19,6 +19,10 @@ ROOT = Path(__file__).resolve().parents[1]
 CAMPAIGN = ROOT / "experiments/k12_b48_expanded_evaluation_20260813"
 PYTHON = Path("/workspace/.followup_venv/bin/python")
 MODEL = "llava-hf/llava-1.5-7b-hf"
+MODEL_SNAPSHOT = Path(
+    "/workspace/cache/huggingface/hub/models--llava-hf--llava-1.5-7b-hf/"
+    "snapshots/b234b804b114d9e37bb655e11cbbb5f5e971b7a9"
+)
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -56,6 +60,20 @@ def append_event(value: dict[str, Any]) -> None:
     CAMPAIGN.mkdir(parents=True, exist_ok=True)
     with (CAMPAIGN / "events.jsonl").open("a", encoding="utf-8") as handle:
         handle.write(json.dumps({"timestamp": utc_now(), **value}, sort_keys=True) + "\n")
+
+
+def execution_env() -> dict[str, str]:
+    if not MODEL_SNAPSHOT.is_dir():
+        raise RuntimeError(f"Canonical model snapshot is missing: {MODEL_SNAPSHOT}")
+    env = os.environ.copy()
+    env.update({
+        "VLM_LOCAL_MODEL_PATH": str(MODEL_SNAPSHOT),
+        "HF_HUB_OFFLINE": "1",
+        "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+        "TOKENIZERS_PARALLELISM": "false",
+        "TRANSFORMERS_VERBOSITY": "error",
+    })
+    return env
 
 
 def broad_cells() -> list[Cell]:
@@ -203,7 +221,10 @@ def run_processes(jobs: list[tuple[Cell, str, str | None, int | None]], width: i
             handle = (logs / f"{phase}_{name}.log").open("a", encoding="utf-8")
             cmd = command(cell, phase, run_id=run_id, limit=limit)
             append_event({"event": "run_started", "run_id": name, "phase": phase, "command": cmd})
-            process = subprocess.Popen(cmd, cwd=ROOT, text=True, stdout=handle, stderr=subprocess.STDOUT)
+            process = subprocess.Popen(
+                cmd, cwd=ROOT, env=execution_env(), text=True,
+                stdout=handle, stderr=subprocess.STDOUT,
+            )
             active.append((process, cell, phase, run_id, limit, handle, time.time()))
         time.sleep(2)
         remaining = []
