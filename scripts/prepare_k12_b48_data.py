@@ -35,6 +35,7 @@ from vlm_pruning.final_campaign import DATASETS, DatasetProtocol
 
 DEFAULT_OUTPUT_ROOT = Path("data/k12_b48_expanded")
 DATASET_BY_KEY = {item.key: item for item in DATASETS}
+_IMAGE_RECORD_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 
 
 class PreparationError(RuntimeError):
@@ -135,6 +136,12 @@ def source_bytes(value: Any) -> tuple[bytes, str]:
 
 
 def image_record(value: Any, image_root: Path) -> dict[str, Any]:
+    source_hint = None
+    if isinstance(value, dict) and value.get("path"):
+        source_hint = str(value["path"])
+        cached = _IMAGE_RECORD_CACHE.get((str(image_root), source_hint))
+        if cached is not None:
+            return dict(cached)
     data, suffix = source_bytes(value)
     byte_sha = hashlib.sha256(data).hexdigest()
     try:
@@ -163,13 +170,16 @@ def image_record(value: Any, image_root: Path) -> dict[str, Any]:
         relative = path.relative_to(ROOT)
     except ValueError:
         relative = path
-    return {
+    record = {
         "image_path": relative.as_posix(),
         "image_byte_sha256": byte_sha,
         "image_pixel_sha256": pixel_sha,
         "width": width,
         "height": height,
     }
+    if source_hint is not None:
+        _IMAGE_RECORD_CACHE[(str(image_root), source_hint)] = dict(record)
+    return record
 
 
 def image_values(row: dict[str, Any], protocol: DatasetProtocol) -> list[Any]:
@@ -312,7 +322,7 @@ def vqa_record(
         choices = parse_choices(row.get("options"))
         category, image_id = row.get("subfield", ""), row["id"]
     elif key == "mme":
-        sample_id = safe_id(row["question_id"])
+        sample_id = f"mme_source_{source_row:06d}__{safe_id(row['question_id'])}"
         question, answer, choices = row["question"], row["answer"], []
         category, image_id = row.get("category", ""), row["question_id"]
     elif key == "vqav2_val":
@@ -324,7 +334,7 @@ def vqa_record(
         question, answer, choices = row["question"], answer_strings(row["answers"]), []
         category, image_id = "", row["image_id"]
     elif key == "pope_all":
-        sample_id = safe_id(row.get("question_id") or row["id"])
+        sample_id = f"{safe_id(row.get('category', 'unknown'))}__{safe_id(row.get('question_id') or row['id'])}"
         question, answer, choices = row["question"], row["answer"], []
         category, image_id = row.get("category", ""), row.get("id")
     elif key == "scienceqa_img_test":
@@ -376,7 +386,7 @@ def vqa_record(
         record["answer_index"] = int(row["answer"])
         record["subject"] = row.get("subject")
     if key == "mme":
-        record["mme_pair_id"] = str(row["question_id"]).rsplit("_", 1)[0]
+        record["mme_pair_id"] = f"{str(row.get('category') or '').lower()}::{row['question_id']}"
     if key == "mmvet_test":
         record["capability"] = row.get("capability")
     return record
@@ -454,6 +464,10 @@ def prepare(protocol: DatasetProtocol, output_root: Path, limit: int | None) -> 
         if limit is not None and processed_sources >= limit:
             break
     limited = limit is not None
+    if protocol.key == "mme" and not limited:
+        from vlm_pruning.mme import unique_manifest_rows
+
+        records = unique_manifest_rows(records)
     report = validate_manifest(protocol, records, processed_sources if limited else source_rows, limited=limited)
     if report["status"] != "pass":
         raise PreparationError(f"{protocol.key}: " + "; ".join(report["issues"]))

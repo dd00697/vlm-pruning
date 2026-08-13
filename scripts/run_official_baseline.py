@@ -252,7 +252,7 @@ def load_model(model_path: str, precision: str) -> tuple[Any, Any, Any, Any, dic
         "torch_dtype": str(dtype),
     }
     try:
-        processor = AutoProcessor.from_pretrained(model_path)
+        processor = AutoProcessor.from_pretrained(model_path, use_fast=False)
         model = LlavaForConditionalGeneration.from_pretrained(
             model_path,
             torch_dtype=dtype,
@@ -723,6 +723,25 @@ def score_vqa(sample: dict[str, Any], raw: str, dataset: str) -> dict[str, Any]:
         target_canons = [vqa_normalize_answer(value) for value in target_values if value is not None]
         correct = bool(pred_canon and pred_canon in target_canons)
         soft_score = vqa_soft_accuracy(raw, target_values)
+    elif dataset.lower() == "gqa":
+        def gqa_normalize(value: Any) -> str:
+            text = str(value if value is not None else "").lower().strip()
+            text = re.sub(r"[^a-z0-9\s]", "", text)
+            return re.sub(r"\s+", " ", text).strip()
+
+        pred_canon = gqa_normalize(raw)
+        target_canons = [gqa_normalize(value) for value in target_values if value is not None]
+        correct = bool(pred_canon and pred_canon in target_canons)
+        soft_score = 1.0 if correct else 0.0
+    elif dataset.lower() == "scienceqa_img_test":
+        target = str(answer or "").strip().lower()
+        prediction = str(raw or "").strip()
+        correct = prediction.lower() == target or (
+            len(prediction) >= 2 and prediction[0].isupper() and prediction[1] == "." and prediction[0].lower() == target
+        )
+        pred_canon = prediction
+        target_canons = [target]
+        soft_score = 1.0 if correct else 0.0
     else:
         pred_canon = canonical_text(raw)
         target_canons = [canonical_text(value) for value in target_values if value is not None]
@@ -2028,6 +2047,8 @@ def run(args: argparse.Namespace) -> int:
                         result.update(
                             {
                                 "query": sample.get("query"),
+                                "width": width,
+                                "height": height,
                                 "gt_box": sample.get("gt_box"),
                                 "raw_parsed_box": raw_box,
                                 "predicted_box": clipped_box,
@@ -2062,6 +2083,14 @@ def run(args: argparse.Namespace) -> int:
                                 "question": sample.get("question"),
                                 "choices": sample.get("choices"),
                                 "target_answer": sample.get("answer"),
+                                "benchmark_fields": {
+                                    key: sample.get(key)
+                                    for key in (
+                                        "index", "hint", "source", "l2_category", "question_type",
+                                        "subfield", "options_raw", "capability", "answer_index",
+                                    )
+                                    if sample.get(key) is not None
+                                },
                                 **scored,
                             }
                         )

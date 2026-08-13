@@ -300,7 +300,7 @@ def protocol_payload() -> dict[str, Any]:
         "mandatory_core_methods": list(MANDATORY_CORE_METHODS),
         "lmms_eval_commit": LMMS_EVAL_COMMIT,
         "reporting": {
-            "primary_section_anchor_count": 12,
+            "primary_section_anchor_count": 15,
             "forbidden_primary_section_terms": [
                 "K=20",
                 "K20",

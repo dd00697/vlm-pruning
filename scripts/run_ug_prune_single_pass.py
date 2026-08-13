@@ -819,6 +819,8 @@ def run(args: argparse.Namespace) -> int:
                         result.update(
                             {
                                 "query": sample.get("query"),
+                                "width": width,
+                                "height": height,
                                 "gt_box": sample.get("gt_box"),
                                 "raw_parsed_box": raw_box,
                                 "predicted_box": clipped_box,
@@ -854,6 +856,14 @@ def run(args: argparse.Namespace) -> int:
                                 "question": sample.get("question"),
                                 "choices": sample.get("choices"),
                                 "target_answer": sample.get("answer"),
+                                "benchmark_fields": {
+                                    key: sample.get(key)
+                                    for key in (
+                                        "index", "hint", "source", "l2_category", "question_type",
+                                        "subfield", "options_raw", "capability", "answer_index",
+                                    )
+                                    if sample.get(key) is not None
+                                },
                                 **scored,
                             }
                         )

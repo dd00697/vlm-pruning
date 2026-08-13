@@ -516,7 +516,7 @@ def load_model(model_id: str, offload_dir: Path, quantization: str) -> tuple[Any
         kwargs["offload_folder"] = str(offload_dir)
         kwargs["offload_state_dict"] = True
     try:
-        processor = AutoProcessor.from_pretrained(model_id)
+        processor = AutoProcessor.from_pretrained(model_id, use_fast=False)
         model = LlavaForConditionalGeneration.from_pretrained(model_id, **kwargs)
         model.eval()
     except Exception as exc:
