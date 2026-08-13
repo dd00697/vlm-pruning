@@ -38,6 +38,15 @@ class K12B48DataTests(unittest.TestCase):
         _images_as_bytes(dataset, FakeImage)
         self.assertEqual([name for name, _ in dataset.cast], ["image", "image_1"])
 
+    def test_locked_streaming_source_count_is_protocol_count(self) -> None:
+        # load_split's return contract lets full preparation compare the actual
+        # yielded count against the preregistered count without materializing
+        # unrelated dataset splits. The integration smoke exercises HF itself.
+        from vlm_pruning.final_campaign import DATASETS
+
+        protocol = next(item for item in DATASETS if item.key == "mmmu_val")
+        self.assertEqual(protocol.expected_rows, 900)
+
     def test_parse_choices(self) -> None:
         self.assertEqual(parse_choices("['one', 'two']"), ["one", "two"])
         self.assertEqual(parse_choices([1, 2]), ["1", "2"])

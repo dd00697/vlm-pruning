@@ -459,7 +459,7 @@ def prepare(protocol: DatasetProtocol, output_root: Path, limit: int | None) -> 
         if protocol.key == "gqa"
         else load_split(
             protocol,
-            streaming=limit is not None and protocol.key in {"mmmu_val", "vqav2_val", "textvqa_val"},
+            streaming=protocol.key in {"mmmu_val", "vqav2_val", "textvqa_val"},
         )
     )
     records: list[dict[str, Any]] = []
@@ -479,6 +479,10 @@ def prepare(protocol: DatasetProtocol, output_root: Path, limit: int | None) -> 
         if limit is not None and processed_sources >= limit:
             break
     limited = limit is not None
+    if not limited and processed_sources != protocol.expected_rows:
+        raise PreparationError(
+            f"{protocol.key}: streamed source rows {processed_sources} != locked {protocol.expected_rows}"
+        )
     if protocol.key == "mme" and not limited:
         from vlm_pruning.mme import unique_manifest_rows
 
