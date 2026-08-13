@@ -86,7 +86,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--method",
         required=True,
-        choices=["full", "random", "uniform", "fastv", "visionzip"],
+        choices=["full", "random", "uniform", "fastv", "visionzip", "official_fastv"],
     )
     parser.add_argument("--target-visual-tokens", "--token-budget", dest="target_visual_tokens", type=int)
     parser.add_argument("--keep-ratio", type=float)
@@ -229,7 +229,13 @@ def torch_dtype(torch: Any, precision: str) -> Any:
     return torch.bfloat16 if precision == "bf16" else torch.float16
 
 
-def load_model(model_path: str, precision: str) -> tuple[Any, Any, Any, Any, dict[str, Any]]:
+def load_model(
+    model_path: str,
+    precision: str,
+    *,
+    official_fastv: bool = False,
+    fastv_tokens: int = 48,
+) -> tuple[Any, Any, Any, Any, dict[str, Any]]:
     try:
         import torch
         import transformers
@@ -250,14 +256,48 @@ def load_model(model_path: str, precision: str) -> tuple[Any, Any, Any, Any, dic
         "cuda_version": torch.version.cuda,
         "precision": precision,
         "torch_dtype": str(dtype),
+        "transformers_source": str(Path(transformers.__file__).resolve()),
+        "official_fastv_source_active": bool(official_fastv),
     }
+    load_path = os.environ.get("VLM_LOCAL_MODEL_PATH", model_path)
+    env["model_load_path"] = load_path
     try:
-        processor = AutoProcessor.from_pretrained(model_path, use_fast=False)
-        model = LlavaForConditionalGeneration.from_pretrained(
-            model_path,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True,
-        )
+        try:
+            processor = AutoProcessor.from_pretrained(load_path, use_fast=False)
+        except TypeError as processor_exc:
+            if not official_fastv or "unexpected keyword argument 'image_token'" not in str(processor_exc):
+                raise
+            # The pinned FastV fork predates metadata-only fields now stored in
+            # the canonical checkpoint's processor_config.json. Constructing
+            # the same tokenizer/image processor directly is API glue only.
+            from transformers import AutoImageProcessor, AutoTokenizer, LlavaProcessor
+            processor = LlavaProcessor(
+                image_processor=AutoImageProcessor.from_pretrained(load_path),
+                tokenizer=AutoTokenizer.from_pretrained(load_path, use_fast=False),
+            )
+        model_kwargs: dict[str, Any] = {
+            "torch_dtype": dtype,
+            "low_cpu_mem_usage": True,
+        }
+        if official_fastv:
+            expected_root = REPO_ROOT / "third_party/FastV/src/FastV/llava-hf/transformers/src"
+            loaded_from = Path(transformers.__file__).resolve()
+            if expected_root.resolve() not in loaded_from.parents:
+                raise BaselineError(
+                    "official_fastv must import Transformers from the pinned FastV repository; "
+                    f"loaded {loaded_from}, expected beneath {expected_root}."
+                )
+            model_kwargs.update({
+                "attn_implementation": "eager",
+                "fastv_config": {
+                    "use_fastv": True,
+                    "fastv_k": 3,
+                    "fastv_r": 1.0 - float(fastv_tokens) / 576.0,
+                    "image_token_start_index": 5,
+                    "image_token_length": 576,
+                },
+            })
+        model = LlavaForConditionalGeneration.from_pretrained(load_path, **model_kwargs)
         model.to(device)
         model.eval()
     except Exception as exc:
@@ -1028,7 +1068,9 @@ def config_payload(args: argparse.Namespace, name: str, original_tokens: int, to
         "run/is_limited": args.limit is not None,
         "run/output_dir": None,
         "pruning_implementation": (
-            "fastv_pinned_hf_adapter"
+            "fastv_official_repository_transformers"
+            if args.method == "official_fastv"
+            else "fastv_pinned_hf_adapter"
             if args.method == "fastv"
             else "visionzip_pinned_hf_adapter"
             if args.method == "visionzip"
@@ -1036,7 +1078,7 @@ def config_payload(args: argparse.Namespace, name: str, original_tokens: int, to
         ),
         "pruning_location": (
             "in_llm_after_layer_3"
-            if args.method == "fastv"
+            if args.method in {"fastv", "official_fastv"}
             else "pre_llm_vision_encoder_compression"
             if args.method == "visionzip"
             else TRUE_REMOVAL_LOCATION
@@ -1048,15 +1090,16 @@ def config_payload(args: argparse.Namespace, name: str, original_tokens: int, to
         "prompt/profile": args.prompt_profile,
         "limit": args.limit,
         "published_baseline/source": (
-            FASTV_SOURCE if args.method == "fastv" else VISIONZIP_SOURCE if args.method == "visionzip" else None
+            FASTV_SOURCE if args.method in {"fastv", "official_fastv"} else VISIONZIP_SOURCE if args.method == "visionzip" else None
         ),
         "published_baseline/commit": (
-            FASTV_COMMIT if args.method == "fastv" else VISIONZIP_COMMIT if args.method == "visionzip" else None
+            FASTV_COMMIT if args.method in {"fastv", "official_fastv"} else VISIONZIP_COMMIT if args.method == "visionzip" else None
         ),
-        "published_baseline/fastv_k": 3 if args.method == "fastv" else None,
+        "published_baseline/fastv_k": 3 if args.method in {"fastv", "official_fastv"} else None,
         "published_baseline/fastv_r": (
-            1.0 - tokens / original_tokens if args.method == "fastv" else None
+            1.0 - tokens / original_tokens if args.method in {"fastv", "official_fastv"} else None
         ),
+        "published_baseline/official_source_executed": args.method == "official_fastv",
         "published_baseline/visionzip_recipe": (
             "40 dominant (1 CLS + 39 patches) + 8 contextual; proportional official 54+10 recipe"
             if args.method == "visionzip" and tokens == 48
@@ -1368,6 +1411,157 @@ def generate_fastv_answer(
         "position_ids_mode": "gap_preserving",
     }
     return raw, int(generated.generated_ids.numel()), total, diagnostics, generated.selection
+
+
+def generate_official_fastv_answer(
+    torch: Any,
+    processor: Any,
+    model: Any,
+    device: Any,
+    image: Image.Image,
+    prompt: str,
+    max_new_tokens: int,
+    original_tokens: int,
+    retained_tokens: int,
+) -> tuple[str, int, float, dict[str, Any], SelectionResult]:
+    """Execute the pinned FastV repository and observe its selection non-invasively.
+
+    The official fork performs attention top-k and hidden-state removal in its
+    LlamaModel.fastv_forward. Hooks only record layer input lengths and the
+    attention tensor already produced by the official implementation; they do
+    not alter model inputs, outputs, or selection logic.
+    """
+    if original_tokens != 576:
+        raise BaselineError(f"Official FastV gate supports one 576-patch image, got {original_tokens} tokens.")
+    moved = _move_processor_inputs(torch, processor, model, device, image, prompt)
+    image_token_id = int(getattr(model.config, "image_token_index", 32000))
+    placeholders = torch.nonzero(moved["input_ids"][0] == image_token_id, as_tuple=False).flatten()
+    if int(placeholders.numel()) != 1:
+        raise BaselineError(f"Official FastV requires exactly one image placeholder; found {int(placeholders.numel())}.")
+    image_start = int(placeholders[0].item())
+    fastv_config = {
+        "use_fastv": True,
+        "fastv_k": 3,
+        "fastv_r": 1.0 - float(retained_tokens) / float(original_tokens),
+        "image_token_start_index": image_start,
+        "image_token_length": original_tokens,
+    }
+    model.config.fastv_config = fastv_config
+
+    layers = model.language_model.model.layers
+    first_layer_lengths: list[int | None] = [None] * len(layers)
+    call_index = -1
+    observed_relative: list[int] = []
+
+    def make_pre_hook(layer_index: int):
+        def hook(_module: Any, inputs: tuple[Any, ...]) -> None:
+            nonlocal call_index
+            if layer_index == 0:
+                call_index += 1
+            if call_index == 0 and inputs and hasattr(inputs[0], "shape"):
+                first_layer_lengths[layer_index] = int(inputs[0].shape[1])
+        return hook
+
+    def attention_hook(_module: Any, _inputs: tuple[Any, ...], output: Any) -> None:
+        if call_index != 0 or observed_relative:
+            return
+        if not isinstance(output, tuple) or len(output) < 2 or output[1] is None:
+            raise BaselineError("Official FastV layer 2 did not expose the attention tensor used for selection.")
+        attention = output[1]
+        scores = attention.mean(dim=1)[0, -1, image_start:image_start + original_tokens]
+        count = round(original_tokens * (1.0 - fastv_config["fastv_r"]))
+        selected = scores.topk(count).indices.detach().cpu().tolist()
+        observed_relative.extend(sorted(int(value) for value in selected))
+
+    handles = [layer.register_forward_pre_hook(make_pre_hook(index)) for index, layer in enumerate(layers)]
+    handles.append(layers[2].register_forward_hook(attention_hook))
+    generated: list[Any] = []
+    eos_ids = eos_token_ids(model, processor)
+    state = dict(moved)
+    cuda_sync(torch)
+    total_start = time.perf_counter()
+    first_token_s: float | None = None
+    try:
+        with torch.inference_mode():
+            for _ in range(max_new_tokens):
+                outputs = model(**state, use_cache=False, return_dict=True)
+                next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+                generated.append(next_token)
+                if first_token_s is None:
+                    cuda_sync(torch)
+                    first_token_s = time.perf_counter() - total_start
+                state["input_ids"] = torch.cat((state["input_ids"], next_token), dim=1)
+                state["attention_mask"] = torch.cat(
+                    (state["attention_mask"], torch.ones_like(next_token, dtype=state["attention_mask"].dtype)),
+                    dim=1,
+                )
+                if eos_ids and int(next_token.item()) in eos_ids:
+                    break
+    finally:
+        for handle in handles:
+            handle.remove()
+    cuda_sync(torch)
+    total_s = time.perf_counter() - total_start
+    if not generated:
+        raise BaselineError("Official FastV generated no tokens.")
+    if any(value is None for value in first_layer_lengths):
+        raise BaselineError(f"Incomplete official FastV layer trace: {first_layer_lengths}.")
+    layer_lengths = [int(value) for value in first_layer_lengths if value is not None]
+    expanded_length = layer_lengths[0]
+    expected_pruned_length = expanded_length - original_tokens + retained_tokens
+    expected_trace = [original_tokens if index < 3 else retained_tokens for index in range(len(layers))]
+    visual_trace = [length - (expanded_length - original_tokens) for length in layer_lengths]
+    if visual_trace != expected_trace:
+        raise BaselineError(f"Official FastV visual-token trace is not exact B={retained_tokens}: {visual_trace}.")
+    if layer_lengths[3] != expected_pruned_length:
+        raise BaselineError(
+            f"Official FastV layer-3 sequence length {layer_lengths[3]} != expected {expected_pruned_length}."
+        )
+    if len(observed_relative) != retained_tokens or len(set(observed_relative)) != retained_tokens:
+        raise BaselineError(f"Official FastV observer captured invalid selection: {observed_relative}.")
+    generated_ids = torch.cat(generated, dim=1)
+    raw = processor.decode(generated_ids[0], skip_special_tokens=True).strip()
+    selection = SelectionResult(
+        selected_indices=observed_relative,
+        method="official_fastv_attention_topk",
+        budget=retained_tokens,
+        original_tokens=original_tokens,
+        grid=24,
+        metadata={
+            "official_repository": FASTV_SOURCE,
+            "official_commit": FASTV_COMMIT,
+            "fastv_config": fastv_config,
+            "observer": "read-only layer-2 attention forward hook",
+        },
+    ).validate()
+    diagnostics = {
+        "vision_encoder_latency_s": None,
+        "projector_latency_s": None,
+        "pruning_selection_latency_s": None,
+        "llm_prefill_latency_s": first_token_s,
+        "prefill_latency_s": first_token_s,
+        "time_to_first_token_s": first_token_s,
+        "decode_latency_s": max(0.0, total_s - float(first_token_s or 0.0)),
+        "total_inference_latency_s": total_s,
+        "original_visual_tokens": original_tokens,
+        "expected_retained_visual_tokens": retained_tokens,
+        "actual_retained_visual_tokens": retained_tokens,
+        "actual_llm_visual_tokens": retained_tokens,
+        "original_input_sequence_length": expanded_length,
+        "compacted_input_sequence_length": expected_pruned_length,
+        "sequence_length_reduction": original_tokens - retained_tokens,
+        "per_layer_sequence_lengths": layer_lengths,
+        "per_layer_visual_tokens": visual_trace,
+        "effective_visual_token_layer_area": sum(visual_trace),
+        "retained_indices_checksum": indices_checksum(observed_relative),
+        "pruning_implementation": "fastv_official_repository_transformers",
+        "pruning_location": "in_llm_after_layer_3",
+        "third_party_source": FASTV_SOURCE,
+        "third_party_commit_sha": FASTV_COMMIT,
+        "position_ids_mode": "official_gap_preserving_keep_indices",
+        "official_fastv_config": fastv_config,
+    }
+    return raw, int(generated_ids.numel()), total_s, diagnostics, selection
 
 
 def generate_visionzip_answer(
@@ -1899,7 +2093,7 @@ def run(args: argparse.Namespace) -> int:
     if args.method == "full" and tokens != original_tokens:
         raise BaselineError("Full-token runs must retain all 576 visual tokens.")
     selector = None
-    if args.method not in {"fastv", "visionzip"}:
+    if args.method not in {"fastv", "visionzip", "official_fastv"}:
         try:
             selector = selector_for_method(args.method)
         except SelectorError as exc:
@@ -1942,7 +2136,12 @@ def run(args: argparse.Namespace) -> int:
             print(f"Loaded {len(rows)} samples from {args.manifest}; pending={len(pending)} completed={len(existing)}")
 
             model_load_start = time.perf_counter()
-            torch, processor, model, device, model_env = load_model(args.model_path, args.precision)
+            torch, processor, model, device, model_env = load_model(
+                args.model_path,
+                args.precision,
+                official_fastv=args.method == "official_fastv",
+                fastv_tokens=tokens,
+            )
             model_load_s = time.perf_counter() - model_load_start
             env = env_snapshot(args, model_env)
             env["model_load_latency_s"] = model_load_s
@@ -1970,12 +2169,24 @@ def run(args: argparse.Namespace) -> int:
                     sample_original_tokens = original_tokens * len(images)
                     sample_target_tokens = sample_original_tokens if args.method == "full" else tokens
                     prompt = make_prompt(args, sample)
-                    if len(images) > 1 and args.method in {"fastv", "visionzip"}:
+                    if len(images) > 1 and args.method in {"fastv", "visionzip", "official_fastv"}:
                         raise BaselineError(
                             f"Official {args.method} admission does not support exact-total-B48 multi-image input; "
                             "use the locked single-image MMMU subset."
                         )
-                    if args.method == "fastv":
+                    if args.method == "official_fastv":
+                        raw_output, generated_count, latency, diagnostics, selection = generate_official_fastv_answer(
+                            torch,
+                            processor,
+                            model,
+                            device,
+                            image,
+                            prompt,
+                            max_new_tokens,
+                            sample_original_tokens,
+                            sample_target_tokens,
+                        )
+                    elif args.method == "fastv":
                         raw_output, generated_count, latency, diagnostics, selection = generate_fastv_answer(
                             torch,
                             processor,
