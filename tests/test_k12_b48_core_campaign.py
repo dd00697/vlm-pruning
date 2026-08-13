@@ -7,6 +7,7 @@ from scripts.run_k12_b48_core_campaign import (
     broad_cells,
     command,
     execution_env,
+    random_variance_cells,
     refcoco_repair_cells,
 )
 
@@ -31,6 +32,16 @@ class CoreCampaignTests(unittest.TestCase):
             self.assertIn(fragment, joined)
         self.assertNotIn("--target-visual-tokens 72", joined)
         self.assertNotIn("--target-visual-tokens 128", joined)
+
+    def test_random_variance_is_separate_three_seed_evidence(self) -> None:
+        variance = random_variance_cells()
+        self.assertEqual(len(variance), 26)
+        self.assertEqual({cell.seed for cell in variance}, {1, 2})
+        self.assertTrue(
+            all(cell.method == "random" and cell.stage == "random_variance" for cell in variance)
+        )
+        seed_zero = {cell.seed for cell in broad_cells() if cell.method == "random"}
+        self.assertEqual(seed_zero, {0})
 
     def test_refcoco_completion_contains_only_missing_or_wrong_config_cells(self) -> None:
         cells = refcoco_repair_cells()

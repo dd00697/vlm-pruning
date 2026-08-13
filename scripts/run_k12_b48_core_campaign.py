@@ -40,6 +40,7 @@ class Cell:
     manifest: Path
     method: str
     stage: str = "broad"
+    seed: int = 0
 
     @property
     def budget(self) -> int:
@@ -97,8 +98,26 @@ def refcoco_repair_cells() -> list[Cell]:
     ]
 
 
+def random_variance_cells() -> list[Cell]:
+    result = []
+    for protocol in DATASETS:
+        manifest = ROOT / "data/k12_b48_expanded" / protocol.key / "manifest.jsonl"
+        for seed in (1, 2):
+            result.append(Cell(
+                f"{protocol.key}__random_seed{seed}", protocol.key, protocol.task,
+                protocol.split, manifest, "random", "random_variance", seed,
+            ))
+    manifest = ROOT / "data/manifests/final_evaluation/refcoco_val_unique.jsonl"
+    for seed in (1, 2):
+        result.append(Cell(
+            f"refcoco_val__random_seed{seed}", "refcoco", "grounding", "val",
+            manifest, "random", "random_variance", seed,
+        ))
+    return result
+
+
 def cells() -> list[Cell]:
-    return refcoco_repair_cells() + broad_cells()
+    return refcoco_repair_cells() + broad_cells() + random_variance_cells()
 
 
 def output_root(phase: str) -> Path:
@@ -112,7 +131,7 @@ def run_dir(cell: Cell, phase: str, run_id: str | None = None) -> Path:
 def command(cell: Cell, phase: str, *, run_id: str | None = None, limit: int | None = None) -> list[str]:
     common = [
         "--dataset", cell.dataset, "--task", cell.task, "--manifest", str(cell.manifest.relative_to(ROOT)),
-        "--split", cell.split, "--target-visual-tokens", str(cell.budget), "--seed", "0", "--precision", "bf16",
+        "--split", cell.split, "--target-visual-tokens", str(cell.budget), "--seed", str(cell.seed), "--precision", "bf16",
         "--model-path", MODEL, "--run-name", run_id or cell.run_id,
         "--output-root", str(output_root(phase).relative_to(ROOT)),
         "--figures-root", str((CAMPAIGN / "figures").relative_to(ROOT)),
@@ -159,7 +178,7 @@ def integrity(cell: Cell, phase: str, *, run_id: str | None = None, limit: int |
         "model/decoding": "deterministic_greedy", "dataset/name": cell.dataset,
         "dataset/split": cell.split, "dataset/manifest_checksum": sha256_file(cell.manifest),
         "dataset/num_samples": len(manifest_rows(cell, limit)), "task": cell.task,
-        "tokens/target_visual_tokens": cell.budget, "method/seed": 0, "limit": limit,
+        "tokens/target_visual_tokens": cell.budget, "method/seed": cell.seed, "limit": limit,
     }
     if cell.method != "full":
         expected.update({
@@ -209,7 +228,8 @@ def register() -> dict[str, Any]:
             "run_id": cell.run_id, "dataset": cell.dataset, "task": cell.task, "split": cell.split,
             "manifest": str(cell.manifest.relative_to(ROOT)), "manifest_sha256": sha256_file(cell.manifest),
             "expected_rows": len(manifest_rows(cell)), "method": cell.method, "stage": cell.stage,
-            "budget": cell.budget, "command": command(cell, "full"), "shell": shlex.join(command(cell, "full")),
+            "seed": cell.seed, "budget": cell.budget, "command": command(cell, "full"),
+            "shell": shlex.join(command(cell, "full")),
         })
     payload = {"campaign_id": "k12_b48_expanded_evaluation_20260813", "registered_at_utc": utc_now(), "cells": rows}
     write_json(CAMPAIGN / "core_run_manifests.json", payload)
