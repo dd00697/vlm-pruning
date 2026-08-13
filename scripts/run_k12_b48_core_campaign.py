@@ -31,6 +31,10 @@ from vlm_pruning.final_campaign import DATASETS  # noqa: E402
 from vlm_pruning.gpu_scheduler import admissible_widths  # noqa: E402
 
 
+_MANIFEST_ROWS_CACHE: dict[Path, list[dict[str, Any]]] = {}
+_MANIFEST_SHA_CACHE: dict[Path, str] = {}
+
+
 @dataclass(frozen=True)
 class Cell:
     run_id: str
@@ -157,8 +161,19 @@ def command(cell: Cell, phase: str, *, run_id: str | None = None, limit: int | N
 
 
 def manifest_rows(cell: Cell, limit: int | None = None) -> list[dict[str, Any]]:
-    rows = read_jsonl_strict(cell.manifest)
+    rows = _MANIFEST_ROWS_CACHE.get(cell.manifest)
+    if rows is None:
+        rows = read_jsonl_strict(cell.manifest)
+        _MANIFEST_ROWS_CACHE[cell.manifest] = rows
     return rows if limit is None else rows[:limit]
+
+
+def manifest_sha(path: Path) -> str:
+    value = _MANIFEST_SHA_CACHE.get(path)
+    if value is None:
+        value = sha256_file(path)
+        _MANIFEST_SHA_CACHE[path] = value
+    return value
 
 
 def integrity(cell: Cell, phase: str, *, run_id: str | None = None, limit: int | None = None, score: bool = True) -> dict[str, Any]:
@@ -176,7 +191,7 @@ def integrity(cell: Cell, phase: str, *, run_id: str | None = None, limit: int |
     expected = {
         "source/git_dirty": False, "model/name": MODEL, "model/precision": "bf16",
         "model/decoding": "deterministic_greedy", "dataset/name": cell.dataset,
-        "dataset/split": cell.split, "dataset/manifest_checksum": sha256_file(cell.manifest),
+        "dataset/split": cell.split, "dataset/manifest_checksum": manifest_sha(cell.manifest),
         "dataset/num_samples": len(manifest_rows(cell, limit)), "task": cell.task,
         "tokens/target_visual_tokens": cell.budget, "method/seed": cell.seed, "limit": limit,
     }
@@ -226,7 +241,7 @@ def register() -> dict[str, Any]:
     for cell in cells():
         rows.append({
             "run_id": cell.run_id, "dataset": cell.dataset, "task": cell.task, "split": cell.split,
-            "manifest": str(cell.manifest.relative_to(ROOT)), "manifest_sha256": sha256_file(cell.manifest),
+            "manifest": str(cell.manifest.relative_to(ROOT)), "manifest_sha256": manifest_sha(cell.manifest),
             "expected_rows": len(manifest_rows(cell)), "method": cell.method, "stage": cell.stage,
             "seed": cell.seed, "budget": cell.budget, "command": command(cell, "full"),
             "shell": shlex.join(command(cell, "full")),
