@@ -164,6 +164,35 @@ def resolve_query_token_positions(
     try:
         prompt_ids, offsets = _encode_with_offsets(tokenizer, prompt)
     except Exception as exc:
+        # The canonical LLaVA SentencePiece tokenizer is intentionally loaded
+        # in slow mode and does not expose offset mappings. Its query-only ids
+        # are nevertheless an exact subsequence of the processor input. Align
+        # those ids directly, preferring the tokenized prefix position when a
+        # phrase appears more than once. This is an observation/alignment
+        # fallback; it does not alter which query tokens feed query-max.
+        if input_ids is not None:
+            actual_ids = [int(token_id) for token_id in _as_list(input_ids)]
+            token_ids = _encode_query_only(tokenizer, query)
+            preferred_start = None
+            try:
+                preferred_start = len(_encode_query_only(tokenizer, prompt[:char_start]))
+            except Exception:
+                pass
+            start = _best_subsequence_start(actual_ids, token_ids, preferred_start=preferred_start)
+            if start is not None and token_ids:
+                token_positions = list(range(start, start + len(token_ids)))
+                return QueryTokenResolution(
+                    query=query,
+                    prompt=prompt,
+                    char_start=char_start,
+                    char_end=char_end,
+                    prompt_token_positions=[],
+                    token_positions=token_positions,
+                    token_ids=token_ids,
+                    token_texts=_token_texts(tokenizer, token_ids),
+                    resolver_status="matched_slow_tokenizer_subsequence",
+                    message=f"Offset mappings unavailable ({type(exc).__name__}); aligned exact token-id subsequence.",
+                )
         return QueryTokenResolution(
             query=query,
             prompt=prompt,

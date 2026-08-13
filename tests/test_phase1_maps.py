@@ -54,6 +54,13 @@ class FakeTokenizer:
         return [inverse[token_id] for token_id in token_ids]
 
 
+class SlowFakeTokenizer(FakeTokenizer):
+    def __call__(self, text: str, return_offsets_mapping: bool = False, add_special_tokens: bool = True):
+        if return_offsets_mapping:
+            raise NotImplementedError("slow tokenizer has no offsets")
+        return super().__call__(text, return_offsets_mapping=False, add_special_tokens=add_special_tokens)
+
+
 class QueryTokenResolverTests(unittest.TestCase):
     def test_resolves_query_positions_in_actual_input_ids(self) -> None:
         tokenizer = FakeTokenizer()
@@ -78,6 +85,20 @@ class QueryTokenResolverTests(unittest.TestCase):
         result = resolve_query_token_positions(tokenizer, "USER: <image>\nFind a mug.", "red cup")
         self.assertEqual(result.resolver_status, "query_not_found")
         self.assertEqual(result.token_positions, [])
+
+    def test_slow_tokenizer_aligns_exact_query_subsequence(self) -> None:
+        tokenizer = SlowFakeTokenizer()
+        prompt = 'USER: <image> Find "red cup". ASSISTANT:'
+        actual_ids = tokenizer(prompt)["input_ids"]
+        result = resolve_query_token_positions(
+            tokenizer,
+            prompt,
+            "red cup",
+            input_ids=actual_ids,
+            image_token_id=32000,
+        )
+        self.assertEqual(result.resolver_status, "matched_slow_tokenizer_subsequence")
+        self.assertEqual([actual_ids[pos] for pos in result.token_positions], result.token_ids)
 
 
 class MapStatsTests(unittest.TestCase):
