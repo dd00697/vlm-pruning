@@ -40,12 +40,14 @@ from run_official_baseline import (  # noqa: E402
     add_relative_metrics,
     aggregate,
     budget_family,
+    default_max_new_tokens,
     env_snapshot,
     evaluator_name,
     keep_ratio,
     load_existing_results,
     load_manifest,
     load_model,
+    load_sample_images,
     make_prompt,
     manifest_checksum,
     metric_definition,
@@ -587,7 +589,7 @@ def build_result(
 ) -> dict[str, Any]:
     retained = selection.selected_indices
     selector_metadata = selection.metadata
-    original_visual_tokens = int(config.get("tokens/original_visual_tokens") or selection.original_tokens)
+    original_visual_tokens = int(selection.original_tokens)
     selected_budget = int(getattr(selection, "budget", config["tokens/target_visual_tokens"]))
     duplicate_count = len(retained) - len(set(int(index) for index in retained))
     out_of_range_count = sum(1 for index in retained if int(index) < 0 or int(index) >= original_visual_tokens)
@@ -603,6 +605,8 @@ def build_result(
         "source_row": source_row,
         "original_sample_id": sample_metadata.get("original_sample_id", str(sample["sample_id"])),
         "image_path": str(image_path.as_posix()),
+        "image_paths": [str(value) for value in sample.get("image_paths", [image_path])],
+        "image_count": int(sample.get("image_count") or 1),
         "image_id": sample.get("image_id"),
         "mme_pair_id": sample.get("mme_pair_id") or sample_metadata.get("mme_pair_id"),
         "method": config.get("method/name", METHOD_NAME),
@@ -726,18 +730,20 @@ def run(args: argparse.Namespace) -> int:
             )
             results = list(existing)
             figure_paths: list[Path] = []
-            max_new_tokens = args.max_new_tokens or (48 if args.task == "grounding" else 16)
+            max_new_tokens = args.max_new_tokens or default_max_new_tokens(args.dataset, args.task)
             run_start = time.perf_counter()
             sample_mode = "a" if args.resume and partial_path.exists() else "w"
             with partial_path.open(sample_mode, encoding="utf-8") as handle:
                 for index, sample in enumerate(pending):
                     sample_id = str(sample["sample_id"])
-                    image_path = Path(sample["image_path"])
-                    image = Image.open(image_path).convert("RGB")
+                    image_paths, images = load_sample_images(sample)
+                    image_path = image_paths[0]
+                    image = images[0]
+                    sample_original_tokens = original_tokens * len(images)
                     width = int(sample.get("width") or image.size[0])
                     height = int(sample.get("height") or image.size[1])
                     prompt = make_prompt(args, sample)
-                    text_prompt = apply_chat_template(processor, prompt)
+                    text_prompt = apply_chat_template(processor, prompt, len(images))
                     query_text = query_text_for_sample(args, sample)
 
                     full_inputs, prep_diag = prepare_compacted_inputs(
@@ -745,10 +751,10 @@ def run(args: argparse.Namespace) -> int:
                         processor,
                         model,
                         device,
-                        image,
+                        images,
                         prompt,
-                        list(range(original_tokens)),
-                        original_tokens,
+                        list(range(sample_original_tokens)),
+                        sample_original_tokens,
                     )
                     if baseline_selector is None:
                         resolution = resolve_query_token_positions(
@@ -771,7 +777,7 @@ def run(args: argparse.Namespace) -> int:
                         precomputed_selection = baseline_selector.select(
                             sample_id=sample_id,
                             budget=tokens,
-                            original_tokens=original_tokens,
+                            original_tokens=sample_original_tokens,
                             grid=args.image_grid_size,
                             seed=args.seed,
                         )
@@ -788,7 +794,7 @@ def run(args: argparse.Namespace) -> int:
                         query_token_positions=query_token_positions,
                         seed=args.seed,
                         max_new_tokens=max_new_tokens,
-                        original_tokens=original_tokens,
+                        original_tokens=sample_original_tokens,
                         forwarder=forwarder,
                         decode_mode=args.decode_mode,
                         selection=precomputed_selection,

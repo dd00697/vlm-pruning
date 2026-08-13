@@ -217,6 +217,22 @@ def retained_indices(method: str, keep_count: int, original_count: int, seed: in
     if method == "uniform":
         if keep_count >= original_count:
             return list(range(original_count))
+        per_image = grid * grid
+        if original_count % per_image != 0:
+            raise BaselineError(
+                f"Uniform selection expects whole {grid}x{grid} image grids, got {original_count} tokens."
+            )
+        image_count = original_count // per_image
+        if image_count > 1:
+            base, remainder = divmod(keep_count, image_count)
+            selected: list[int] = []
+            for image_index in range(image_count):
+                quota = base + (1 if image_index < remainder else 0)
+                selected.extend(
+                    image_index * per_image + index
+                    for index in uniform_points(quota, grid)
+                )
+            return sorted(selected)
         if keep_count >= original_count / 2:
             drop_count = original_count - keep_count
             drop = set(uniform_points(drop_count, grid))
@@ -525,14 +541,18 @@ def make_prompt(task: str, sample: dict[str, Any], coordinate_mode: str) -> str:
     return f"{sample['question']}\nAnswer with exactly one word: yes or no."
 
 
-def apply_chat_template(processor: Any, prompt: str) -> str:
-    messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt}]}]
+def apply_chat_template(processor: Any, prompt: str, image_count: int = 1) -> str:
+    if image_count <= 0:
+        raise BaselineError(f"image_count must be positive, got {image_count}")
+    content = [{"type": "image"} for _ in range(int(image_count))]
+    content.append({"type": "text", "text": prompt})
+    messages = [{"role": "user", "content": content}]
     if hasattr(processor, "apply_chat_template"):
         try:
             return processor.apply_chat_template(messages, add_generation_prompt=True)
         except Exception:
             pass
-    return f"USER: <image>\n{prompt}\nASSISTANT:"
+    return f"USER: {' '.join(['<image>'] * int(image_count))}\n{prompt}\nASSISTANT:"
 
 
 def selected_vision_features(model: Any, pixel_values: Any) -> tuple[Any, float, float]:
@@ -587,13 +607,16 @@ def prepare_compacted_inputs(
     processor: Any,
     model: Any,
     device: Any,
-    image: Image.Image,
+    image: Image.Image | list[Image.Image],
     prompt: str,
     retained: list[int],
     expected_original_tokens: int,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    text_prompt = apply_chat_template(processor, prompt)
-    inputs = processor(images=image, text=text_prompt, return_tensors="pt")
+    images = image if isinstance(image, list) else [image]
+    if not images:
+        raise BaselineError("At least one image is required.")
+    text_prompt = apply_chat_template(processor, prompt, len(images))
+    inputs = processor(images=images, text=text_prompt, return_tensors="pt")
     moved = {}
     dtype = next(model.parameters()).dtype
     for key, value in inputs.items():
@@ -605,8 +628,12 @@ def prepare_compacted_inputs(
         moved[key] = value
 
     image_features, vision_latency, projector_latency = selected_vision_features(model, moved["pixel_values"])
-    if image_features.ndim != 3 or image_features.shape[0] != 1:
-        raise BaselineError(f"Expected one image feature tensor with shape [1, tokens, hidden], got {tuple(image_features.shape)}")
+    if image_features.ndim != 3 or int(image_features.shape[0]) != len(images):
+        raise BaselineError(
+            f"Expected {len(images)} image feature tensors [images, tokens, hidden], "
+            f"got {tuple(image_features.shape)}"
+        )
+    image_features = image_features.reshape(1, -1, image_features.shape[-1])
 
     input_ids = moved["input_ids"]
     attention_mask = moved.get("attention_mask")
@@ -730,7 +757,7 @@ def generate_answer_true_removal(
     processor: Any,
     model: Any,
     device: Any,
-    image: Image.Image,
+    image: Image.Image | list[Image.Image],
     prompt: str,
     max_new_tokens: int,
     retained: list[int],

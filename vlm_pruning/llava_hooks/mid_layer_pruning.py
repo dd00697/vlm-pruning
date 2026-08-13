@@ -287,39 +287,55 @@ class MidLayerUGPruneForwarder:
     def position_ids_for(self, length: int, device: Any) -> Any:
         return self.torch.arange(int(length), device=device, dtype=self.torch.long).unsqueeze(0)
 
-    def _grid_tensors(self, device: Any) -> dict[str, Any]:
-        key = str(device)
+    def _grid_tensors(self, device: Any, image_count: int = 1) -> dict[str, Any]:
+        image_count = int(image_count)
+        if image_count <= 0:
+            raise SelectorError(f"image_count must be positive, got {image_count}.")
+        key = f"{device}:images={image_count}"
         cached = self._grid_tensor_cache.get(key)
         if cached is not None:
             return cached
         torch = self.torch
         grid = self.grid
-        count = grid * grid
+        per_image = grid * grid
+        count = per_image * image_count
         indices = torch.arange(count, device=device, dtype=torch.long)
-        rows = torch.div(indices, grid, rounding_mode="floor")
-        cols = indices.remainder(grid)
+        image_ids = torch.div(indices, per_image, rounding_mode="floor")
+        local_indices = indices.remainder(per_image)
+        rows = torch.div(local_indices, grid, rounding_mode="floor")
+        cols = local_indices.remainder(grid)
+        same_image = image_ids[:, None] == image_ids[None, :]
         row_diff = (rows[:, None] - rows[None, :]).abs()
         col_diff = (cols[:, None] - cols[None, :]).abs()
-        near_mask = (row_diff <= int(self.selector_config.nms_radius)) & (col_diff <= int(self.selector_config.nms_radius))
-        neighbor_mask = ((row_diff <= int(self.selector_config.context_radius)) & (col_diff <= int(self.selector_config.context_radius))) & (
+        near_mask = same_image & (row_diff <= int(self.selector_config.nms_radius)) & (col_diff <= int(self.selector_config.nms_radius))
+        neighbor_mask = same_image & ((row_diff <= int(self.selector_config.context_radius)) & (col_diff <= int(self.selector_config.context_radius))) & (
             indices[:, None] != indices[None, :]
         )
         row_bins, col_bins = self.selector_config.anchor_bins
         bin_rows = torch.clamp(torch.div(rows * row_bins, grid, rounding_mode="floor"), max=row_bins - 1)
         bin_cols = torch.clamp(torch.div(cols * col_bins, grid, rounding_mode="floor"), max=col_bins - 1)
-        bin_ids = (bin_rows * col_bins + bin_cols).to(dtype=torch.long)
-        centers = torch.stack([rows.float() + 0.5, cols.float() + 0.5], dim=1)
+        bins_per_image = row_bins * col_bins
+        bin_ids = (image_ids * bins_per_image + bin_rows * col_bins + bin_cols).to(dtype=torch.long)
+        global_cols = image_ids * grid + cols
+        centers = torch.stack([rows.float() + 0.5, global_cols.float() + 0.5], dim=1)
         distance_sq = ((centers[:, None, :] - centers[None, :, :]) ** 2).sum(dim=-1)
-        center = float(grid) / 2.0
-        center_distance_sq = ((centers - center) ** 2).sum(dim=-1)
+        center_point = torch.tensor(
+            [float(grid) / 2.0, float(grid * image_count) / 2.0],
+            device=device,
+            dtype=centers.dtype,
+        )
+        center_distance_sq = ((centers - center_point) ** 2).sum(dim=-1)
         cached = {
             "indices": indices,
+            "rows": rows,
+            "global_cols": global_cols,
             "near_mask": near_mask,
             "neighbor_mask": neighbor_mask,
             "bin_ids": bin_ids,
             "distance_sq": distance_sq,
             "center_distance_sq": center_distance_sq,
-            "num_bins": int(row_bins * col_bins),
+            "num_bins": int(bins_per_image * image_count),
+            "image_count": image_count,
         }
         self._grid_tensor_cache[key] = cached
         return cached
@@ -521,7 +537,8 @@ class MidLayerUGPruneForwarder:
         config = selector_config or self.selector_config
         return (
             self.diagnostics_mode == "benchmark"
-            and int(original_tokens) == self.grid * self.grid
+            and int(original_tokens) >= self.grid * self.grid
+            and int(original_tokens) % (self.grid * self.grid) == 0
             and self.grid == 24
             and config.map_family == "unrolled"
             and config.map_source in {"query_max", "query_pooled"}
@@ -561,7 +578,10 @@ class MidLayerUGPruneForwarder:
             "entropy_norm": float((entropy / max_entropy).item()) if int(values.numel()) > 1 else 0.0,
             "peakiness": float((values.max() - values.mean()).item()),
         }
-        grid_tensors = self._grid_tensors(values.device)
+        per_image = self.grid * self.grid
+        if int(values.numel()) % per_image != 0:
+            raise SelectorError(f"Score map has {int(values.numel())} tokens, not whole image grids.")
+        grid_tensors = self._grid_tensors(values.device, int(values.numel()) // per_image)
         top_counts = sorted({16, 29, 48, 58, 72, 96, int(self.target_visual_tokens)})
         for k in top_counts:
             count = min(int(k), int(values.numel()))
@@ -578,7 +598,7 @@ class MidLayerUGPruneForwarder:
             )
         return stats
 
-    def _selected_spread_stats_torch(self, selected: Any) -> dict[str, float | int]:
+    def _selected_spread_stats_torch(self, selected: Any, *, original_tokens: int) -> dict[str, float | int]:
         torch = self.torch
         indices = selected.to(dtype=torch.long).reshape(-1)
         if int(indices.numel()) == 0:
@@ -588,13 +608,18 @@ class MidLayerUGPruneForwarder:
                 "selected_col_span": 0,
                 "selected_mean_pairwise_spread": 0.0,
             }
-        grid_tensors = self._grid_tensors(indices.device)
+        per_image = self.grid * self.grid
+        if int(original_tokens) % per_image != 0:
+            raise SelectorError(f"original_tokens={original_tokens} is not whole image grids.")
+        grid_tensors = self._grid_tensors(indices.device, int(original_tokens) // per_image)
         bins = grid_tensors["bin_ids"].index_select(0, indices)
-        rows = torch.div(indices, self.grid, rounding_mode="floor").float()
-        cols = indices.remainder(self.grid).float()
+        rows = grid_tensors["rows"].index_select(0, indices).float()
+        cols = grid_tensors["global_cols"].index_select(0, indices).float()
         coords = torch.stack([rows, cols], dim=1)
         if int(indices.numel()) > 1:
-            spread = torch.pdist(coords, p=2).mean() / ((2.0**0.5) * max(self.grid - 1, 1))
+            width = self.grid * int(original_tokens // per_image)
+            diagonal = max(((self.grid - 1) ** 2 + (width - 1) ** 2) ** 0.5, 1.0)
+            spread = torch.pdist(coords, p=2).mean() / diagonal
         else:
             spread = torch.tensor(0.0, device=indices.device)
         return {
@@ -616,9 +641,12 @@ class MidLayerUGPruneForwarder:
         config = selector_config or self.selector_config
         ids = input_ids[0] if getattr(input_ids, "ndim", 1) == 2 else input_ids
         image_positions = torch.nonzero(ids == int(self.image_token_id), as_tuple=False).flatten()
-        expected = self.grid * self.grid
-        if int(image_positions.numel()) != expected:
-            raise SelectorError(f"Expected {expected} image-token positions, found {int(image_positions.numel())}.")
+        per_image = self.grid * self.grid
+        expected = int(image_positions.numel())
+        if expected < per_image or expected % per_image != 0:
+            raise SelectorError(
+                f"Expected one or more complete {self.grid}x{self.grid} image grids, found {expected} tokens."
+            )
         if not query_token_positions:
             raise SelectorError("query_token_positions is empty.")
         query_positions = torch.as_tensor(query_token_positions, device=ids.device, dtype=torch.long)
@@ -638,14 +666,14 @@ class MidLayerUGPruneForwarder:
             else:
                 pooled_query = torch.nn.functional.normalize(query_norm.mean(dim=0, keepdim=True), p=2, dim=-1)
                 scores = (image_norm @ pooled_query.transpose(0, 1)).squeeze(1)
-            maps.append(self._zscore(scores).reshape(self.grid, self.grid))
+            maps.append(self._zscore(scores).reshape(-1))
             keys.append(f"layer{layer}:{config.map_source}")
         if config.fusion_mode == "single_layer":
             if len(maps) != 1:
                 raise SelectorError("single_layer fusion requires exactly one requested layer.")
-            fused = self._zscore(maps[0].reshape(-1)).reshape(self.grid, self.grid)
+            fused = self._zscore(maps[0].reshape(-1))
         elif config.fusion_mode == "soft_average":
-            fused = self._zscore(torch.stack(maps, dim=0).mean(dim=0).reshape(-1)).reshape(self.grid, self.grid)
+            fused = self._zscore(torch.stack(maps, dim=0).mean(dim=0).reshape(-1))
         else:
             raise SelectorError(f"Fast benchmark path does not support fusion_mode={config.fusion_mode}.")
         flat = fused.reshape(-1)
@@ -757,7 +785,10 @@ class MidLayerUGPruneForwarder:
         target_budget = int(target_visual_tokens or self.target_visual_tokens)
         target_count, context_count, anchor_count = budget_split(target_budget, config)
         ranked = torch.argsort(scores, descending=True, stable=True)
-        grid_tensors = self._grid_tensors(scores.device)
+        per_image = self.grid * self.grid
+        if int(original_tokens) % per_image != 0:
+            raise SelectorError(f"original_tokens={original_tokens} is not whole image grids.")
+        grid_tensors = self._grid_tensors(scores.device, int(original_tokens) // per_image)
         if config.selector_strategy == "query_topk":
             query_topk = ranked[:target_budget]
             target = ranked.new_empty((0,), dtype=torch.long)
@@ -794,7 +825,9 @@ class MidLayerUGPruneForwarder:
             fill = fill[selected_mask.index_select(0, fill)]
         selected_tensor = torch.nonzero(selected_mask, as_tuple=False).flatten().sort().values
         map_stats = dict(map_stats)
-        map_stats.update(self._selected_spread_stats_torch(selected_tensor))
+        map_stats.update(
+            self._selected_spread_stats_torch(selected_tensor, original_tokens=original_tokens)
+        )
         selected_indices = [int(index) for index in selected_tensor.detach().cpu().tolist()]
         roles = {
             "target": [int(index) for index in target.sort().values.detach().cpu().tolist()],

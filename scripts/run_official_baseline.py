@@ -170,6 +170,20 @@ def load_manifest(path: Path, limit: int | None) -> list[dict[str, Any]]:
     return rows
 
 
+def load_sample_images(sample: dict[str, Any]) -> tuple[list[Path], list[Image.Image]]:
+    raw_paths = sample.get("image_paths")
+    if not isinstance(raw_paths, list) or not raw_paths:
+        raw_paths = [sample["image_path"]]
+    paths = [Path(str(value)) for value in raw_paths]
+    images = [Image.open(path).convert("RGB") for path in paths]
+    declared = int(sample.get("image_count") or len(images))
+    if declared != len(images):
+        raise BaselineError(
+            f"Sample {sample.get('sample_id')} declares image_count={declared}, found {len(images)} paths."
+        )
+    return paths, images
+
+
 def manifest_checksum(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -536,7 +550,7 @@ def answer_mode(sample: dict[str, Any], dataset: str) -> str:
         return "multiple_choice"
     answer = str(sample.get("answer") or "").strip().lower()
     choices = sample.get("choices") or []
-    if dataset.lower() == "pope" or answer in {"yes", "no"}:
+    if dataset.lower() in {"pope", "pope_all"} or answer in {"yes", "no"}:
         return "yes_no"
     if isinstance(choices, list) and choices:
         return "multiple_choice"
@@ -557,12 +571,21 @@ def registered_prompt_template(args: argparse.Namespace) -> str | None:
             f"Return exactly one bounding box in {coord} as "
             "[x_min, y_min, x_max, y_max]. Do not include any other text."
         )
-    if args.dataset.lower() == "mme" and args.prompt_profile == "paper":
+    name = args.dataset.lower()
+    if name == "mme" and args.prompt_profile == "paper":
         return "{question}"
-    if args.dataset.lower() in {"pope", "mme"}:
+    if name in {"pope", "pope_all", "mme"}:
         return "{question}\nAnswer with exactly one word: yes or no."
-    if args.dataset.lower() == "textvqa":
-        return "{question}\nAnswer as briefly as possible."
+    if name in {"gqa", "vqav2_val", "textvqa", "textvqa_val"}:
+        return "{question}\nAnswer the question using a single word or phrase."
+    if name == "mmbench_en_dev":
+        return "{hint} {question}\n{labelled_choices}\nAnswer with the option's letter from the given choices directly."
+    if name == "mmmu_val":
+        return "Official MMMU question/images and choices; answer with an option letter or one word/phrase."
+    if name == "scienceqa_img_test":
+        return "Optional Context, question, labelled choices; answer with the option's letter directly."
+    if name == "mmvet_test":
+        return "First please perform reasoning, and think step by step to provide best answer to the following question."
     return None
 
 
@@ -579,9 +602,23 @@ def make_prompt(args: argparse.Namespace, sample: dict[str, Any]) -> str:
             f"Return exactly one bounding box in {coord} as [x_min, y_min, x_max, y_max]. "
             "Do not include any other text."
         )
+    name = args.dataset.lower()
     question = str(sample["question"]).strip()
-    if args.dataset.lower() == "mme" and args.prompt_profile == "paper":
+    if name == "mme" and args.prompt_profile == "paper":
         return question
+    if name == "mmvet_test":
+        return (
+            "First please perform reasoning, and think step by step to provide best answer "
+            f"to the following question: \n\n{question}"
+        )
+    if name == "mmbench_en_dev":
+        hint = str(sample.get("hint") or "").strip()
+        if hint:
+            question = f"{hint} {question}"
+    if name == "scienceqa_img_test":
+        context = str(sample.get("hint") or "").strip()
+        if context:
+            question = f"Context: {context}\n{question}"
     mode = answer_mode(sample, args.dataset)
     if mode == "yes_no":
         return f"{question}\nAnswer with exactly one word: yes or no."
@@ -592,7 +629,21 @@ def make_prompt(args: argparse.Namespace, sample: dict[str, Any]) -> str:
             lines.append(f"{choice_label(idx)}. {choice}")
         lines.append("\nAnswer with the option letter only.")
         return "\n".join(lines)
+    if name in {"gqa", "vqav2_val", "textvqa", "textvqa_val", "mmmu_val"}:
+        return f"{question}\nAnswer the question using a single word or phrase."
     return f"{question}\nAnswer as briefly as possible."
+
+
+def default_max_new_tokens(dataset: str, task: str) -> int:
+    """Match the pinned official task generation limits unless overridden."""
+    if task == "grounding":
+        return 48
+    name = dataset.lower()
+    if name in {"mmbench_en_dev", "mmvet_test"}:
+        return 1024
+    if name == "mmmu_val":
+        return 128
+    return 16
 
 
 def extract_choice(raw: str, choices: list[Any]) -> tuple[str | None, str | None]:
@@ -667,7 +718,7 @@ def score_vqa(sample: dict[str, Any], raw: str, dataset: str) -> dict[str, Any]:
             "invalid_reason": "choice_extraction_failed" if pred_label is None and pred_text is None else None,
         }
     target_values = answer if isinstance(answer, list) else [answer]
-    if dataset.lower() == "textvqa":
+    if dataset.lower() in {"textvqa", "textvqa_val", "vqav2_val"}:
         pred_canon = vqa_normalize_answer(raw)
         target_canons = [vqa_normalize_answer(value) for value in target_values if value is not None]
         correct = bool(pred_canon and pred_canon in target_canons)
@@ -684,7 +735,7 @@ def score_vqa(sample: dict[str, Any], raw: str, dataset: str) -> dict[str, Any]:
         "correct": correct,
         "score": soft_score,
         "normalized_exact_match": 1.0 if correct else 0.0,
-        "vqa_soft_score": soft_score if dataset.lower() == "textvqa" else None,
+        "vqa_soft_score": soft_score if dataset.lower() in {"textvqa", "textvqa_val", "vqav2_val"} else None,
         "invalid": not bool(pred_canon),
         "invalid_reason": "empty_prediction" if not pred_canon else None,
     }
@@ -818,7 +869,7 @@ def aggregate(results: list[dict[str, Any]], args: argparse.Namespace, wall_time
                 "quality/yes_rate": pred_yes / len(yes_rows) if yes_rows else None,
             }
         )
-        if args.dataset.lower() == "textvqa":
+        if args.dataset.lower() in {"textvqa", "textvqa_val", "vqav2_val"}:
             soft_scores = [float(row.get("vqa_soft_score") or 0.0) for row in results]
             exact_scores = [float(row.get("normalized_exact_match") or 0.0) for row in results]
             metrics["quality/vqa_accuracy"] = sum(soft_scores) / len(soft_scores) if soft_scores else 0.0
@@ -827,7 +878,7 @@ def aggregate(results: list[dict[str, Any]], args: argparse.Namespace, wall_time
             )
             metrics["quality/main_score"] = metrics["quality/vqa_accuracy"]
             metrics["quality/accuracy"] = metrics["quality/vqa_accuracy"]
-        if args.dataset.lower() == "pope":
+        if args.dataset.lower() in {"pope", "pope_all"}:
             categories = ("random", "popular", "adversarial")
             for category in categories:
                 subset = [row for row in results if str(row.get("category") or "").lower() == category]
@@ -1002,23 +1053,27 @@ def evaluator_name(dataset: str, task: str) -> str:
     if task == "grounding":
         return "box_iou_acc_at_0_5"
     name = dataset.lower()
-    if name in {"pope", "mme"}:
+    if name in {"pope", "pope_all", "mme"}:
         return "yes_no_accuracy_f1"
-    if name in {"aokvqa", "a-okvqa", "scienceqa_img", "scienceqa", "mmmu", "seed_bench", "seed-bench"}:
+    if name in {"aokvqa", "a-okvqa", "scienceqa_img", "scienceqa", "scienceqa_img_test", "mmmu", "mmmu_val", "mmbench_en_dev", "seed_bench", "seed-bench"}:
         return "multiple_choice_accuracy"
     if name in {"ocr_vqa", "ocr-vqa"}:
         return "normalized_exact_match"
-    if name == "textvqa":
+    if name in {"textvqa", "textvqa_val", "vqav2_val"}:
         return "vqa_soft_accuracy"
+    if name == "gqa":
+        return "gqa_exact_match_ignore_case_punctuation"
+    if name == "mmvet_test":
+        return "mmvet_official_judge"
     return "manifest_accuracy"
 
 
 def metric_definition(dataset: str, task: str) -> str:
     if task == "grounding":
         return "Parse one predicted box and compute mean IoU, median IoU, and Acc@0.5 against manifest gt_box."
-    if dataset.lower() in {"pope", "mme"}:
+    if dataset.lower() in {"pope", "pope_all", "mme"}:
         return "Normalize yes/no answers and compute accuracy, precision, recall, F1, and yes-rate."
-    if dataset.lower() == "textvqa":
+    if dataset.lower() in {"textvqa", "textvqa_val", "vqav2_val"}:
         return (
             "Apply standard VQA answer normalisation and leave-one-annotator-out soft "
             "consensus accuracy; retain normalized exact match as a secondary diagnostic."
@@ -1787,6 +1842,8 @@ def build_result_common(
 ) -> dict[str, Any]:
     retained = selection.selected_indices
     sample_metadata = sample.get("metadata") if isinstance(sample.get("metadata"), dict) else {}
+    original_visual_tokens = int(selection.original_tokens)
+    selected_budget = int(selection.budget)
     result = {
         "sample_id": str(sample["sample_id"]),
         "original_sample_id": sample_metadata.get("original_sample_id", str(sample["sample_id"])),
@@ -1795,12 +1852,15 @@ def build_result_common(
         "split": sample.get("split") or args.split,
         "category": sample.get("category"),
         "image_path": str(image_path.as_posix()),
+        "image_paths": [str(value) for value in sample.get("image_paths", [image_path])],
+        "image_count": int(sample.get("image_count") or 1),
         "image_id": sample.get("image_id"),
         "mme_pair_id": sample.get("mme_pair_id") or sample_metadata.get("mme_pair_id"),
         "method": args.method,
         "seed": args.seed,
-        "target_visual_tokens": config["tokens/target_visual_tokens"],
-        "keep_ratio": config["tokens/keep_ratio"],
+        "target_visual_tokens": selected_budget,
+        "keep_ratio": keep_ratio(selected_budget, original_visual_tokens),
+        "original_visual_tokens": original_visual_tokens,
         "raw_model_output": raw_output,
         "latency_s": latency,
         "generated_token_count": generated_count,
@@ -1877,7 +1937,7 @@ def run(args: argparse.Namespace) -> int:
 
             results = list(existing)
             figure_paths: list[Path] = []
-            max_new_tokens = args.max_new_tokens or (48 if args.task == "grounding" else 16)
+            max_new_tokens = args.max_new_tokens or default_max_new_tokens(args.dataset, args.task)
             run_start = time.perf_counter()
             sample_mode = "a" if args.resume and partial_path.exists() else "w"
             with partial_path.open(sample_mode, encoding="utf-8") as handle:
@@ -1886,9 +1946,17 @@ def run(args: argparse.Namespace) -> int:
                     selector_sample_id = sample_id
                     if args.selector_id_mode == "original_sample_id":
                         selector_sample_id = str((sample.get("metadata") or {}).get("original_sample_id") or sample_id)
-                    image_path = Path(sample["image_path"])
-                    image = Image.open(image_path).convert("RGB")
+                    image_paths, images = load_sample_images(sample)
+                    image_path = image_paths[0]
+                    image = images[0]
+                    sample_original_tokens = original_tokens * len(images)
+                    sample_target_tokens = sample_original_tokens if args.method == "full" else tokens
                     prompt = make_prompt(args, sample)
+                    if len(images) > 1 and args.method in {"fastv", "visionzip"}:
+                        raise BaselineError(
+                            f"Official {args.method} admission does not support exact-total-B48 multi-image input; "
+                            "use the locked single-image MMMU subset."
+                        )
                     if args.method == "fastv":
                         raw_output, generated_count, latency, diagnostics, selection = generate_fastv_answer(
                             torch,
@@ -1898,8 +1966,8 @@ def run(args: argparse.Namespace) -> int:
                             image,
                             prompt,
                             max_new_tokens,
-                            original_tokens,
-                            tokens,
+                            sample_original_tokens,
+                            sample_target_tokens,
                         )
                     elif args.method == "visionzip":
                         raw_output, generated_count, latency, diagnostics, selection = generate_visionzip_answer(
@@ -1910,16 +1978,16 @@ def run(args: argparse.Namespace) -> int:
                             image,
                             prompt,
                             max_new_tokens,
-                            original_tokens,
-                            tokens,
+                            sample_original_tokens,
+                            sample_target_tokens,
                         )
                     else:
                         try:
                             assert selector is not None
                             selection = selector.select(
                                 sample_id=selector_sample_id,
-                                budget=tokens,
-                                original_tokens=original_tokens,
+                            budget=sample_target_tokens,
+                            original_tokens=sample_original_tokens,
                                 grid=args.image_grid_size,
                                 seed=args.seed,
                             )
@@ -1930,16 +1998,19 @@ def run(args: argparse.Namespace) -> int:
                             processor,
                             model,
                             device,
-                            image,
+                            images,
                             prompt,
                             max_new_tokens,
                             selection.selected_indices,
-                            original_tokens,
+                            sample_original_tokens,
                             position_mode=args.position_mode,
                         )
                     retained = selection.selected_indices
-                    if diagnostics.get("actual_llm_visual_tokens") != tokens:
-                        raise BaselineError(f"Actual retained visual tokens {diagnostics.get('actual_llm_visual_tokens')} != target {tokens}.")
+                    if diagnostics.get("actual_llm_visual_tokens") != sample_target_tokens:
+                        raise BaselineError(
+                            f"Actual retained visual tokens {diagnostics.get('actual_llm_visual_tokens')} "
+                            f"!= target {sample_target_tokens}."
+                        )
                     if args.method != "full" and diagnostics.get("compacted_input_sequence_length", 0) >= diagnostics.get("original_input_sequence_length", 0):
                         raise BaselineError(
                             "True token removal did not shorten the input sequence: "

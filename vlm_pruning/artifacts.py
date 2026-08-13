@@ -128,12 +128,20 @@ def validate_rows(
     budget_failures: list[str] = []
     for row in rows:
         sid = str(row.get("sample_id"))
+        row_original_tokens = row.get("original_visual_tokens", original_tokens)
+        try:
+            row_original_tokens = int(row_original_tokens) if row_original_tokens is not None else None
+        except (TypeError, ValueError):
+            row_original_tokens = None
         if budget is not None:
+            expected_budget = int(budget)
+            if str(row.get("method") or "").lower() == "full" and row_original_tokens is not None:
+                expected_budget = row_original_tokens
             requested = row.get("target_visual_tokens")
             actual = row.get("actual_llm_visual_tokens", row.get("actual_retained_visual_tokens"))
-            if requested is not None and int(requested) != int(budget):
+            if requested is not None and int(requested) != expected_budget:
                 budget_failures.append(f"{sid}: requested={requested}")
-            if actual is not None and int(actual) != int(budget):
+            if actual is not None and int(actual) != expected_budget:
                 budget_failures.append(f"{sid}: actual={actual}")
             retained = row.get("retained_indices")
             if require_retained:
@@ -141,9 +149,11 @@ def validate_rows(
                     budget_failures.append(f"{sid}: retained_indices missing")
                 else:
                     values = [int(value) for value in retained]
-                    if len(values) != int(budget) or len(set(values)) != len(values):
+                    if len(values) != expected_budget or len(set(values)) != len(values):
                         budget_failures.append(f"{sid}: invalid retained count/duplicates")
-                    if original_tokens is not None and any(value < 0 or value >= int(original_tokens) for value in values):
+                    if row_original_tokens is not None and any(
+                        value < 0 or value >= row_original_tokens for value in values
+                    ):
                         budget_failures.append(f"{sid}: retained index out of range")
         if strategy is not None and row.get("selector_strategy") != strategy:
             budget_failures.append(f"{sid}: selector_strategy={row.get('selector_strategy')!r}")
