@@ -86,7 +86,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--method",
         required=True,
-        choices=["full", "random", "uniform", "fastv", "visionzip", "official_fastv"],
+        choices=[
+            "full", "random", "uniform", "fastv", "visionzip",
+            "official_fastv", "official_fastv_disabled",
+        ],
     )
     parser.add_argument("--target-visual-tokens", "--token-budget", dest="target_visual_tokens", type=int)
     parser.add_argument("--keep-ratio", type=float)
@@ -1070,7 +1073,9 @@ def config_payload(args: argparse.Namespace, name: str, original_tokens: int, to
         "run/is_limited": args.limit is not None,
         "run/output_dir": None,
         "pruning_implementation": (
-            "fastv_official_repository_transformers"
+            "fastv_official_repository_disabled_parity"
+            if args.method == "official_fastv_disabled"
+            else "fastv_official_repository_transformers"
             if args.method == "official_fastv"
             else "fastv_pinned_hf_adapter"
             if args.method == "fastv"
@@ -1079,7 +1084,9 @@ def config_payload(args: argparse.Namespace, name: str, original_tokens: int, to
             else TRUE_REMOVAL_LABEL
         ),
         "pruning_location": (
-            "in_llm_after_layer_3"
+            "disabled_parity_gate"
+            if args.method == "official_fastv_disabled"
+            else "in_llm_after_layer_3"
             if args.method in {"fastv", "official_fastv"}
             else "pre_llm_vision_encoder_compression"
             if args.method == "visionzip"
@@ -1092,16 +1099,16 @@ def config_payload(args: argparse.Namespace, name: str, original_tokens: int, to
         "prompt/profile": args.prompt_profile,
         "limit": args.limit,
         "published_baseline/source": (
-            FASTV_SOURCE if args.method in {"fastv", "official_fastv"} else VISIONZIP_SOURCE if args.method == "visionzip" else None
+            FASTV_SOURCE if args.method in {"fastv", "official_fastv", "official_fastv_disabled"} else VISIONZIP_SOURCE if args.method == "visionzip" else None
         ),
         "published_baseline/commit": (
-            FASTV_COMMIT if args.method in {"fastv", "official_fastv"} else VISIONZIP_COMMIT if args.method == "visionzip" else None
+            FASTV_COMMIT if args.method in {"fastv", "official_fastv", "official_fastv_disabled"} else VISIONZIP_COMMIT if args.method == "visionzip" else None
         ),
         "published_baseline/fastv_k": 3 if args.method in {"fastv", "official_fastv"} else None,
         "published_baseline/fastv_r": (
             1.0 - tokens / original_tokens if args.method in {"fastv", "official_fastv"} else None
         ),
-        "published_baseline/official_source_executed": args.method == "official_fastv",
+        "published_baseline/official_source_executed": args.method in {"official_fastv", "official_fastv_disabled"},
         "published_baseline/visionzip_recipe": (
             "40 dominant (1 CLS + 39 patches) + 8 contextual; proportional official 54+10 recipe"
             if args.method == "visionzip" and tokens == 48
@@ -1562,6 +1569,107 @@ def generate_official_fastv_answer(
         "third_party_commit_sha": FASTV_COMMIT,
         "position_ids_mode": "official_gap_preserving_keep_indices",
         "official_fastv_config": fastv_config,
+    }
+    return raw, int(generated_ids.numel()), total_s, diagnostics, selection
+
+
+def generate_official_fastv_disabled_answer(
+    torch: Any,
+    processor: Any,
+    model: Any,
+    device: Any,
+    image: Image.Image,
+    prompt: str,
+    max_new_tokens: int,
+    original_tokens: int,
+) -> tuple[str, int, float, dict[str, Any], SelectionResult]:
+    """Run the pinned FastV fork with FastV disabled for the parity gate."""
+    moved = _move_processor_inputs(torch, processor, model, device, image, prompt)
+    model.config.fastv_config = None
+    layers = model.language_model.model.layers
+    first_layer_lengths: list[int | None] = [None] * len(layers)
+    call_index = -1
+
+    def make_hook(layer_index: int):
+        def hook(_module: Any, inputs: tuple[Any, ...]) -> None:
+            nonlocal call_index
+            if layer_index == 0:
+                call_index += 1
+            if call_index == 0 and inputs and hasattr(inputs[0], "shape"):
+                first_layer_lengths[layer_index] = int(inputs[0].shape[1])
+        return hook
+
+    handles = [layer.register_forward_pre_hook(make_hook(index)) for index, layer in enumerate(layers)]
+    generated: list[Any] = []
+    eos_ids = eos_token_ids(model, processor)
+    state = dict(moved)
+    cuda_sync(torch)
+    total_start = time.perf_counter()
+    first_token_s: float | None = None
+    try:
+        with torch.inference_mode():
+            for _ in range(max_new_tokens):
+                outputs = model(**state, use_cache=False, return_dict=True)
+                next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+                generated.append(next_token)
+                if first_token_s is None:
+                    cuda_sync(torch)
+                    first_token_s = time.perf_counter() - total_start
+                state["input_ids"] = torch.cat((state["input_ids"], next_token), dim=1)
+                state["attention_mask"] = torch.cat(
+                    (state["attention_mask"], torch.ones_like(next_token, dtype=state["attention_mask"].dtype)),
+                    dim=1,
+                )
+                if eos_ids and int(next_token.item()) in eos_ids:
+                    break
+    finally:
+        for handle in handles:
+            handle.remove()
+    cuda_sync(torch)
+    total_s = time.perf_counter() - total_start
+    if not generated or any(value is None for value in first_layer_lengths):
+        raise BaselineError("Official FastV disabled parity trace is incomplete.")
+    layer_lengths = [int(value) for value in first_layer_lengths if value is not None]
+    expanded_length = layer_lengths[0]
+    if any(value != expanded_length for value in layer_lengths):
+        raise BaselineError(f"FastV-disabled fork unexpectedly changed sequence length: {layer_lengths}.")
+    generated_ids = torch.cat(generated, dim=1)
+    raw = processor.decode(generated_ids[0], skip_special_tokens=True).strip()
+    selected = list(range(original_tokens))
+    selection = SelectionResult(
+        selected_indices=selected,
+        method="official_fastv_disabled_full",
+        budget=original_tokens,
+        original_tokens=original_tokens,
+        grid=24,
+        metadata={"official_repository": FASTV_SOURCE, "official_commit": FASTV_COMMIT, "fastv_config": None},
+    ).validate()
+    diagnostics = {
+        "vision_encoder_latency_s": None,
+        "projector_latency_s": None,
+        "pruning_selection_latency_s": 0.0,
+        "llm_prefill_latency_s": first_token_s,
+        "prefill_latency_s": first_token_s,
+        "time_to_first_token_s": first_token_s,
+        "decode_latency_s": max(0.0, total_s - float(first_token_s or 0.0)),
+        "total_inference_latency_s": total_s,
+        "original_visual_tokens": original_tokens,
+        "expected_retained_visual_tokens": original_tokens,
+        "actual_retained_visual_tokens": original_tokens,
+        "actual_llm_visual_tokens": original_tokens,
+        "original_input_sequence_length": expanded_length,
+        "compacted_input_sequence_length": expanded_length,
+        "sequence_length_reduction": 0,
+        "per_layer_sequence_lengths": layer_lengths,
+        "per_layer_visual_tokens": [original_tokens] * len(layers),
+        "effective_visual_token_layer_area": original_tokens * len(layers),
+        "retained_indices_checksum": indices_checksum(selected),
+        "pruning_implementation": "fastv_official_repository_disabled_parity",
+        "pruning_location": "disabled",
+        "third_party_source": FASTV_SOURCE,
+        "third_party_commit_sha": FASTV_COMMIT,
+        "position_ids_mode": "canonical_compact",
+        "official_fastv_config": None,
     }
     return raw, int(generated_ids.numel()), total_s, diagnostics, selection
 
@@ -2095,7 +2203,7 @@ def run(args: argparse.Namespace) -> int:
     if args.method == "full" and tokens != original_tokens:
         raise BaselineError("Full-token runs must retain all 576 visual tokens.")
     selector = None
-    if args.method not in {"fastv", "visionzip", "official_fastv"}:
+    if args.method not in {"fastv", "visionzip", "official_fastv", "official_fastv_disabled"}:
         try:
             selector = selector_for_method(args.method)
         except SelectorError as exc:
@@ -2171,12 +2279,16 @@ def run(args: argparse.Namespace) -> int:
                     sample_original_tokens = original_tokens * len(images)
                     sample_target_tokens = sample_original_tokens if args.method == "full" else tokens
                     prompt = make_prompt(args, sample)
-                    if len(images) > 1 and args.method in {"fastv", "visionzip", "official_fastv"}:
+                    if len(images) > 1 and args.method in {"fastv", "visionzip", "official_fastv", "official_fastv_disabled"}:
                         raise BaselineError(
                             f"Official {args.method} admission does not support exact-total-B48 multi-image input; "
                             "use the locked single-image MMMU subset."
                         )
-                    if args.method == "official_fastv":
+                    if args.method == "official_fastv_disabled":
+                        raw_output, generated_count, latency, diagnostics, selection = generate_official_fastv_disabled_answer(
+                            torch, processor, model, device, image, prompt, max_new_tokens, sample_original_tokens,
+                        )
+                    elif args.method == "official_fastv":
                         raw_output, generated_count, latency, diagnostics, selection = generate_official_fastv_answer(
                             torch,
                             processor,
@@ -2242,7 +2354,7 @@ def run(args: argparse.Namespace) -> int:
                             f"Actual retained visual tokens {diagnostics.get('actual_llm_visual_tokens')} "
                             f"!= target {sample_target_tokens}."
                         )
-                    if args.method != "full" and diagnostics.get("compacted_input_sequence_length", 0) >= diagnostics.get("original_input_sequence_length", 0):
+                    if args.method not in {"full", "official_fastv_disabled"} and diagnostics.get("compacted_input_sequence_length", 0) >= diagnostics.get("original_input_sequence_length", 0):
                         raise BaselineError(
                             "True token removal did not shorten the input sequence: "
                             f"original={diagnostics.get('original_input_sequence_length')} "
