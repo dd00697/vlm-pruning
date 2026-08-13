@@ -49,6 +49,7 @@ if str(ROOT) not in sys.path:
 from scripts.run_original_llava_official_method import expected_visual_trace  # noqa: E402
 from vlm_pruning.artifacts import read_jsonl_strict, sha256_file, validate_completed_run  # noqa: E402
 from vlm_pruning.final_campaign import DATASETS  # noqa: E402
+from vlm_pruning.gpu_scheduler import admissible_widths  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -369,10 +370,39 @@ def gpu_snapshot() -> str:
         return str(exc)
 
 
+def gpu_total_memory_mb() -> float:
+    values = subprocess.check_output(
+        ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"], text=True,
+    ).strip().splitlines()
+    if len(values) != 1:
+        raise RuntimeError(f"Expected one campaign GPU, got {values}")
+    return float(values[0])
+
+
+def serial_peak_memory_mb() -> float:
+    peaks = []
+    for cell in cells():
+        path = run_dir(cell, "serial") / "metrics.json"
+        if not path.is_file():
+            raise RuntimeError(f"Missing serial memory evidence: {path}")
+        metrics = json.loads(path.read_text(encoding="utf-8"))
+        peak = metrics.get("efficiency/peak_gpu_memory_reserved_mb")
+        if peak is None:
+            peak = metrics.get("efficiency/peak_gpu_memory_mb")
+        if peak is None:
+            raise RuntimeError(f"Serial peak memory missing: {path}")
+        peaks.append(float(peak))
+    return max(peaks)
+
+
 def soak(limit: int) -> dict[str, Any]:
     representatives = [cell for cell in cells() if cell.dataset in {"gqa", "mme", "textvqa_val"}]
     attempts, safe = [], 0
-    for width in (3, 2, 1):
+    total_mb = gpu_total_memory_mb()
+    peak_mb = serial_peak_memory_mb()
+    widths, headroom_mb = admissible_widths(total_mb, peak_mb)
+    skipped = [width for width in (3, 2, 1) if width not in widths]
+    for width in widths:
         before = gpu_snapshot()
         results = run_processes([(cell, f"soak{width}", limit) for cell in representatives[:width]], width)
         passed = all(x["validation"]["status"] == "pass" for x in results)
@@ -381,7 +411,10 @@ def soak(limit: int) -> dict[str, Any]:
             safe = width
             break
     payload = {"status": "pass" if safe else "fail", "safe_parallelism": safe,
-               "created_at_utc": utc_now(), "limit": limit, "attempts": attempts}
+               "created_at_utc": utc_now(), "limit": limit, "attempts": attempts,
+               "memory_gate": {"gpu_total_mb": total_mb, "serial_peak_reserved_mb": peak_mb,
+                               "required_headroom_mb": headroom_mb, "admissible_widths": widths,
+                               "skipped_without_launch": skipped}}
     write_json(CAMPAIGN / "original_official_gpu_soak.json", payload)
     return payload
 
