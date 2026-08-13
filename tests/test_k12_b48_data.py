@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from PIL import Image
 
@@ -12,6 +13,7 @@ from scripts.prepare_k12_b48_data import (
     image_record,
     mmbench_choices,
     parse_choices,
+    validate_manifest,
 )
 from scripts.run_baseline import retained_indices
 from vlm_pruning.artifacts import validate_rows
@@ -19,6 +21,26 @@ from vlm_pruning.llava_hooks.mid_layer_pruning import MidLayerUGPruneForwarder, 
 
 
 class K12B48DataTests(unittest.TestCase):
+    def test_manifest_checks_each_distinct_image_once(self) -> None:
+        from vlm_pruning.final_campaign import DATASETS
+
+        protocol = next(item for item in DATASETS if item.key == "vqav2_val")
+        records = [
+            {
+                "sample_id": f"sample-{index}",
+                "question": "What is shown?",
+                "answer": "cat",
+                "image_paths": ["data/shared.jpg"],
+                "image_count": 1,
+            }
+            for index in range(3)
+        ]
+        with mock.patch("scripts.prepare_k12_b48_data.Path.is_file", return_value=True) as is_file:
+            report = validate_manifest(protocol, records, len(records), limited=True)
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(report["unique_images"], 1)
+        is_file.assert_called_once()
+
     def test_image_id_is_never_cast_as_an_image_column(self) -> None:
         class FakeDataset:
             column_names = ["image", "image_1", "image_id", "image_width"]

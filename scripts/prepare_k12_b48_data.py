@@ -418,14 +418,22 @@ def validate_manifest(
         issues.append(f"manifest rows {len(records)} != {expected_manifest_rows}")
     if not records:
         issues.append("manifest has no records")
+    # A benchmark can ask several questions about the same image (VQAv2 is the
+    # largest example).  Validate every distinct referenced artifact once.  A
+    # per-row stat is equivalent for integrity purposes but turns into hundreds
+    # of thousands of redundant network-filesystem requests on large splits.
+    image_paths = {
+        path
+        for row in records
+        for path in row.get("image_paths", [])
+    }
     missing_images = []
-    for row in records:
-        for path in row.get("image_paths", []):
-            resolved = Path(path)
-            if not resolved.is_absolute():
-                resolved = ROOT / resolved
-            if not resolved.is_file():
-                missing_images.append(path)
+    for path in image_paths:
+        resolved = Path(path)
+        if not resolved.is_absolute():
+            resolved = ROOT / resolved
+        if not resolved.is_file():
+            missing_images.append(path)
     if missing_images:
         issues.append(f"missing images: {missing_images[:5]}")
     if protocol.task == "grounding" and any(
@@ -442,7 +450,7 @@ def validate_manifest(
         "source_rows": source_rows,
         "manifest_rows": len(records),
         "unique_sample_ids": len(set(ids)),
-        "unique_images": len({path for row in records for path in row.get("image_paths", [])}),
+        "unique_images": len(image_paths),
         "image_count_histogram": {
             str(count): sum(int(row.get("image_count", 0)) == count for row in records)
             for count in sorted({int(row.get("image_count", 0)) for row in records})
