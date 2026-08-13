@@ -21,6 +21,7 @@ OUTPUT_ROOT = CAMPAIGN / "runs/official_original_llava"
 SMOKE_ROOT = CAMPAIGN / "smoke/official_original_llava"
 ORIGINAL_CACHE = Path("/dev/shm/vlm_original_llava_cache")
 ORIGINAL_REVISION = "4481d270cc22fd5c4d1bb5df129622006ccd9234"
+VISION_REVISION = "ce19dc912ca5cd21c8a653c79e251e808ccabcd1"
 ORIGINAL_SNAPSHOT = ORIGINAL_CACHE / "models--liuhaotian--llava-v1.5-7b" / "snapshots" / ORIGINAL_REVISION
 CANONICAL_SUMMARY = CAMPAIGN / "canonical_checkpoint_tensor_summary.json"
 EQUIVALENCE_REPORT = CAMPAIGN / "original_llava_checkpoint_equivalence.json"
@@ -88,7 +89,10 @@ def single_snapshot(model_prefix: str) -> Path:
 
 
 def vision_snapshot() -> Path:
-    return single_snapshot("models--openai--clip-vit-large-patch14-336")
+    snapshot = single_snapshot("models--openai--clip-vit-large-patch14-336")
+    if snapshot.name != VISION_REVISION:
+        raise RuntimeError(f"CLIP snapshot revision {snapshot.name} != locked {VISION_REVISION}")
+    return snapshot
 
 
 def official_env(method: str) -> dict[str, str]:

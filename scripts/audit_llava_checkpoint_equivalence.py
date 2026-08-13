@@ -135,17 +135,30 @@ def pytorch_index_tensors(checkpoint: Path) -> tuple[dict[str, dict[str, Any]], 
     return result, derived
 
 
-def vision_tensors(checkpoint: Path) -> dict[str, dict[str, Any]]:
+def vision_tensors(checkpoint: Path, wanted: set[str]) -> tuple[dict[str, dict[str, Any]], list[str]]:
     from safetensors import safe_open
 
     candidates = [checkpoint / "model.safetensors"]
     if (checkpoint / "model.safetensors.index.json").is_file():
-        values = {"clip::" + name: tensor_digest(tensor) for name, tensor in indexed_safetensors(checkpoint)}
-        return values
+        values: dict[str, dict[str, Any]] = {}
+        ignored = []
+        for source_name, tensor in indexed_safetensors(checkpoint):
+            name = "clip::" + source_name
+            if name in wanted:
+                values[name] = tensor_digest(tensor)
+            else:
+                ignored.append(name)
+        ignored.sort()
+        return values, ignored
     for path in candidates:
         if path.is_file():
             with safe_open(path, framework="pt", device="cpu") as handle:
-                return {"clip::" + name: tensor_digest(handle.get_tensor(name)) for name in handle.keys()}
+                names = ["clip::" + name for name in handle.keys()]
+                values = {
+                    name: tensor_digest(handle.get_tensor(name.removeprefix("clip::")))
+                    for name in names if name in wanted
+                }
+                return values, sorted(name for name in names if name not in wanted)
     # Older CLIP snapshots can use a single PyTorch file.
     import torch
 
@@ -153,14 +166,22 @@ def vision_tensors(checkpoint: Path) -> dict[str, dict[str, Any]]:
     if not path.is_file():
         raise FileNotFoundError(f"No supported vision model file in {checkpoint}")
     state = torch.load(path, map_location="cpu", weights_only=True)
-    return {"clip::" + name: tensor_digest(tensor) for name, tensor in state.items()}
+    names = ["clip::" + name for name in state]
+    values = {
+        name: tensor_digest(state[name.removeprefix("clip::")])
+        for name in names if name in wanted
+    }
+    return values, sorted(name for name in names if name not in wanted)
 
 
 def compare_original(canonical_summary: Path, original: Path, vision: Path, output: Path) -> dict[str, Any]:
     canonical = json.loads(canonical_summary.read_text(encoding="utf-8"))
     expected = canonical["tensors"]
     original_tensors, derived = pytorch_index_tensors(original)
-    original_tensors.update(vision_tensors(vision))
+    clip_tensors, unused_clip = vision_tensors(
+        vision, {name for name in expected if name.startswith("clip::")},
+    )
+    original_tensors.update(clip_tensors)
     missing = sorted(set(expected) - set(original_tensors))
     extra = sorted(set(original_tensors) - set(expected))
     mismatches = {
@@ -183,6 +204,8 @@ def compare_original(canonical_summary: Path, original: Path, vision: Path, outp
         "mismatches": mismatches,
         "excluded_derived_rotary_buffers": sorted(derived),
         "exclusion_reason": "Rotary inv_freq values are deterministic non-parameter buffers in the old stack and are not serialized by the converted stack.",
+        "unused_clip_checkpoint_tensors": unused_clip,
+        "unused_clip_reason": "The author LLaVA stack instantiates CLIPVisionModel; text-encoder/projection tensors packaged in the source CLIPModel checkpoint are not loaded or used.",
     }
     atomic_json(output, payload)
     if status != "pass":
