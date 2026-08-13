@@ -172,14 +172,28 @@ def resolve_query_token_positions(
         # fallback; it does not alter which query tokens feed query-max.
         if input_ids is not None:
             actual_ids = [int(token_id) for token_id in _as_list(input_ids)]
-            token_ids = _encode_query_only(tokenizer, query)
             preferred_start = None
             try:
                 preferred_start = len(_encode_query_only(tokenizer, prompt[:char_start]))
             except Exception:
                 pass
-            start = _best_subsequence_start(actual_ids, token_ids, preferred_start=preferred_start)
-            if start is not None and token_ids:
+            candidates: list[list[int]] = []
+            for candidate_text in (query, " " + query):
+                candidate_ids = _encode_query_only(tokenizer, candidate_text)
+                if candidate_ids and candidate_ids not in candidates:
+                    candidates.append(candidate_ids)
+            matches: list[tuple[int, list[int]]] = []
+            for candidate_ids in candidates:
+                candidate_start = _best_subsequence_start(
+                    actual_ids, candidate_ids, preferred_start=preferred_start,
+                )
+                if candidate_start is not None:
+                    matches.append((candidate_start, candidate_ids))
+            if matches:
+                start, token_ids = min(
+                    matches,
+                    key=lambda item: abs(item[0] - preferred_start) if preferred_start is not None else item[0],
+                )
                 token_positions = list(range(start, start + len(token_ids)))
                 return QueryTokenResolution(
                     query=query,
