@@ -35,10 +35,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def tensor_digest(tensor: Any) -> dict[str, Any]:
+def tensor_digest(tensor: Any, *, target_dtype: str | None = None) -> dict[str, Any]:
     import torch
 
     value = tensor.detach().cpu().contiguous()
+    if target_dtype is not None and str(value.dtype) != target_dtype:
+        dtype_name = target_dtype.removeprefix("torch.")
+        dtype = getattr(torch, dtype_name, None)
+        if not isinstance(dtype, torch.dtype):
+            raise ValueError(f"Unsupported target dtype: {target_dtype}")
+        value = value.to(dtype=dtype).contiguous()
     raw = value.view(torch.uint8).numpy().tobytes()
     return {
         "sha256": hashlib.sha256(raw).hexdigest(),
@@ -135,7 +141,7 @@ def pytorch_index_tensors(checkpoint: Path) -> tuple[dict[str, dict[str, Any]], 
     return result, derived
 
 
-def vision_tensors(checkpoint: Path, wanted: set[str]) -> tuple[dict[str, dict[str, Any]], list[str]]:
+def vision_tensors(checkpoint: Path, wanted: dict[str, dict[str, Any]]) -> tuple[dict[str, dict[str, Any]], list[str]]:
     from safetensors import safe_open
 
     candidates = [checkpoint / "model.safetensors"]
@@ -145,7 +151,7 @@ def vision_tensors(checkpoint: Path, wanted: set[str]) -> tuple[dict[str, dict[s
         for source_name, tensor in indexed_safetensors(checkpoint):
             name = "clip::" + source_name
             if name in wanted:
-                values[name] = tensor_digest(tensor)
+                values[name] = tensor_digest(tensor, target_dtype=wanted[name]["dtype"])
             else:
                 ignored.append(name)
         ignored.sort()
@@ -155,7 +161,10 @@ def vision_tensors(checkpoint: Path, wanted: set[str]) -> tuple[dict[str, dict[s
             with safe_open(path, framework="pt", device="cpu") as handle:
                 names = ["clip::" + name for name in handle.keys()]
                 values = {
-                    name: tensor_digest(handle.get_tensor(name.removeprefix("clip::")))
+                    name: tensor_digest(
+                        handle.get_tensor(name.removeprefix("clip::")),
+                        target_dtype=wanted[name]["dtype"],
+                    )
                     for name in names if name in wanted
                 }
                 return values, sorted(name for name in names if name not in wanted)
@@ -168,7 +177,9 @@ def vision_tensors(checkpoint: Path, wanted: set[str]) -> tuple[dict[str, dict[s
     state = torch.load(path, map_location="cpu", weights_only=True)
     names = ["clip::" + name for name in state]
     values = {
-        name: tensor_digest(state[name.removeprefix("clip::")])
+        name: tensor_digest(
+            state[name.removeprefix("clip::")], target_dtype=wanted[name]["dtype"],
+        )
         for name in names if name in wanted
     }
     return values, sorted(name for name in names if name not in wanted)
@@ -179,7 +190,7 @@ def compare_original(canonical_summary: Path, original: Path, vision: Path, outp
     expected = canonical["tensors"]
     original_tensors, derived = pytorch_index_tensors(original)
     clip_tensors, unused_clip = vision_tensors(
-        vision, {name for name in expected if name.startswith("clip::")},
+        vision, {name: value for name, value in expected.items() if name.startswith("clip::")},
     )
     original_tensors.update(clip_tensors)
     missing = sorted(set(expected) - set(original_tensors))
@@ -206,6 +217,7 @@ def compare_original(canonical_summary: Path, original: Path, vision: Path, outp
         "exclusion_reason": "Rotary inv_freq values are deterministic non-parameter buffers in the old stack and are not serialized by the converted stack.",
         "unused_clip_checkpoint_tensors": unused_clip,
         "unused_clip_reason": "The author LLaVA stack instantiates CLIPVisionModel; text-encoder/projection tensors packaged in the source CLIPModel checkpoint are not loaded or used.",
+        "dtype_normalisation": "Source CLIP tensors are cast to the canonical serialized dtype before hashing, matching the official LLaVA runtime load into FP16.",
     }
     atomic_json(output, payload)
     if status != "pass":

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from scripts.audit_llava_checkpoint_equivalence import semantic_canonical_name
+from scripts.audit_llava_checkpoint_equivalence import semantic_canonical_name, tensor_digest
 
 
 class LLaVACheckpointEquivalenceTests(unittest.TestCase):
@@ -22,6 +22,16 @@ class LLaVACheckpointEquivalenceTests(unittest.TestCase):
         self.assertEqual(
             semantic_canonical_name("vision_tower.vision_model.post_layernorm.weight"),
             "clip::vision_model.post_layernorm.weight",
+        )
+
+    def test_runtime_dtype_normalisation_matches_fp16_serialisation(self) -> None:
+        import torch
+
+        source = torch.tensor([1.125, -2.25], dtype=torch.float32)
+        expected = source.to(torch.float16)
+        self.assertEqual(
+            tensor_digest(source, target_dtype="torch.float16"),
+            tensor_digest(expected),
         )
 
 
