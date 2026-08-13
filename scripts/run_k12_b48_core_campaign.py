@@ -149,6 +149,10 @@ def integrity(cell: Cell, phase: str, *, run_id: str | None = None, limit: int |
                                     original_tokens=576, task=cell.task, strategy=strategy)
     if report.get("status") != "pass":
         return report
+    if not (directory / "COMPLETED.json").is_file():
+        report["status"] = "fail"
+        report.setdefault("issues", []).append("completion sentinel missing")
+        return report
     config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
     expected = {
         "source/git_dirty": False, "model/name": MODEL, "model/precision": "bf16",

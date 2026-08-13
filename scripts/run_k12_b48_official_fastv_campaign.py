@@ -151,6 +151,8 @@ def validate(cell: Cell, phase: str, limit: int | None, score: bool = True) -> d
         directory, rows, budget=48, original_tokens=576, task=cell.task, require_retained=True,
     )
     issues = list(report.get("issues") or [])
+    if not (directory / "COMPLETED.json").is_file():
+        issues.append("completion sentinel missing")
     if report.get("status") == "pass":
         config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
         environment = json.loads((directory / "run_environment.json").read_text(encoding="utf-8"))

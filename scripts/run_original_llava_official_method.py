@@ -545,6 +545,7 @@ def run(args: argparse.Namespace) -> int:
         "metrics_sha256": sha256_file(run_dir / "metrics.json"),
         "integrity_sha256": sha256_file(run_dir / "integrity_report.json"),
     })
+    partial_path.unlink(missing_ok=True)
     return 0
 
 

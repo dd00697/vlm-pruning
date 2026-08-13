@@ -66,6 +66,7 @@ from vlm_pruning.artifacts import (  # noqa: E402
     ArtifactIntegrityError,
     finalize_partial_jsonl,
     load_resume_rows,
+    sha256_file,
     source_provenance,
     validate_completed_run,
 )
@@ -315,6 +316,8 @@ def completed_run_matches(
     manifest_rows: list[dict[str, Any]],
     checksum: str,
 ) -> bool:
+    if not (run_dir / "COMPLETED.json").is_file():
+        return False
     metrics_path = run_dir / "metrics.json"
     config_path = run_dir / "config.json"
     if not metrics_path.exists() or not config_path.exists():
@@ -952,6 +955,19 @@ def run(args: argparse.Namespace) -> int:
             write_json(run_dir / "integrity_report.json", jsonable(completion))
             if completion["status"] != "pass":
                 raise ArtifactIntegrityError("Final run integrity failed: " + "; ".join(completion["issues"]))
+            write_json(
+                run_dir / "COMPLETED.json",
+                {
+                    "status": "complete",
+                    "completed_at_utc": utc_now(),
+                    "rows": len(results),
+                    "config_sha256": sha256_file(run_dir / "config.json"),
+                    "predictions_sha256": sha256_file(per_sample_path),
+                    "metrics_sha256": sha256_file(run_dir / "metrics.json"),
+                    "integrity_sha256": sha256_file(run_dir / "integrity_report.json"),
+                },
+            )
+            partial_path.unlink(missing_ok=True)
             update_tables(config, metrics, args)
             update_runtime_files(args.tables_root, estimate)
             log_wandb(wandb_run, metrics, results, run_dir, figure_paths)
