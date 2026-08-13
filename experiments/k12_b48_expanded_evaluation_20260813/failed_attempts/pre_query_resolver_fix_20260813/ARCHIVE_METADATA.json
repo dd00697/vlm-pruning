@@ -1,0 +1,24 @@
+{
+  "archive_class": "recoverable_failed_attempt_evidence",
+  "archived_at_utc": "2026-08-13T18:58:27Z",
+  "reason": "The first structured RefCOCO full run exposed a slow-tokenizer query-boundary alignment failure. Every incomplete run opened by the same controller invocation was archived before the resolver compatibility repair was committed so that no final run can mix source revisions.",
+  "source_commit": "98e630a",
+  "final_evidence_eligible": false,
+  "runs": {
+    "refcoco_val__uniform": {
+      "partial_rows": 523,
+      "partial_sha256": "40416b4696b2e7da195b395cc3b262b5b5a49aa924aed191e792ca4d5f1baaa8",
+      "reason": "Incomplete sibling run; archived to preserve single-revision provenance even though uniform selection does not use query-token resolution."
+    },
+    "refcoco_val__structured_compact": {
+      "partial_rows": 9,
+      "partial_sha256": "7eebfb15863dd84e45f104f02882485e1fe2e9772754e64821963d1fbb0bcd7c",
+      "reason": "Stopped on sample index 9 with tokenizer_offsets_failed."
+    },
+    "gqa__full": {
+      "partial_rows": 0,
+      "partial_sha256": null,
+      "reason": "Controller created configuration/log files before shutdown; no predictions were produced."
+    }
+  }
+}

@@ -1,0 +1,61 @@
+{
+  "campaign_id": "k12_b48_expanded_evaluation_20260813",
+  "outcomes_inspected_before_amendment": true,
+  "superseded_registration_commit": "7041fa9366f38686cb5201e5535398f9c5e01549",
+  "active_registration_commit": "b29b27264e7549ed3b3b2344c8f6c35e6fb4790a",
+  "amendments": [
+    {
+      "class": "protocol_metadata_correction",
+      "description": "Corrected the reporting-only primary anchor count from 12 to the locked 15; K=12 continues to mean pruning after decoder layer 12. The role allocation remains 21 target, 12 context, and 15 anchor tokens."
+    },
+    {
+      "class": "manifest_preparation_repair",
+      "description": "Assigned the limited-run flag before full MME pair normalization, qualified POPE sample IDs by subset, and cached lossless source images. No benchmark prediction or quality value was generated or inspected."
+    },
+    {
+      "class": "evaluation_and_provenance_hardening",
+      "description": "Added benchmark-specific raw fields, deterministic slow processor loading, exact raw-output rescoring, pinned official evaluator-source hashes, and MM-Vet blocked-external-scoring behavior."
+    },
+    {
+      "class": "structural_smoke_compatibility",
+      "description": "Limited-only manifest preparation now streams large official splits, image_id is never cast as an image payload, and small RefCOCO+ splits use non-streaming loading to avoid a pyarrow finalizer failure. Full preparation semantics and locked row counts are unchanged."
+    },
+    {
+      "class": "execution_safety",
+      "description": "Added a strict 52-cell primary core controller plus 26 separately labelled random-control variance cells (seeds 1 and 2), exact configuration/token-trace validation, serial smoke and measured-memory GPU-soak gates, official rescoring, and the claim-to-artifact ledger. Seed 0 remains the sole headline paired matrix; variance seeds are never mixed with other configurations. All 12 dataset adapters passed structural smoke before registration."
+    },
+    {
+      "class": "locked_split_streaming_repair",
+      "description": "MMMU, VQAv2, and TextVQA now stream only their locked evaluation split and independently reject an actual yielded-row count different from the registered total. This avoids materializing unrelated splits and bypasses a corrupt, unneeded MMMU test-shard cache left by an interrupted compatibility download. No quality output existed or was inspected."
+    },
+    {
+      "class": "slow_tokenizer_alignment_compatibility",
+      "description": "The canonical slow SentencePiece tokenizer does not implement offset mappings. Query-token resolution now aligns the exact query token-id subsequence (including the context-sensitive leading-space variant) against actual processor input IDs. The locked query-max scoring rule is unchanged. One single-example GQA compatibility output was visible after the original resolver failed; it was not used to select or tune any scientific configuration. The repaired resolver passed unit tests and two-record checks on every available locked benchmark, including grounding and multi-image prompts."
+    },
+    {
+      "class": "official_fastv_admission_glue",
+      "description": "Added an isolated official FastV Transformers execution path, metadata-only processor compatibility construction, read-only attention/layer observers, and a disabled-method parity gate. The official selector code is unmodified. A one-example gate proved a 576,576,576,48x29 visual-token trace and exact raw-output parity with FastV disabled; this technical output was not used for configuration tuning."
+    },
+    {
+      "class": "storage_safety",
+      "description": "Stopped and removed only an incomplete recoverable original-LLaVA checkpoint download after proving that it could not coexist with the canonical checkpoint in the 24 GiB shared-memory volume. VisionZip/TransPrune checkpoint work is sequenced after canonical runs; no scientific artifact was deleted."
+    },
+    {
+      "class": "manifest_validation_scalability",
+      "description": "After all 214354 locked VQAv2 rows had been transformed, the first preparation attempt was interrupted during redundant per-question filesystem existence checks and had not published a manifest. Validation now checks every distinct referenced image artifact once, preserving the same integrity condition while avoiding repeated network-filesystem stats for questions sharing an image. The already cached lossless images are reused on a deterministic full retry; no benchmark prediction existed."
+    },
+    {
+      "class": "official_original_stack_admission_glue",
+      "description": "Added thin official VisionZip and TransPrune dataset/output glue plus read-only per-layer sequence observers. Admission requires byte-identical comparison of all 686 scientific checkpoint tensors and deterministic unpruned output parity before either official method can run. The official selection/pruning source is not modified, no quality outcome has been inspected, and exact B=48 is enforced from observed traces."
+    },
+    {
+      "class": "recoverable_cache_cleanup",
+      "description": "Removed a separate 3533701120-byte .incomplete Hugging Face weight download under /root/.cache after verifying the complete canonical snapshot remained in shared memory. The removed directory contained no result, manifest, or complete model and is fully recoverable."
+    },
+    {
+      "class": "query_offset_observer_compatibility_after_partial_inference",
+      "description": "The first full RefCOCO structured run stopped at sample 10 because a SentencePiece boundary merge made the query-only slow-tokenizer IDs unobservable as a standalone subsequence. The resolver now uses the pinned checkpoint's locally cached fast-equivalent tokenizer only to observe character offsets, then accepts positions only after exact token-ID alignment against the untouched canonical slow-processor model input. No model input, selector rule, budget, prompt, or scientific configuration changed. RefCOCO full and random-control outcomes had already been produced and inspected; they do not invoke query-token resolution and were not used to tune this compatibility repair. A complete pre-resumption sweep resolved all 8811 RefCOCO-val and all 21373 locked RefCOCO+ queries with zero failures. Incomplete pre-repair run directories are retained as failed-attempt evidence and are not mixed into resumed evidence."
+    }
+  ],
+  "status": "amended_after_partial_inference"
+}

@@ -1,0 +1,34 @@
+{
+  "data/k12_b48_expanded/refcoco_plus_testA/manifest.jsonl": {
+    "failure_count": 0,
+    "failures": [],
+    "statuses": {
+      "matched_actual_input_subsequence": 5726
+    },
+    "total": 5726
+  },
+  "data/k12_b48_expanded/refcoco_plus_testB/manifest.jsonl": {
+    "failure_count": 0,
+    "failures": [],
+    "statuses": {
+      "matched_actual_input_subsequence": 4889
+    },
+    "total": 4889
+  },
+  "data/k12_b48_expanded/refcoco_plus_val/manifest.jsonl": {
+    "failure_count": 0,
+    "failures": [],
+    "statuses": {
+      "matched_actual_input_subsequence": 10758
+    },
+    "total": 10758
+  },
+  "data/manifests/final_evaluation/refcoco_val_unique.jsonl": {
+    "failure_count": 0,
+    "failures": [],
+    "statuses": {
+      "matched_actual_input_subsequence": 8811
+    },
+    "total": 8811
+  }
+}

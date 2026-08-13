@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 from typing import Any, Sequence
 
 
@@ -107,8 +108,38 @@ def _token_texts(tokenizer: Any, token_ids: list[int]) -> list[str]:
     return [str(token_id) for token_id in token_ids]
 
 
+@lru_cache(maxsize=4)
+def _load_local_fast_tokenizer(name_or_path: str) -> Any:
+    """Load a fast tokenizer solely as a local character-offset observer."""
+
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        name_or_path,
+        use_fast=True,
+        local_files_only=True,
+    )
+    if not bool(getattr(tokenizer, "is_fast", False)):
+        raise TypeError(f"No fast tokenizer is available at {name_or_path!r}.")
+    return tokenizer
+
+
 def _encode_with_offsets(tokenizer: Any, prompt: str) -> tuple[list[int], list[tuple[int, int]]]:
-    encoded = tokenizer(prompt, return_offsets_mapping=True, add_special_tokens=True)
+    try:
+        encoded = tokenizer(prompt, return_offsets_mapping=True, add_special_tokens=True)
+    except Exception as primary_exc:
+        # The canonical processor deliberately uses the model's slow tokenizer.
+        # A locally cached fast equivalent can still observe character offsets;
+        # later code must align its token ids exactly against the untouched slow
+        # processor input before any positions are accepted.
+        name_or_path = str(getattr(tokenizer, "name_or_path", "")).strip()
+        if not name_or_path:
+            raise
+        try:
+            offset_tokenizer = _load_local_fast_tokenizer(name_or_path)
+            encoded = offset_tokenizer(prompt, return_offsets_mapping=True, add_special_tokens=True)
+        except Exception:
+            raise primary_exc
     input_ids = _as_list(encoded["input_ids"])
     offsets = _as_list(encoded["offset_mapping"])
     clean_offsets: list[tuple[int, int]] = []
@@ -207,6 +238,50 @@ def resolve_query_token_positions(
                     resolver_status="matched_slow_tokenizer_subsequence",
                     message=f"Offset mappings unavailable ({type(exc).__name__}); aligned exact token-id subsequence.",
                 )
+            # SentencePiece may merge the query's final punctuation with the
+            # immediately following delimiter (for example ``."``). In that
+            # case query-only ids cannot occur in the prompt even though the
+            # boundary-spanning token unambiguously overlaps the query. Retry
+            # with exactly one character of observed right context. Returning
+            # that merged token is equivalent to offset-based overlap logic;
+            # no standalone non-query token is added.
+            if char_end < len(prompt):
+                right_context = prompt[char_end : char_end + 1]
+                contextual_candidates: list[list[int]] = []
+                for candidate_text in (query + right_context, " " + query + right_context):
+                    candidate_ids = _encode_query_only(tokenizer, candidate_text)
+                    if candidate_ids and candidate_ids not in contextual_candidates:
+                        contextual_candidates.append(candidate_ids)
+                contextual_matches: list[tuple[int, list[int]]] = []
+                for candidate_ids in contextual_candidates:
+                    candidate_start = _best_subsequence_start(
+                        actual_ids, candidate_ids, preferred_start=preferred_start,
+                    )
+                    if candidate_start is not None:
+                        contextual_matches.append((candidate_start, candidate_ids))
+                if contextual_matches:
+                    start, token_ids = min(
+                        contextual_matches,
+                        key=lambda item: (
+                            abs(item[0] - preferred_start) if preferred_start is not None else item[0]
+                        ),
+                    )
+                    token_positions = list(range(start, start + len(token_ids)))
+                    return QueryTokenResolution(
+                        query=query,
+                        prompt=prompt,
+                        char_start=char_start,
+                        char_end=char_end,
+                        prompt_token_positions=[],
+                        token_positions=token_positions,
+                        token_ids=token_ids,
+                        token_texts=_token_texts(tokenizer, token_ids),
+                        resolver_status="matched_slow_tokenizer_contextual_subsequence",
+                        message=(
+                            f"Offset mappings unavailable ({type(exc).__name__}); aligned an exact "
+                            "subsequence containing the query's right-boundary-spanning token."
+                        ),
+                    )
         return QueryTokenResolution(
             query=query,
             prompt=prompt,

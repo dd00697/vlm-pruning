@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import unittest
+import re
+from unittest.mock import patch
 
 import numpy as np
 
@@ -61,6 +63,33 @@ class SlowFakeTokenizer(FakeTokenizer):
         return super().__call__(text, return_offsets_mapping=False, add_special_tokens=add_special_tokens)
 
 
+class NamedSlowFakeTokenizer(SlowFakeTokenizer):
+    name_or_path = "/local/fake-tokenizer"
+
+
+class BoundaryMergeSlowTokenizer:
+    """Tiny slow tokenizer that merges a query-final period with a quote."""
+
+    def __init__(self) -> None:
+        self.vocab: dict[str, int] = {}
+
+    def _id(self, token: str) -> int:
+        if token not in self.vocab:
+            self.vocab[token] = len(self.vocab) + 1
+        return self.vocab[token]
+
+    def __call__(self, text: str, return_offsets_mapping: bool = False, add_special_tokens: bool = True):
+        del add_special_tokens
+        if return_offsets_mapping:
+            raise NotImplementedError("slow tokenizer has no offsets")
+        tokens = re.findall(r'\."|[A-Za-z]+|[^\sA-Za-z]', text)
+        return {"input_ids": [self._id(token) for token in tokens]}
+
+    def convert_ids_to_tokens(self, token_ids: list[int]) -> list[str]:
+        inverse = {value: key for key, value in self.vocab.items()}
+        return [inverse[token_id] for token_id in token_ids]
+
+
 class QueryTokenResolverTests(unittest.TestCase):
     def test_resolves_query_positions_in_actual_input_ids(self) -> None:
         tokenizer = FakeTokenizer()
@@ -98,6 +127,40 @@ class QueryTokenResolverTests(unittest.TestCase):
             image_token_id=32000,
         )
         self.assertEqual(result.resolver_status, "matched_slow_tokenizer_subsequence")
+        self.assertEqual([actual_ids[pos] for pos in result.token_positions], result.token_ids)
+
+    def test_fast_offset_observer_is_aligned_to_untouched_slow_input(self) -> None:
+        tokenizer = NamedSlowFakeTokenizer()
+        offset_observer = FakeTokenizer()
+        offset_observer.vocab = tokenizer.vocab
+        prompt = 'USER: <image> Find "#71". ASSISTANT:'
+        actual_ids = tokenizer(prompt)["input_ids"]
+
+        with patch(
+            "vlm_pruning.features.query_tokens._load_local_fast_tokenizer",
+            return_value=offset_observer,
+        ):
+            result = resolve_query_token_positions(
+                tokenizer,
+                prompt,
+                "#71",
+                input_ids=actual_ids,
+                image_token_id=32000,
+            )
+
+        self.assertEqual(result.resolver_status, "matched_actual_input_subsequence")
+        self.assertEqual([actual_ids[pos] for pos in result.token_positions], result.token_ids)
+
+    def test_slow_tokenizer_aligns_query_token_merged_with_right_delimiter(self) -> None:
+        tokenizer = BoundaryMergeSlowTokenizer()
+        query = "Woman on the left."
+        prompt = f'USER: <image> Find "{query}". ASSISTANT:'
+        actual_ids = tokenizer(prompt)["input_ids"]
+
+        result = resolve_query_token_positions(tokenizer, prompt, query, input_ids=actual_ids)
+
+        self.assertEqual(result.resolver_status, "matched_slow_tokenizer_contextual_subsequence")
+        self.assertEqual(result.token_texts[-1], '."')
         self.assertEqual([actual_ids[pos] for pos in result.token_positions], result.token_ids)
 
 

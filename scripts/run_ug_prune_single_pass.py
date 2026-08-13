@@ -247,6 +247,7 @@ def config_payload(args: argparse.Namespace, name: str, original_tokens: int, to
     target_ratio, context_ratio, anchor_ratio = role_ratios(role_preset)
     provenance = source_provenance(REPO_ROOT, [
         Path("scripts/run_ug_prune_single_pass.py"),
+        Path("vlm_pruning/features/query_tokens.py"),
         Path("vlm_pruning/selectors/ug_prune.py"),
         Path("vlm_pruning/llava_hooks/mid_layer_pruning.py"),
         Path("vlm_pruning/artifacts.py"),
