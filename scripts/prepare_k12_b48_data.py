@@ -11,13 +11,16 @@ from __future__ import annotations
 
 import argparse
 import ast
+import gc
 import hashlib
+import itertools
 import io
 import json
 import math
 import os
 import re
 import sys
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -56,29 +59,34 @@ def safe_id(value: Any) -> str:
     return text or "missing"
 
 
-def load_split(protocol: DatasetProtocol) -> tuple[Iterable[dict[str, Any]], int]:
+def _images_as_bytes(dataset: Any, image_type: Any) -> Any:
+    for column in dataset.column_names:
+        if column == "image" or re.fullmatch(r"image_[1-9][0-9]*", column):
+            dataset = dataset.cast_column(column, image_type(decode=False))
+    return dataset
+
+
+def load_split(protocol: DatasetProtocol, *, streaming: bool = False) -> tuple[Iterable[dict[str, Any]], int]:
     from datasets import Image as HFImage
     from datasets import concatenate_datasets, load_dataset
 
-    kwargs: dict[str, Any] = {"revision": protocol.revision}
+    kwargs: dict[str, Any] = {"revision": protocol.revision, "streaming": streaming}
     if protocol.config:
         kwargs["name"] = protocol.config
     if protocol.key == "pope_all":
-        parts = [
-            load_dataset(protocol.dataset_id, split=split, **kwargs)
-            for split in ("random", "popular", "adversarial")
-        ]
+        parts = [_images_as_bytes(load_dataset(protocol.dataset_id, split=split, **kwargs), HFImage)
+                 for split in ("random", "popular", "adversarial")]
+        if streaming:
+            return itertools.chain.from_iterable(parts), protocol.expected_rows
         dataset = concatenate_datasets(parts)
     else:
         dataset = load_dataset(protocol.dataset_id, split=protocol.split, **kwargs)
-    if len(dataset) != protocol.expected_rows:
+    if not streaming and len(dataset) != protocol.expected_rows:
         raise PreparationError(
             f"{protocol.key}: source row count {len(dataset)} != locked {protocol.expected_rows}"
         )
-    for column in dataset.column_names:
-        if column == "image" or column.startswith("image_"):
-            dataset = dataset.cast_column(column, HFImage(decode=False))
-    return dataset, len(dataset)
+    dataset = _images_as_bytes(dataset, HFImage)
+    return dataset, protocol.expected_rows if streaming else len(dataset)
 
 
 def load_gqa(protocol: DatasetProtocol) -> tuple[Iterable[dict[str, Any]], int]:
@@ -446,7 +454,14 @@ def validate_manifest(
 def prepare(protocol: DatasetProtocol, output_root: Path, limit: int | None) -> dict[str, Any]:
     dataset_root = ROOT / output_root / protocol.key
     image_root = dataset_root / "images"
-    rows, source_rows = load_gqa(protocol) if protocol.key == "gqa" else load_split(protocol)
+    rows, source_rows = (
+        load_gqa(protocol)
+        if protocol.key == "gqa"
+        else load_split(
+            protocol,
+            streaming=limit is not None and protocol.key in {"mmmu_val", "vqav2_val", "textvqa_val"},
+        )
+    )
     records: list[dict[str, Any]] = []
     processed_sources = 0
     for source_row, raw in enumerate(rows):
@@ -519,6 +534,13 @@ def main() -> int:
             indent=2,
         )
     )
+    if args.limit is not None:
+        # Streaming uses background HTTP/Arrow resources. Give their finalizers
+        # a deterministic window before interpreter shutdown; otherwise some
+        # pyarrow builds can abort after the validated smoke manifest is safely
+        # published.
+        gc.collect()
+        time.sleep(2.0)
     return 0
 
 

@@ -254,8 +254,7 @@ def config_payload(args: argparse.Namespace, name: str, original_tokens: int, to
         "model/stack": "huggingface_llava",
         "model/precision": args.precision,
         "model/decoding": "deterministic_greedy",
-        "model/max_new_tokens": args.max_new_tokens
-        or (48 if args.task == "grounding" else 16),
+        "model/max_new_tokens": args.max_new_tokens or default_max_new_tokens(args.dataset, args.task),
         "dataset/name": args.dataset,
         "dataset/split": split,
         "dataset/manifest": str(args.manifest),

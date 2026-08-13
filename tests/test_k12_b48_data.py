@@ -7,6 +7,7 @@ from pathlib import Path
 from PIL import Image
 
 from scripts.prepare_k12_b48_data import (
+    _images_as_bytes,
     answer_strings,
     image_record,
     mmbench_choices,
@@ -18,6 +19,25 @@ from vlm_pruning.llava_hooks.mid_layer_pruning import MidLayerUGPruneForwarder, 
 
 
 class K12B48DataTests(unittest.TestCase):
+    def test_image_id_is_never_cast_as_an_image_column(self) -> None:
+        class FakeDataset:
+            column_names = ["image", "image_1", "image_id", "image_width"]
+
+            def __init__(self) -> None:
+                self.cast = []
+
+            def cast_column(self, name, value):
+                self.cast.append((name, value))
+                return self
+
+        class FakeImage:
+            def __init__(self, *, decode):
+                self.decode = decode
+
+        dataset = FakeDataset()
+        _images_as_bytes(dataset, FakeImage)
+        self.assertEqual([name for name, _ in dataset.cast], ["image", "image_1"])
+
     def test_parse_choices(self) -> None:
         self.assertEqual(parse_choices("['one', 'two']"), ["one", "two"])
         self.assertEqual(parse_choices([1, 2]), ["1", "2"])
