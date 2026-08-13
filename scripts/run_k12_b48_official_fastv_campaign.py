@@ -73,6 +73,7 @@ def official_env() -> dict[str, str]:
         "HF_HUB_OFFLINE": "1",
         "HF_HUB_DISABLE_PROGRESS_BARS": "1",
         "TOKENIZERS_PARALLELISM": "false",
+        "CUDA_VISIBLE_DEVICES": "0",
     })
     return env
 
@@ -316,6 +317,15 @@ def gpu_total_memory_mb() -> float:
     return float(values[0])
 
 
+def gpu_free_memory_mb() -> float:
+    values = subprocess.check_output(
+        ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"], text=True,
+    ).strip().splitlines()
+    if len(values) != 1:
+        raise RuntimeError(f"Expected one campaign GPU, got {values}")
+    return float(values[0])
+
+
 def serial_peak_memory_mb() -> float:
     peaks = []
     for cell in cells():
@@ -340,6 +350,12 @@ def soak(limit: int) -> dict[str, Any]:
     widths, headroom_mb = admissible_widths(total_mb, peak_mb)
     skipped = [width for width in (3, 2, 1) if width not in widths]
     for width in widths:
+        required_mb = width * peak_mb + headroom_mb
+        free_mb = gpu_free_memory_mb()
+        if free_mb < required_mb:
+            attempts.append({"width": width, "passed": False, "launched": False,
+                             "reason": f"current free {free_mb} MiB < required {required_mb} MiB"})
+            continue
         before = gpu_snapshot()
         results = run_processes([(cell, f"soak{width}", limit) for cell in representatives[:width]], width)
         passed = all(x["validation"]["status"] == "pass" for x in results)
@@ -364,6 +380,11 @@ def full(max_parallel: int | None) -> dict[str, Any]:
     width = int(soak_report["safe_parallelism"])
     if max_parallel is not None:
         width = min(width, max_parallel)
+    gate = soak_report["memory_gate"]
+    required_mb = width * float(gate["serial_peak_reserved_mb"]) + float(gate["required_headroom_mb"])
+    free_mb = gpu_free_memory_mb()
+    if free_mb < required_mb:
+        raise RuntimeError(f"Current GPU free memory {free_mb} MiB < required {required_mb} MiB")
     results = run_processes([(cell, "full", None) for cell in cells()], width)
     payload = {"status": "pass" if all(x["validation"]["status"] == "pass" for x in results) else "fail",
                "created_at_utc": utc_now(), "parallelism": width, "runs": results}
