@@ -247,6 +247,9 @@ def load_model(
     dtype = torch_dtype(torch, precision)
     device = torch.device("cuda:0")
     free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    expected_fastv_root = REPO_ROOT / "third_party/FastV/src/FastV/llava-hf/transformers/src"
+    transformers_file = Path(transformers.__file__).resolve()
+    fastv_transformers_source = expected_fastv_root.resolve() in transformers_file.parents
     env = {
         "gpu_name": torch.cuda.get_device_name(device),
         "gpu_total_memory_gb": total_bytes / 1024**3,
@@ -256,7 +259,8 @@ def load_model(
         "cuda_version": torch.version.cuda,
         "precision": precision,
         "torch_dtype": str(dtype),
-        "transformers_source": str(Path(transformers.__file__).resolve()),
+        "transformers_source": str(transformers_file),
+        "fastv_transformers_source": fastv_transformers_source,
         "official_fastv_source_active": bool(official_fastv),
     }
     load_path = os.environ.get("VLM_LOCAL_MODEL_PATH", model_path)
@@ -265,7 +269,7 @@ def load_model(
         try:
             processor = AutoProcessor.from_pretrained(load_path, use_fast=False)
         except TypeError as processor_exc:
-            if not official_fastv or "unexpected keyword argument 'image_token'" not in str(processor_exc):
+            if not fastv_transformers_source or "unexpected keyword argument 'image_token'" not in str(processor_exc):
                 raise
             # The pinned FastV fork predates metadata-only fields now stored in
             # the canonical checkpoint's processor_config.json. Constructing
@@ -280,12 +284,10 @@ def load_model(
             "low_cpu_mem_usage": True,
         }
         if official_fastv:
-            expected_root = REPO_ROOT / "third_party/FastV/src/FastV/llava-hf/transformers/src"
-            loaded_from = Path(transformers.__file__).resolve()
-            if expected_root.resolve() not in loaded_from.parents:
+            if not fastv_transformers_source:
                 raise BaselineError(
                     "official_fastv must import Transformers from the pinned FastV repository; "
-                    f"loaded {loaded_from}, expected beneath {expected_root}."
+                    f"loaded {transformers_file}, expected beneath {expected_fastv_root}."
                 )
             model_kwargs.update({
                 "attn_implementation": "eager",
