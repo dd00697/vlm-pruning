@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
@@ -39,6 +40,20 @@ class FakeCache:
 
 
 class Phase2BFrozenConfigTests(unittest.TestCase):
+    def test_cli_exposes_registered_prompt_profile_to_shared_prompt_builder(self) -> None:
+        from scripts.run_ug_prune_single_pass import parse_args
+
+        argv = [
+            "run_ug_prune_single_pass.py",
+            "--dataset", "mme",
+            "--task", "vqa",
+            "--manifest", "mme.jsonl",
+            "--prompt-profile", "registered",
+        ]
+        with patch("sys.argv", argv):
+            args = parse_args()
+        self.assertEqual(args.prompt_profile, "registered")
+
     def test_frozen_config_matches_phase2_winner(self) -> None:
         config = frozen_ug_gap58_config()
 

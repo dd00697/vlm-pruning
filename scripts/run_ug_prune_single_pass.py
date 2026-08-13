@@ -109,6 +109,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-grid-size", type=int, default=DEFAULT_GRID)
     parser.add_argument("--max-new-tokens", type=int)
     parser.add_argument("--max-figures", type=int, default=8)
+    parser.add_argument(
+        "--prompt-profile",
+        default="registered",
+        choices=["registered", "paper"],
+        help="Prompt contract shared with the official baseline runner.",
+    )
     parser.add_argument("--box-coordinate-mode", default="normalized_0_1", choices=["normalized_0_1", "normalized_0_1000", "absolute_pixels"])
     parser.add_argument("--prune-after-layer", type=int, default=12)
     parser.add_argument(
@@ -305,6 +311,7 @@ def config_payload(args: argparse.Namespace, name: str, original_tokens: int, to
         ),
         "evaluator/name": evaluator_name(args.dataset, args.task),
         "evaluator/metric_definition": metric_definition(args.dataset, args.task),
+        "prompt/profile": args.prompt_profile,
         "prompt/template": registered_prompt_template(args),
     }
 
@@ -349,6 +356,7 @@ def completed_run_matches(
         config.get("ug/decode_mode") == args.decode_mode,
         config.get("ug/diagnostics_mode", "full") == args.diagnostics_mode,
         config.get("model/precision") == args.precision,
+        config.get("prompt/profile", "registered") == args.prompt_profile,
         config.get("limit") == args.limit,
         int(metrics.get("samples/evaluated", -1)) == len(manifest_rows),
     ]

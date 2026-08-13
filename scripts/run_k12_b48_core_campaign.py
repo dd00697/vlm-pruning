@@ -157,6 +157,7 @@ def command(cell: Cell, phase: str, *, run_id: str | None = None, limit: int | N
         "--ug-fusion-mode", "single_layer", "--ug-probe-layers", "12",
         "--ug-role-preset", "more_anchors", "--position-mode", position,
         "--decode-mode", "layer_aware_cache", "--diagnostics-mode", "benchmark",
+        "--prompt-profile", "registered",
     ]
 
 

@@ -28,6 +28,7 @@ class CoreCampaignTests(unittest.TestCase):
             "--prune-after-layer 12", "--target-visual-tokens 48", "--ug-map-source query_max",
             "--ug-fusion-mode single_layer", "--ug-probe-layers 12", "--ug-role-preset more_anchors",
             "--position-mode gap_preserving", "--decode-mode layer_aware_cache", "--precision bf16",
+            "--prompt-profile registered",
         ):
             self.assertIn(fragment, joined)
         self.assertNotIn("--target-visual-tokens 72", joined)
