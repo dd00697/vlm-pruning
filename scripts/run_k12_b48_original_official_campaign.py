@@ -283,6 +283,12 @@ def admission() -> dict[str, Any]:
             "status": "matched_b48_eligible",
             "artifact": str(run_dir(cell, "admission").relative_to(ROOT)),
             "trace": expected_visual_trace(method),
+            "environment": {
+                "python": str(METHODS[method]["python"]),
+                "pip_freeze": subprocess.check_output(
+                    [str(METHODS[method]["python"]), "-m", "pip", "freeze", "--all"], text=True,
+                ).splitlines(),
+            },
         }
     payload = {
         "status": "pass",
@@ -295,6 +301,11 @@ def admission() -> dict[str, Any]:
             "raw_output": original_row["raw_model_output"],
         },
         "methods": method_evidence,
+        "official_llava_dependency": {
+            "repo": str(VISIONZIP_LLAVA_REPO),
+            "commit": git_value(VISIONZIP_LLAVA_REPO, "rev-parse", "HEAD"),
+            "clean": True,
+        },
     }
     write_json(CAMPAIGN / "original_official_admission_report.json", payload)
     return payload
