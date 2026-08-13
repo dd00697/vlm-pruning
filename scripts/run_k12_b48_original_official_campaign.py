@@ -186,7 +186,7 @@ def validate(cell: Cell, phase: str, limit: int | None, *, score: bool) -> dict[
         expected_config = {
             "source/git_dirty": False,
             "model/name": "liuhaotian/llava-v1.5-7b",
-            "model/precision": "fp16",
+            "model/precision": "official_mixed_fp16_llm_fp32_vision",
             "dataset/name": cell.dataset,
             "dataset/split": cell.split,
             "dataset/manifest_checksum": sha256_file(cell.manifest),

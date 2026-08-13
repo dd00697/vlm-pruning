@@ -217,7 +217,7 @@ def compare_original(canonical_summary: Path, original: Path, vision: Path, outp
         "exclusion_reason": "Rotary inv_freq values are deterministic non-parameter buffers in the old stack and are not serialized by the converted stack.",
         "unused_clip_checkpoint_tensors": unused_clip,
         "unused_clip_reason": "The author LLaVA stack instantiates CLIPVisionModel; text-encoder/projection tensors packaged in the source CLIPModel checkpoint are not loaded or used.",
-        "dtype_normalisation": "Source CLIP tensors are cast to the canonical serialized dtype before hashing, matching the official LLaVA runtime load into FP16.",
+        "dtype_normalisation": "The source CLIP checkpoint is FP32. For packaging-equivalence hashing it is cast to the canonical checkpoint's serialized FP16 dtype; every resulting value must match exactly. The author-original runtime may compute the vision tower in FP32 and is reported as a mixed-precision environment rather than conflated with canonical BF16 timing.",
     }
     atomic_json(output, payload)
     if status != "pass":
