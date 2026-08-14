@@ -136,6 +136,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pre-llm-selector", choices=["none", "oracle", "random", "uniform"], default="none")
     parser.add_argument("--pre-llm-budget", type=int)
     parser.add_argument("--oracle-teacher-layer", type=int, choices=[12, 20])
+    parser.add_argument(
+        "--oracle-index-input",
+        type=Path,
+        help="Replay a strict index-only oracle JSONL instead of executing the dense teacher.",
+    )
     parser.add_argument("--precision", choices=["bf16"], default="bf16")
     parser.add_argument("--model-path", default=DEFAULT_MODEL)
     parser.add_argument("--limit", type=int)
@@ -155,6 +160,11 @@ def validate_cli(args: argparse.Namespace) -> None:
             raise ProgressiveRunError("Oracle selection requires --oracle-teacher-layer 12 or 20")
         if args.pre_llm_selector != "oracle" and args.oracle_teacher_layer is not None:
             raise ProgressiveRunError("Only oracle selection may specify a teacher layer")
+    if args.oracle_index_input is not None:
+        if args.pre_llm_selector != "oracle":
+            raise ProgressiveRunError("--oracle-index-input is valid only for oracle selection")
+        if not args.oracle_index_input.is_file():
+            raise ProgressiveRunError(f"Oracle index input does not exist: {args.oracle_index_input}")
     validate_schedule(args.schedule)
     if args.limit is not None and args.limit <= 0:
         raise ProgressiveRunError("--limit must be positive")
@@ -221,6 +231,8 @@ def build_config(args: argparse.Namespace, rows: list[dict[str, Any]], run_dir: 
         "oracle_teacher_layer": args.oracle_teacher_layer,
         "oracle_teacher_indices_only": args.pre_llm_selector == "oracle",
         "oracle_candidate_average_excludes_teacher": args.pre_llm_selector == "oracle",
+        "oracle_index_input": str(args.oracle_index_input.resolve()) if args.oracle_index_input else None,
+        "oracle_index_input_sha256": sha256_file(args.oracle_index_input) if args.oracle_index_input else None,
         "limit": args.limit,
         "scope": "smoke" if args.limit is not None else "discovery",
         "run/output_dir": str(run_dir.relative_to(REPO_ROOT)),
@@ -234,6 +246,7 @@ IMMUTABLE_CONFIG_KEYS = {
     "dataset/num_samples", "prompt/template", "original_visual_tokens", "grid",
     "schedule", "position_mode", "query_map", "seed", "pre_llm_selector",
     "pre_llm_budget", "oracle_teacher_layer", "limit", "scope",
+    "oracle_index_input", "oracle_index_input_sha256",
 }
 
 
@@ -414,6 +427,12 @@ def run(args: argparse.Namespace) -> int:
     oracle_partial = run_dir / "oracle_indices.partial.jsonl"
     oracle_final = run_dir / "oracle_indices.jsonl"
     oracle_artifacts = load_oracle_artifacts(oracle_partial) if args.resume and args.pre_llm_selector == "oracle" else {}
+    if args.oracle_index_input is not None:
+        external = load_oracle_artifacts(args.oracle_index_input)
+        overlap = set(oracle_artifacts).intersection(external)
+        if overlap and any(oracle_artifacts[sample_id] != external[sample_id] for sample_id in overlap):
+            raise ProgressiveRunError("Resume oracle indices differ from the registered replay input")
+        oracle_artifacts.update(external)
 
     model_load_start = time.perf_counter()
     torch, processor, model, device, model_env = load_model(args.model_path, args.precision)
@@ -461,6 +480,7 @@ def run(args: argparse.Namespace) -> int:
 
                 if args.pre_llm_selector == "oracle":
                     oracle_artifact = oracle_artifacts.get(sample_id)
+                    artifact_was_generated = False
                     if oracle_artifact is None:
                         teacher_inputs, teacher_prep = prepare_full_inputs(
                             torch, processor, model, device, images, prompt
@@ -490,10 +510,14 @@ def run(args: argparse.Namespace) -> int:
                         oracle_handle.write(json.dumps(oracle_artifact.as_dict(), sort_keys=True) + "\n")
                         oracle_handle.flush()
                         oracle_artifacts[sample_id] = oracle_artifact
+                        artifact_was_generated = True
                         del teacher_inputs, teacher_prep, teacher_resolution
                         gc.collect()
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
+                    if not artifact_was_generated:
+                        oracle_handle.write(json.dumps(oracle_artifact.as_dict(), sort_keys=True) + "\n")
+                        oracle_handle.flush()
                     initial_indices = oracle_artifact.selected_indices(int(args.pre_llm_budget))
                     initial_selector = f"oracle_k{oracle_artifact.teacher_layer}"
                     initial_checksum = oracle_artifact.ranking_checksum

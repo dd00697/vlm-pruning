@@ -180,6 +180,25 @@ class ProgressiveRunnerTests(unittest.TestCase):
         self.assertEqual(forwarder.selector_config.probe_layers, (1,))
         self.assertEqual(forwarder.selector_config.position_mode, "gap_preserving")
 
+    def test_oracle_replay_cli_is_restricted_to_oracle_and_existing_file(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from scripts.run_progressive_oracle_refcoco import ProgressiveRunError, validate_cli
+
+        with tempfile.TemporaryDirectory() as directory:
+            indices = Path(directory) / "indices.jsonl"
+            indices.write_text("{}\n", encoding="utf-8")
+            invalid = SimpleNamespace(
+                pre_llm_selector="random",
+                pre_llm_budget=64,
+                oracle_teacher_layer=None,
+                oracle_index_input=indices,
+                schedule=(),
+                limit=2,
+            )
+            with self.assertRaisesRegex(ProgressiveRunError, "valid only for oracle"):
+                validate_cli(invalid)
+
 
 if __name__ == "__main__":
     unittest.main()
