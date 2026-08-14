@@ -16,6 +16,7 @@ from typing import Any, Iterable, Sequence
 
 from vlm_pruning.efficiency import cache_tensor_bytes
 from vlm_pruning.llava_hooks.mid_layer_pruning import CacheLengthProxy, MidLayerUGPruneForwarder
+from vlm_pruning.selectors import UGPruneConfig
 from vlm_pruning.selectors.base import SelectorError
 
 
@@ -299,6 +300,12 @@ class ProgressivePruneForwarder(MidLayerUGPruneForwarder):
             grid=grid,
             prune_after_layer=1,
             target_visual_tokens=max(1, int(initial_visual_tokens)),
+            selector_config=UGPruneConfig(
+                selector_strategy="query_topk",
+                probe_layers=(1,),
+                fusion_mode="single_layer",
+                position_mode="gap_preserving",
+            ),
             diagnostics_mode=diagnostics_mode,
             synchronise_subtimings=synchronise_subtimings,
         )

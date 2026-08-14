@@ -163,6 +163,23 @@ class ProgressiveRunnerTests(unittest.TestCase):
             "experiments/progressive_oracle_refcoco_val_20260814/preflight/smoke_runs/full",
         )
 
+    def test_constructor_uses_valid_inert_base_probe_configuration(self) -> None:
+        import torch
+
+        fake_model = SimpleNamespace(
+            model=SimpleNamespace(
+                language_model=SimpleNamespace(layers=[object()] * 32)
+            )
+        )
+        forwarder = ProgressivePruneForwarder(
+            torch,
+            fake_model,
+            image_token_id=32000,
+            schedule=[],
+        )
+        self.assertEqual(forwarder.selector_config.probe_layers, (1,))
+        self.assertEqual(forwarder.selector_config.position_mode, "gap_preserving")
+
 
 if __name__ == "__main__":
     unittest.main()
