@@ -276,6 +276,119 @@ def table(registry: dict[str, Any], ids: list[str]) -> str:
     return "\n".join(lines)
 
 
+def interval_table(payload: dict[str, Any]) -> str:
+    lines = [
+        "| Contrast (left minus right) | Metric | Delta | 95% paired bootstrap CI | Unit |",
+        "|---|---|---:|---:|---|",
+    ]
+    for row in payload.get("paired_intervals") or []:
+        lines.append(
+            f"| {row['contrast']} | {row['metric']} | {float(row['mean_delta']):.4f} | "
+            f"[{float(row['lower_95']):.4f}, {float(row['upper_95']):.4f}] | {row['unit']} |"
+        )
+    return "\n".join(lines)
+
+
+def random_characterization(registry: dict[str, Any]) -> str:
+    query_ids = {16: "T2", 8: "T3", 4: "T4"}
+    lines = [
+        "| B | Query Acc | Random Acc mean (seed range) | Query mIoU | Random mIoU mean (seed range) |",
+        "|---:|---:|---:|---:|---:|",
+    ]
+    for budget in (16, 8, 4):
+        query = registry["cells"][query_ids[budget]]["metrics"]
+        random_metrics = [registry["cells"][f"R{budget}-S{seed}"]["metrics"] for seed in (0, 1, 2)]
+        acc = [float(row["quality/acc_at_0_5"]) for row in random_metrics]
+        miou = [float(row["quality/mean_iou"]) for row in random_metrics]
+        lines.append(
+            f"| {budget} | {float(query['quality/acc_at_0_5']):.4f} | "
+            f"{sum(acc)/3:.4f} ({min(acc):.4f}-{max(acc):.4f}) | "
+            f"{float(query['quality/mean_iou']):.4f} | {sum(miou)/3:.4f} ({min(miou):.4f}-{max(miou):.4f}) |"
+        )
+    return "\n".join(lines)
+
+
+def progressive_frontier(registry: dict[str, Any]) -> list[str]:
+    ids = [f"P{index}" for index in range(1, 10)]
+    frontier: list[str] = []
+    for candidate in ids:
+        row = registry["cells"][candidate]
+        acc = float(row["metrics"]["quality/acc_at_0_5"])
+        tokens = float(row["candidate_average_visual_tokens"])
+        dominated = False
+        for competitor in ids:
+            if competitor == candidate:
+                continue
+            other = registry["cells"][competitor]
+            other_acc = float(other["metrics"]["quality/acc_at_0_5"])
+            other_tokens = float(other["candidate_average_visual_tokens"])
+            if other_acc >= acc and other_tokens <= tokens and (other_acc > acc or other_tokens < tokens):
+                dominated = True
+                break
+        if not dominated:
+            frontier.append(candidate)
+    return sorted(frontier, key=lambda cell_id: registry["cells"][cell_id]["candidate_average_visual_tokens"])
+
+
+def timing_report(registry: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    gates = registry.get("timing_gate_decisions") or {}
+    for cell_id in ("E1", "E2"):
+        cell = registry["timing_cells"][cell_id]
+        gate = cell.get("gate") or gates.get(cell_id) or {}
+        lines.append(f"### {cell_id}: {cell.get('status', 'pending')}")
+        lines.append("")
+        if cell.get("status") == "accepted":
+            metrics = cell["metrics"]
+            full = metrics["variants"]["full"]
+            candidate = metrics["variants"]["candidate"]
+            lines.extend([
+                f"Candidate: **{cell['candidate_cell_id']}**; paired rows: {metrics['samples']}; "
+                "20 warm-up examples per path; alternating within-pair order; matched full reference measured in the same process.",
+                "",
+                "| Quantity | Full mean | Candidate mean | Candidate/full or reduction |",
+                "|---|---:|---:|---:|",
+            ])
+            for field, label in (
+                ("vision_encoder_latency_s", "Vision latency (s)"),
+                ("projector_latency_s", "Projector latency (s)"),
+                ("llm_prefill_latency_s", "LLM prefill latency (s)"),
+                ("selector_total_latency_s", "Selector latency (s)"),
+                ("decode_latency_s", "Decode latency (s)"),
+                ("end_to_end_latency_s", "End-to-end latency (s)"),
+                ("generated_token_count", "Generated tokens"),
+                ("prompt_kv_total_bytes", "Prompt KV bytes"),
+                ("final_kv_total_bytes", "Final KV bytes"),
+                ("candidate_average_visual_tokens", "Average visual tokens"),
+            ):
+                full_mean = float(full[field]["mean"])
+                candidate_mean = float(candidate[field]["mean"])
+                suffix = "—"
+                if full_mean:
+                    suffix = f"{candidate_mean/full_mean:.4f}×"
+                lines.append(f"| {label} | {full_mean:.6f} | {candidate_mean:.6f} | {suffix} |")
+            lines.extend([
+                f"| Peak allocated GPU bytes | {int(full['peak_allocated_gpu_bytes'])} | "
+                f"{int(candidate['peak_allocated_gpu_bytes'])} | — |",
+                f"| Peak reserved GPU bytes | {int(full['peak_reserved_gpu_bytes'])} | "
+                f"{int(candidate['peak_reserved_gpu_bytes'])} | — |",
+                "",
+                "Prompt/final KV storage is also preserved by decoder-layer segment in the physical timing JSONL. "
+                "These are exploratory one-pass measurements, not the dissertation's five-repetition final timing protocol.",
+                "",
+            ])
+        elif cell.get("status") == "skipped_by_design":
+            lines.extend([
+                f"Candidate: **{cell.get('candidate_cell_id')}**. Skipped by design: {cell.get('skip_reason')}.",
+                "",
+                f"Registered gate evidence: `{json.dumps(gate, sort_keys=True)}`",
+                "",
+            ])
+        else:
+            lines.extend(["Gate evaluation or execution remains pending.", ""])
+    return lines
+
+
 def strongest_by_registered_rule(registry: dict[str, Any], ids: list[str]) -> str:
     rows = {
         cell_id: registry["cells"][cell_id]
@@ -360,6 +473,10 @@ def render_report(registry: dict[str, Any]) -> None:
     accepted2 = all(registry["cells"][f"P{i}"]["status"] == "accepted" for i in range(1, 10))
     accepted3 = all(registry["cells"][f"O{i}"]["status"] == "accepted" for i in range(1, 11))
     ref = registry["reference"]["discovery_recomputed"]
+    preflight = json.loads((CAMPAIGN_ROOT / "preflight/PREFLIGHT_REPORT.json").read_text(encoding="utf-8"))
+    analysis1 = json.loads((ANALYSIS_ROOT / "campaign1.json").read_text(encoding="utf-8")) if accepted1 else {}
+    analysis2 = json.loads((ANALYSIS_ROOT / "campaign2.json").read_text(encoding="utf-8")) if accepted2 else {}
+    analysis3 = json.loads((ANALYSIS_ROOT / "campaign3.json").read_text(encoding="utf-8")) if accepted3 else {}
     sections = [
         "# Progressive Visual-Token Pruning and Oracle Feasibility Campaign",
         "",
@@ -377,7 +494,7 @@ def render_report(registry: dict[str, Any]) -> None:
         "",
         "## Implementation and preflight evidence",
         "",
-        "All 147 CPU tests passed. Real-model empty-schedule, K12/B48, and K20/B48 paths matched the current canonical implementations exactly. B=0, two-stage, three-stage, oracle restart, and strict index-only replay passed. Two-way quality concurrency passed exact semantic parity with 10% measured memory headroom; three-way concurrency was rejected by capacity. Oracle remains serial unless separately soaked.",
+        f"All {int(preflight['gates']['cpu_suite']['tests'])} preregistered preflight CPU tests passed. Real-model empty-schedule, K12/B48, and K20/B48 paths matched the current canonical implementations exactly. B=0, two-stage, three-stage, oracle restart, and strict index-only replay passed. Two-way quality concurrency passed exact semantic parity with 10% measured memory headroom; three-way concurrency was rejected by capacity. Oracle remained serial.",
         "",
         "Two preflight-only attempts failed before scientific inference (wrong interpreter; inert helper probe configuration). They were preserved and did not become quality cells.",
         "",
@@ -391,7 +508,17 @@ def render_report(registry: dict[str, Any]) -> None:
         sections.extend([
             f"The provisional discovery `B_tail` is **{decision['value']}** under the registered 1.0-point Acc@0.5 and 0.005 mIoU development tolerances. This is not an equivalence claim and requires 8,811-row confirmation.",
             "",
-            f"Paired intervals and dense-prefix query-versus-random seed-mean contrasts are recorded in `analysis/campaign1.json` ({BOOTSTRAPS:,} resamples, seed {ANALYSIS_SEED}).",
+            "Relative to REF_K20_B48, T5 (B=0) changes Acc@0.5 by +1.3 percentage points and mIoU by +0.0077 on this subset. The rule therefore selects zero, but its 1,000-row uncertainty makes this a breaking-point hypothesis rather than a definitive threshold.",
+            "",
+            "Dense-prefix query-top-k versus random behavior:",
+            "",
+            random_characterization(registry),
+            "",
+            "Query-top-k is not consistently above the random seed mean at B=16/8/4; the paired intervals below determine whether any observed difference is distinguishable from zero. Random seed spread is retained rather than hidden behind the mean.",
+            "",
+            f"Registered paired contrasts ({BOOTSTRAPS:,} resamples, seed {ANALYSIS_SEED}):",
+            "",
+            interval_table(analysis1),
             "",
         ])
     else:
@@ -399,8 +526,15 @@ def render_report(registry: dict[str, Any]) -> None:
     sections.extend(["## Campaign 2 — progressive pruning", "", table(registry, [f"P{i}" for i in range(1, 10)]), ""])
     if accepted2:
         decision = registry["decisions"]["progressive_refinement"]
+        frontier = progressive_frontier(registry)
         sections.extend([
             f"The registered base/refinement selection chose **{decision['strongest_refinement']}** before P9. The full decision traces, Pareto inputs, and paired contrasts are in `decisions/` and `analysis/campaign2.json`.",
+            "",
+            f"The non-dominated Acc@0.5/average-token frontier among P1-P9 is **{', '.join(frontier)}** (in increasing token order). P3 has the highest progressive accuracy (0.4080); P5 is the registered near-best efficiency choice because it is only 0.2 points lower at 186 rather than 198 average tokens. Both remain clearly below REF_K20_B48.",
+            "",
+            "P8 versus P9 is the preregistered zero-tail versus four-token-tail ablation because `B_tail=0`; it is not described as a selector comparison. P8 leads by only 0.1 point Acc@0.5 and its interval includes zero.",
+            "",
+            interval_table(analysis2),
             "",
         ])
     else:
@@ -415,7 +549,13 @@ def render_report(registry: dict[str, Any]) -> None:
     ])
     if accepted3:
         sections.extend([
-            "The oracle capacity curve and control contrasts are recorded in `analysis/campaign3.json`. O7/O8 use the preregistered dynamic `B_early64` calculation and remain at or below 64 candidate-average tokens regardless of `B_tail`.",
+            "The K12-teacher capacity curve is 0.2630/0.3513, 0.2980/0.3666, and 0.3140/0.3836 Acc@0.5/mIoU at 64/96/128 patches. The K20-teacher curve is stronger—0.2910/0.3517, 0.3500/0.3815, and 0.3720/0.4018—but even privileged K20 oracle-128 is 6.7 accuracy points and 0.0310 mIoU below REF_K20_B48.",
+            "",
+            "O7/O8 use the preregistered dynamic `B_early64=102` calculation and realize exactly 63.75 candidate-average tokens. O8 is the strongest ≤64-average oracle at 0.3510 Acc@0.5 and 0.3881 mIoU, still 8.8 points and 0.0447 mIoU below the reference. Oracle-64 nevertheless clearly exceeds random-64 (0.1680/0.2573) and uniform-64 (0.1980/0.2818), so patch identity helps but is not sufficient to replace early dense processing.",
+            "",
+            "Oracle computations are privileged diagnostics: candidate-average figures exclude the discarded dense teacher pass, while teacher work is separately shown as 6,912 (K12) or 11,520 (K20) visual-token layers.",
+            "",
+            interval_table(analysis3),
             "",
         ])
     else:
@@ -423,21 +563,21 @@ def render_report(registry: dict[str, Any]) -> None:
     sections.extend([
         "## Rejected attempts and artifact validity",
         "",
-        "Every accepted cell must have exactly 1,000 ordered physical predictions, a strict source/config epoch, independently recomputed raw-output metrics, validated stage indices/positions/cache lengths, and a hash-bearing completion sentinel. Any rejected discovery attempts remain in the registry; none may be silently spliced.",
+        "All 33 scientific cells were accepted on their first attempt. Every accepted cell has exactly 1,000 ordered physical predictions, a strict source/config epoch, independently recomputed raw-output metrics, validated stage indices/positions/cache lengths, and a hash-bearing completion sentinel. No partial was spliced or reconstructed.",
+        "",
+        "The two rejected preflight-only attempts occurred before scientific inference: the default interpreter lacked `transformers`, and an unused inherited helper probe configuration was rejected. Both are recorded in `preflight/PREFLIGHT_REPORT.json`; neither counts as a scientific cell.",
         "",
         "## Conditional exploratory timing",
         "",
-        "Pending registered E1/E2 gates." if not accepted3 else "E1/E2 gate evaluation is pending.",
-        "",
-        "## Deferred full-validation recommendation",
-        "",
     ])
+    sections.extend(timing_report(registry))
+    sections.extend(["## Deferred full-validation recommendation", ""])
     if accepted3:
         final = registry.get("final_exploratory_decision") or finalize_decisions(registry)
         sections.extend([
             f"Strongest deployable candidate: **{final['strongest_deployable']}**. Strongest oracle candidate at ≤64 average tokens: **{final['strongest_oracle_le_64']}**.",
             "",
-            "No 8,811-row confirmation was run. The exact recommended candidate and at most one important comparator are frozen in the registry as **not run** and require a new human-authorized goal.",
+            "The future 8,811-row recommendation is T2 (K20→16 query top-k) with R16-S0 (K20→16 random, seed 0) as its single selector comparator. Both are frozen in the registry as **not run**. No F1-F4, testA/testB, or other full-validation job was launched; a new human-authorized goal is required.",
             "",
         ])
     else:
@@ -452,10 +592,14 @@ def render_report(registry: dict[str, Any]) -> None:
     ])
     if accepted3:
         final = registry["final_exploratory_decision"]
+        deployable = registry["cells"][final["strongest_deployable"]]
+        oracle = registry["cells"][final["strongest_oracle_le_64"]]
         sections.extend([
             RECOMMENDATIONS[final["recommendation"]],
             "",
-            "This is a preliminary exploratory recommendation derived from the registered quality/mIoU/efficiency rules. Do not begin training without human review and, for a dissertation claim, deferred full-validation evidence.",
+            f"The strongest deployable cell ({final['strongest_deployable']}) is accurate but averages {float(deployable['candidate_average_visual_tokens']):.1f} visual tokens, while the strongest ≤64-average oracle ({final['strongest_oracle_le_64']}) reaches only {float(oracle['metrics']['quality/acc_at_0_5']):.4f} Acc@0.5 and {float(oracle['metrics']['quality/mean_iou']):.4f} mIoU. Even oracle-128 remains well below the reference. The evidence therefore points to early-layer information transfer/mixing—not merely imperfect patch ranking—as the limiting factor.",
+            "",
+            "This is a preliminary exploratory recommendation. Do not begin training without human review; any dissertation claim should first consider the deferred 8,811-row confirmation.",
         ])
     else:
         sections.append("Pending completion of all 33 accepted discovery cells.")

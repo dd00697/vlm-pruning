@@ -1,0 +1,21 @@
+{
+  "P9_contrast": "zero_tail_vs_minimal_nonzero_tail",
+  "selection_trace": [
+    {
+      "highest_acc_at_0_5": 0.401,
+      "metrics": {
+        "P7": {
+          "acc_at_0_5": 0.39,
+          "average_visual_tokens": 180.0,
+          "mean_iou": 0.4121999569441858
+        }
+      },
+      "near_best_ids": [
+        "P8"
+      ],
+      "round": 1,
+      "winner": "P8"
+    }
+  ],
+  "strongest_refinement": "P8"
+}
