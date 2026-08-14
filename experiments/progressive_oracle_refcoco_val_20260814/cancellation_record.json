@@ -1,0 +1,12 @@
+{
+  "checked_at_utc": "2026-08-14T11:01:45Z",
+  "legacy_campaign_root": "experiments/k12_b48_expanded_evaluation_20260813",
+  "legacy_controller_or_worker_matches": [],
+  "nvidia_compute_processes": [],
+  "status": "no_active_legacy_or_cuda_process",
+  "terminated_processes": [],
+  "verification_commands": [
+    "nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader",
+    "ps -eo pid,ppid,etime,cmd | rg 'run_(k12_b48|ug_prune|official_baseline|final_timing)|progressive_oracle' | rg -v 'rg '"
+  ]
+}

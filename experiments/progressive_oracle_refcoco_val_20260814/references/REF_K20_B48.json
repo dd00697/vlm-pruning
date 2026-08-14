@@ -1,0 +1,63 @@
+{
+  "acceptance_basis": "independent physical JSONL validation; historical integrity metadata was not trusted",
+  "campaign_reference_rows_path": "experiments/progressive_oracle_refcoco_val_20260814/references/REF_K20_B48_per_sample.jsonl",
+  "campaign_reference_rows_sha256": "70e537b227ef96a259ca8425ae9fa3032662f5615128d8481be76a93bfb18736",
+  "discovery_manifest_sha256": "98577029365776a76bd5ec798da4ef06c546e298fd1e950bd238d6b9d127f1cd",
+  "discovery_recomputed": {
+    "acc_at_0_5": 0.439,
+    "mean_iou": 0.43283213252387953,
+    "parse_rate": 1.0
+  },
+  "discovery_rows": 1000,
+  "full_manifest_sha256": "f26d7b954189e86f55b50f9506bb670d3a0cf847d3152779af6c08dbf094e3d7",
+  "full_recomputed": {
+    "acc_at_0_5": 0.4463738508682329,
+    "mean_iou": 0.4348412531759187,
+    "parse_rate": 1.0
+  },
+  "full_rows": 8811,
+  "historical_completion_sentinel_present": false,
+  "historical_config_sha256": "141eb19b62c9504920d7a763058373b2365f9467d5e5fa3330e2b61c50d0ec61",
+  "historical_partial_present": true,
+  "historical_partial_sha256": "0cda5a53ffd0da1b7ce0500f4bd84ed435368b565b3cb582b34217c80fa20c4f",
+  "historical_predictions_path": "experiments/final_selector_ablation_and_repair_20260811/runs/mech_val_k20_b48_query_topk/per_sample_results.jsonl",
+  "historical_predictions_sha256": "95332c4a110ef1624c4fedc9e6eb9b28f3f51e5f50023d065e172920aeb06f9e",
+  "historical_run": "experiments/final_selector_ablation_and_repair_20260811/runs/mech_val_k20_b48_query_topk",
+  "protocol_checks": {
+    "dataset/manifest_checksum": "f26d7b954189e86f55b50f9506bb670d3a0cf847d3152779af6c08dbf094e3d7",
+    "dataset/name": "refcoco",
+    "dataset/num_samples": 8811,
+    "dataset/split": "val",
+    "method/seed": 0,
+    "model/decoding": "deterministic_greedy",
+    "model/max_new_tokens": 48,
+    "model/name": "llava-hf/llava-1.5-7b-hf",
+    "model/precision": "bf16",
+    "position_mode": "gap_preserving",
+    "prompt/template": "Identify the target described by this referring expression: \"{query}\".\nReturn exactly one bounding box in normalized 0-1 image coordinates as [x_min, y_min, x_max, y_max]. Do not include any other text.",
+    "pruning_implementation": "mid_layer_single_pass",
+    "pruning_location": "after_layer_20",
+    "run/is_limited": false,
+    "selection/method": "ug",
+    "selection/strategy": "query_topk",
+    "tokens/actual_visual_tokens": 48,
+    "tokens/original_visual_tokens": 576,
+    "tokens/target_visual_tokens": 48,
+    "ug/decode_mode": "layer_aware_cache",
+    "ug/diagnostics_mode": "benchmark",
+    "ug/fusion_mode": "single_layer",
+    "ug/map_source": "query_max",
+    "ug/position_mode": "gap_preserving",
+    "ug/probe_layers": "20",
+    "ug/prune_after_layer": 20
+  },
+  "reference_id": "REF_K20_B48",
+  "status": "pass",
+  "validated_at_utc": "2026-08-14T11:19:23Z",
+  "verified_historical_source_sha256": {
+    "scripts/run_ug_prune_single_pass.py": "8da3207c3393ae5e1c2b547a19ac79dd4d7ee9f5a2778b208d3b28643c5eadff",
+    "vlm_pruning/artifacts.py": "c7c86eb8fc635d4068409c2782c162f37638ff425a4c474d0af8a21e4ed77a8a",
+    "vlm_pruning/llava_hooks/mid_layer_pruning.py": "5d3a05cbcf4e76b4c682d8b30a8afe124ea4a9d5e09024afb70619c5269ab4b4",
+    "vlm_pruning/selectors/ug_prune.py": "9bad99456f4d8851a87d9893a79aa2d072cbac168e335361790618aaad12090c"
+  }
+}

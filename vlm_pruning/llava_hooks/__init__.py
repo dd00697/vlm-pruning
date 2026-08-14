@@ -15,6 +15,22 @@ from .mid_layer_pruning import (
     ug_gap58_config_for_prune_layer,
     validate_retained_indices,
 )
+from .progressive_pruning import (
+    OracleIndexArtifact,
+    ProgressiveCacheState,
+    ProgressiveGenerationResult,
+    ProgressivePrefillResult,
+    ProgressivePruneForwarder,
+    PruningEvent,
+    SegmentCache,
+    StageTrace,
+    average_visual_tokens,
+    deterministic_stage_seed,
+    random_original_indices,
+    realized_visual_trace,
+    uniform_original_indices,
+    validate_schedule,
+)
 
 __all__ = [
     "CacheLengthProxy",
@@ -30,4 +46,18 @@ __all__ = [
     "selected_positions_for_retained_tensor",
     "ug_gap58_config_for_prune_layer",
     "validate_retained_indices",
+    "OracleIndexArtifact",
+    "ProgressiveCacheState",
+    "ProgressiveGenerationResult",
+    "ProgressivePrefillResult",
+    "ProgressivePruneForwarder",
+    "PruningEvent",
+    "SegmentCache",
+    "StageTrace",
+    "average_visual_tokens",
+    "deterministic_stage_seed",
+    "random_original_indices",
+    "realized_visual_trace",
+    "uniform_original_indices",
+    "validate_schedule",
 ]
