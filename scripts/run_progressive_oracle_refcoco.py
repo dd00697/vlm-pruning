@@ -10,6 +10,7 @@ import json
 import os
 import platform
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -175,18 +176,27 @@ def make_prompt(sample: dict[str, Any]) -> str:
 
 
 def source_contract() -> dict[str, Any]:
-    return source_provenance(
-        REPO_ROOT,
-        [
-            Path("scripts/run_progressive_oracle_refcoco.py"),
-            Path("scripts/validate_progressive_oracle_run.py"),
-            Path("scripts/run_baseline.py"),
-            Path("vlm_pruning/artifacts.py"),
-            Path("vlm_pruning/features/query_tokens.py"),
-            Path("vlm_pruning/llava_hooks/mid_layer_pruning.py"),
-            Path("vlm_pruning/llava_hooks/progressive_pruning.py"),
-        ],
-    )
+    paths = [
+        Path("scripts/run_progressive_oracle_refcoco.py"),
+        Path("scripts/validate_progressive_oracle_run.py"),
+        Path("scripts/run_baseline.py"),
+        Path("vlm_pruning/artifacts.py"),
+        Path("vlm_pruning/features/query_tokens.py"),
+        Path("vlm_pruning/llava_hooks/mid_layer_pruning.py"),
+        Path("vlm_pruning/llava_hooks/progressive_pruning.py"),
+    ]
+    provenance = source_provenance(REPO_ROOT, paths)
+    # Campaign registry/report updates are intentionally tracked during a long
+    # run and must not masquerade as source-code dirt.  Scientific cleanliness
+    # is scoped to every executable/hash-bearing source file.
+    status = subprocess.check_output(
+        ["git", "status", "--porcelain", "--", *[str(path) for path in paths]],
+        cwd=REPO_ROOT,
+        text=True,
+    ).strip()
+    provenance["git_dirty"] = bool(status)
+    provenance["code_paths_checked"] = [str(path) for path in paths]
+    return provenance
 
 
 def build_config(args: argparse.Namespace, rows: list[dict[str, Any]], run_dir: Path) -> dict[str, Any]:

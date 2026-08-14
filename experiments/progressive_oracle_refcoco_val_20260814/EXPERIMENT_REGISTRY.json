@@ -499,6 +499,12 @@
     "source_manifest_sha256": "f26d7b954189e86f55b50f9506bb670d3a0cf847d3152779af6c08dbf094e3d7",
     "status": "frozen"
   },
+  "preflight": {
+    "report": "experiments/progressive_oracle_refcoco_val_20260814/preflight/PREFLIGHT_REPORT.json",
+    "safe_quality_parallel_width": 2,
+    "safe_oracle_parallel_width": 1,
+    "status": "pass"
+  },
   "reference": {
     "acceptance_basis": "independent physical JSONL validation; historical integrity metadata was not trusted",
     "campaign_reference_rows_path": "experiments/progressive_oracle_refcoco_val_20260814/references/REF_K20_B48_per_sample.jsonl",

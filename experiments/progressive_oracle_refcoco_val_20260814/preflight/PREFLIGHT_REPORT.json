@@ -1,0 +1,114 @@
+{
+  "capacity": {
+    "gpu": "NVIDIA A40",
+    "memory_free_mib_before_smoke": 45489,
+    "memory_total_mib": 46068,
+    "maximum_measured_reserved_mib": 14040,
+    "two_job_reserved_with_10_percent_headroom_mib": 30888,
+    "three_job_reserved_with_10_percent_headroom_mib": 46332
+  },
+  "failed_preflight_attempts": [
+    {
+      "reason": "default interpreter lacked transformers; no model inference executed",
+      "run_dir": "experiments/progressive_oracle_refcoco_val_20260814/preflight/smoke_runs/full"
+    },
+    {
+      "reason": "unused inherited helper probe configuration rejected before inference",
+      "run_dir": "experiments/progressive_oracle_refcoco_val_20260814/preflight/smoke_runs/full"
+    }
+  ],
+  "gates": {
+    "b0_generation": {
+      "completion_sha256": "aa3b00d5ce23898b894c8734fba1ad85f2cca53557610e33bf405220d2153128",
+      "pass": true,
+      "run_dir": "experiments/progressive_oracle_refcoco_val_20260814/preflight/smoke_runs/b0"
+    },
+    "cpu_suite": {
+      "pass": true,
+      "tests": 147
+    },
+    "k12_b48_parity": {
+      "completion_sha256": "3e3631edd04ac5164cd887e88ac20fec0d140db13d42561ce11bbf342ffff2d8",
+      "exact_fields": [
+        "retained_indices",
+        "raw_model_output",
+        "predicted_box",
+        "box_iou"
+      ],
+      "pass": true,
+      "samples": 2
+    },
+    "k20_b48_parity": {
+      "completion_sha256": "14651ef8b411d8018ff00b9b55c9a7934e4d339e40ff926dcfbf6470f5a65945",
+      "exact_fields": [
+        "retained_indices",
+        "raw_model_output",
+        "predicted_box",
+        "box_iou"
+      ],
+      "pass": true,
+      "samples": 2
+    },
+    "oracle_index_replay": {
+      "completion_sha256": "786702a02857494a212b9c86851a75cb672af241c6cd12714b26330240d8277e",
+      "exact_fields": [
+        "ranking_checksum",
+        "selected_indices",
+        "raw_model_output",
+        "predicted_box",
+        "box_iou"
+      ],
+      "pass": true,
+      "samples": 2
+    },
+    "oracle_restart": {
+      "candidate_average_visual_tokens": 64.0,
+      "completion_sha256": "ea88d676d3c49a5d08692be16831954b8b6a1b17155a03a0a60d12ee416eb762",
+      "oracle_teacher_visual_token_layer_work": 6912,
+      "pass": true,
+      "samples": 2
+    },
+    "quality_parallel_soak": {
+      "configurations": [
+        "K20->48 query_topk",
+        "K4->384, K12->48 query_topk"
+      ],
+      "exact_fields": [
+        "score_map_checksums",
+        "retained_indices",
+        "raw_model_output",
+        "predicted_box",
+        "box_iou"
+      ],
+      "pass": true,
+      "samples_per_configuration": 2
+    },
+    "three_stage": {
+      "candidate_average_visual_tokens": 195.0,
+      "completion_sha256": "e631213a94d5c34faffb51dff1e794af2e9cc6dbaf7e5bfa497c2394962aa32b",
+      "pass": true,
+      "run_dir": "experiments/progressive_oracle_refcoco_val_20260814/preflight/smoke_runs/three_stage"
+    },
+    "two_stage": {
+      "candidate_average_visual_tokens": 198.0,
+      "completion_sha256": "11857e783ee8032116e33392b202085f46e06eaf1622d54a0a71727750e9f4d9",
+      "pass": true,
+      "run_dir": "experiments/progressive_oracle_refcoco_val_20260814/preflight/smoke_runs/two_stage"
+    },
+    "unpruned_parity": {
+      "completion_sha256": "201ca58d9e0a75e3232ae0d198625b5f24f2be0c030b178f76cb4698a7620720",
+      "exact_fields": [
+        "raw_model_output",
+        "predicted_box",
+        "box_iou"
+      ],
+      "pass": true,
+      "samples": 2
+    }
+  },
+  "oracle_parallel_width": 1,
+  "pinned_python": "/workspace/.followup_venv/bin/python",
+  "safe_quality_parallel_width": 2,
+  "source_commit": "e31526340ddb8f627643951c0741547107bab7de",
+  "status": "pass"
+}

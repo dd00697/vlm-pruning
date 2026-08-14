@@ -29,7 +29,25 @@ and metrics. Its redundant partial file is not used.
 
 ## Implementation and preflight evidence
 
-Pending.
+The generalized path physically prunes an ordered sequence of boundaries,
+recomputes query relevance from each boundary's current hidden states, preserves
+original raster order and gap-aware position IDs, and maintains one validated
+dynamic-cache bank per decoder-layer segment. B=0 removes every visual state
+without a dummy replacement. Oracle restarts accept a strict integer-index
+artifact only and reconstruct fresh projector embeddings.
+
+All 147 CPU tests passed. On two fixed real-model examples, the generalized
+unpruned, K12/B48, and K20/B48 paths exactly matched the current canonical paths
+in output text, boxes, IoU, and (for pruned cells) retained indices. B=0,
+two-stage, three-stage, oracle-restart, and index-only oracle-replay smokes all
+passed independent artifact validation. Replaying stored oracle indices produced
+identical rankings, selections, text, boxes, and IoU without a teacher state.
+
+The maximum measured reservation was 14,040 MiB. Two jobs plus 10% headroom
+require 30,888 MiB and passed an exact serial-versus-concurrent semantic soak.
+Three would require 46,332 MiB, exceeding the measured 45,489 MiB free, so the
+quality controller is capped at two. Oracle execution remains serial unless a
+separate oracle two-job soak passes.
 
 ## Campaign 1 — K20 extreme tail
 
