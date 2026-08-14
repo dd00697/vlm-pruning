@@ -152,5 +152,17 @@ class ProgressiveSelectionTests(unittest.TestCase):
         self.assertEqual(new_mask.tolist(), [[1, 1, 1]])
 
 
+class ProgressiveRunnerTests(unittest.TestCase):
+    def test_relative_output_root_is_normalized_before_provenance_paths(self) -> None:
+        from scripts.run_progressive_oracle_refcoco import REPO_ROOT
+
+        relative = REPO_ROOT / "experiments/progressive_oracle_refcoco_val_20260814/preflight/smoke_runs/full"
+        resolved = relative.resolve()
+        self.assertEqual(
+            str(resolved.relative_to(REPO_ROOT)),
+            "experiments/progressive_oracle_refcoco_val_20260814/preflight/smoke_runs/full",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

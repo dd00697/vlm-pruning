@@ -381,7 +381,7 @@ def run(args: argparse.Namespace) -> int:
     if any(str(row.get("dataset") or "").lower() != "refcoco" or str(row.get("split") or "").lower() != "val" for row in rows):
         raise ProgressiveRunError("Runner accepts RefCOCO validation rows only")
     run_name = args.run_name or f"{args.cell_id.lower()}_attempt1"
-    run_dir = args.output_root / run_name
+    run_dir = (args.output_root / run_name).resolve()
     completed_path = run_dir / "COMPLETED.json"
     if args.skip_existing and completed_path.is_file():
         from validate_progressive_oracle_run import validate_run
