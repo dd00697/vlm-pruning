@@ -49,6 +49,21 @@ class ProgressiveScheduleTests(unittest.TestCase):
                 with self.assertRaises(SelectorError):
                     validate_schedule(schedule)
 
+    def test_merge_selector_is_restricted_to_registered_m448_event(self) -> None:
+        events = validate_schedule(
+            [(4, 448, "query_topk_merge"), (12, 48, "query_topk")]
+        )
+        self.assertEqual(average_visual_tokens(realized_visual_trace(events)), 214)
+        for schedule in (
+            [(4, 384, "query_topk_merge")],
+            [(8, 448, "query_topk_merge")],
+            [(2, 512), (4, 448, "query_topk_merge")],
+            [(4, 448, "query_topk_merge"), (12, 48, "query_topk_merge")],
+        ):
+            with self.subTest(schedule=schedule):
+                with self.assertRaisesRegex(SelectorError, "restricted"):
+                    validate_schedule(schedule)
+
     def test_random_stage_seed_is_deterministic_and_stage_specific(self) -> None:
         args = dict(sample_id="sample", cell_seed=2, incoming_indices=list(range(10)))
         first = deterministic_stage_seed(stage_index=0, boundary=8, **args)
@@ -130,6 +145,24 @@ class ProgressiveSelectionTests(unittest.TestCase):
         self.assertTrue(recomputed)
         self.assertIsNone(derived)
 
+        merge_selected, merge_checksum, merge_recomputed, merge_derived = (
+            forwarder.select_stage_indices(
+                hidden,
+                input_ids=input_ids,
+                original_positions=original_positions,
+                incoming_original_indices=[0, 1, 2, 3],
+                event=PruningEvent(2, 2, "query_topk_merge"),
+                stage_index=0,
+                sample_id="sample",
+                seed=0,
+                query_original_positions=[5],
+            )
+        )
+        self.assertEqual(merge_selected, selected)
+        self.assertEqual(merge_checksum, checksum)
+        self.assertEqual(merge_recomputed, recomputed)
+        self.assertEqual(merge_derived, derived)
+
     def test_gather_retains_all_text_and_supports_empty_visual_set(self) -> None:
         import torch
 
@@ -150,6 +183,50 @@ class ProgressiveSelectionTests(unittest.TestCase):
         self.assertEqual(new_positions.tolist(), [0, 3, 6])
         self.assertEqual(gathered.shape[1], 3)
         self.assertEqual(new_mask.tolist(), [[1, 1, 1]])
+
+    def test_registered_merge_is_mass_preserving_deterministic_and_text_safe(self) -> None:
+        import torch
+
+        forwarder = self.make_forwarder_without_model()
+        ids = torch.tensor([[1, 32000, 32000, 2, 32000, 32000, 3]])
+        hidden = torch.tensor(
+            [[[10.0], [0.0], [1.0], [20.0], [2.0], [3.0], [30.0]]],
+            dtype=torch.float32,
+        )
+        mask = torch.ones_like(ids)
+        positions = torch.arange(7)
+        result = forwarder._merge_after_selection(
+            hidden,
+            input_ids=ids,
+            attention_mask=mask,
+            original_positions=positions,
+            incoming_original_indices=[0, 1, 2, 3],
+            selected_original_indices=[0, 3],
+            visual_masses=torch.ones(4, dtype=torch.float32),
+        )
+        merged, new_ids, new_mask, new_positions, masses, diagnostics = result
+        self.assertEqual(new_ids.tolist(), [[1, 32000, 2, 32000, 3]])
+        self.assertEqual(new_positions.tolist(), [0, 1, 3, 5, 6])
+        self.assertEqual(new_mask.tolist(), [[1, 1, 1, 1, 1]])
+        # Both equidistant dropped patches choose retained original index 0.
+        self.assertEqual(merged[0, [1, 3], 0].tolist(), [1.0, 3.0])
+        self.assertEqual(masses.tolist(), [3.0, 1.0])
+        self.assertEqual(diagnostics["merge_assignment_count"], 2)
+        self.assertEqual(diagnostics["merge_input_mass"], 4.0)
+        self.assertEqual(diagnostics["merge_output_mass"], 4.0)
+        repeat = forwarder._merge_after_selection(
+            hidden,
+            input_ids=ids,
+            attention_mask=mask,
+            original_positions=positions,
+            incoming_original_indices=[0, 1, 2, 3],
+            selected_original_indices=[0, 3],
+            visual_masses=torch.ones(4, dtype=torch.float32),
+        )
+        self.assertEqual(
+            diagnostics["merge_assignment_checksum"], repeat[-1]["merge_assignment_checksum"]
+        )
+        self.assertTrue(torch.equal(merged, repeat[0]))
 
 
 class ProgressiveRunnerTests(unittest.TestCase):

@@ -203,6 +203,7 @@ def validate_stage_traces(row: dict[str, Any], config: dict[str, Any], row_index
     original_text_position_checksum = json_checksum(original_text_positions)
     _equal(row.get("progressive/original_text_position_checksum"), original_text_position_checksum, f"row {row_index} original text position checksum")
     previous_sequence_length = full_length
+    previous_masses = {index: 1.0 for index in range(576)}
     for stage_index, (trace, spec) in enumerate(zip(traces, specs, strict=True)):
         label = f"row {row_index} stage {stage_index}"
         _equal(int(trace.get("stage_index", -1)), stage_index, f"{label} index")
@@ -228,7 +229,7 @@ def validate_stage_traces(row: dict[str, Any], config: dict[str, Any], row_index
         _equal(trace.get("position_id_checksum"), json_checksum(expected_positions), f"{label} position checksum")
         _equal(int(trace.get("incoming_sequence_length", -1)), previous_sequence_length, f"{label} incoming sequence")
         _equal(int(trace.get("outgoing_sequence_length", -1)), len(expected_positions), f"{label} outgoing sequence")
-        if spec["selector"] in {"query_topk", "none"}:
+        if spec["selector"] in {"query_topk", "query_topk_merge", "none"}:
             _equal(trace.get("score_map_recomputed"), True, f"{label} score recomputation")
             if not isinstance(trace.get("score_map_checksum"), str) or len(trace["score_map_checksum"]) != 64:
                 raise ProgressiveValidationError(f"{label} score checksum missing")
@@ -241,6 +242,61 @@ def validate_stage_traces(row: dict[str, Any], config: dict[str, Any], row_index
                 incoming_indices=incoming,
             )
             _equal(trace.get("derived_random_seed"), expected_seed, f"{label} random seed")
+        if spec["selector"] == "query_topk_merge":
+            _equal(bool(trace.get("merge_applied", False)), True, f"{label} merge applied")
+            selected_slot = {original: slot for slot, original in enumerate(outgoing)}
+            expected_masses = [float(previous_masses[original]) for original in outgoing]
+            assignments: list[list[int]] = []
+            for original in incoming:
+                if original in selected_slot:
+                    continue
+                source_row, source_col = divmod(original, 24)
+                retained = min(
+                    outgoing,
+                    key=lambda candidate: (
+                        (source_row - candidate // 24) ** 2
+                        + (source_col - candidate % 24) ** 2,
+                        candidate,
+                    ),
+                )
+                assignments.append([original, retained])
+                expected_masses[selected_slot[retained]] += previous_masses[original]
+            _equal(
+                int(trace.get("merge_assignment_count", -1)),
+                len(assignments),
+                f"{label} merge assignment count",
+            )
+            _equal(
+                trace.get("merge_assignment_checksum"),
+                json_checksum(assignments),
+                f"{label} merge assignment checksum",
+            )
+            _equal(trace.get("merge_output_masses"), expected_masses, f"{label} merge masses")
+            _equal(
+                trace.get("merge_mass_checksum"),
+                json_checksum(expected_masses),
+                f"{label} merge mass checksum",
+            )
+            _close(
+                float(trace.get("merge_input_mass", -1)),
+                sum(previous_masses.values()),
+                f"{label} merge input mass",
+            )
+            _close(
+                float(trace.get("merge_output_mass", -1)),
+                sum(expected_masses),
+                f"{label} merge output mass",
+            )
+            if any(mass <= 0 for mass in expected_masses):
+                raise ProgressiveValidationError(f"{label} has a non-positive retained mass")
+            if float(trace.get("merge_latency_s", -1)) < 0:
+                raise ProgressiveValidationError(f"{label} merge latency is invalid")
+            previous_masses = {
+                original: expected_masses[slot] for slot, original in enumerate(outgoing)
+            }
+        else:
+            _equal(bool(trace.get("merge_applied", False)), False, f"{label} unexpected merge")
+            previous_masses = {original: previous_masses[original] for original in outgoing}
         previous = outgoing
         previous_sequence_length = len(expected_positions)
     _equal(row.get("final_retained_indices"), previous, f"row {row_index} final retained indices")
@@ -412,6 +468,7 @@ def validate_run(
             "exact_stage_budgets_and_subsets": True,
             "text_and_gap_positions_preserved": True,
             "score_maps_recomputed": True,
+            "registered_merge_mass_and_assignment_contract": True,
             "per_layer_segment_caches": True,
             "raw_outputs_rescored": True,
             "oracle_indices_only": config["pre_llm_selector"] == "oracle",

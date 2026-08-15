@@ -68,7 +68,8 @@ def validate_schedule(
         parsed.append(event)
     previous_boundary = 0
     previous_budget = int(initial_visual_tokens)
-    allowed = {"query_topk", "random", "none"}
+    allowed = {"query_topk", "query_topk_merge", "random", "none"}
+    merge_seen = False
     for event in parsed:
         if event.boundary <= previous_boundary or event.boundary >= int(num_layers):
             raise SelectorError(
@@ -84,6 +85,12 @@ def validate_schedule(
             raise SelectorError("selector=none is reserved for the exact B=0 event")
         if event.budget == 0 and event.selector != "none":
             raise SelectorError("B=0 must use selector=none")
+        if event.selector == "query_topk_merge":
+            if merge_seen or event.boundary != 4 or event.budget != 448 or previous_budget != 576:
+                raise SelectorError(
+                    "query_topk_merge is restricted to the registered first event K4->448 from 576 tokens"
+                )
+            merge_seen = True
         previous_boundary = event.boundary
         previous_budget = event.budget
     return tuple(parsed)
@@ -151,6 +158,14 @@ class StageTrace:
     outgoing_position_ids: list[int]
     position_id_checksum: str
     selection_latency_s: float
+    merge_applied: bool = False
+    merge_assignment_count: int = 0
+    merge_assignment_checksum: str | None = None
+    merge_output_masses: list[float] | None = None
+    merge_mass_checksum: str | None = None
+    merge_input_mass: float | None = None
+    merge_output_mass: float | None = None
+    merge_latency_s: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
@@ -391,7 +406,7 @@ class ProgressivePruneForwarder(MidLayerUGPruneForwarder):
         score_checksum: str | None = None
         recomputed = False
         derived_seed: int | None = None
-        if event.selector in {"query_topk", "none"}:
+        if event.selector in {"query_topk", "query_topk_merge", "none"}:
             scores, _ = self.score_current_visual_tokens(
                 hidden_states,
                 input_ids=input_ids,
@@ -441,6 +456,117 @@ class ProgressivePruneForwarder(MidLayerUGPruneForwarder):
             input_ids.index_select(1, keep_positions),
             attention_mask.index_select(1, keep_positions),
             original_positions.index_select(0, keep_positions),
+        )
+
+    def _selected_visual_masses(
+        self,
+        visual_masses: Any,
+        *,
+        incoming_original_indices: Sequence[int],
+        selected_original_indices: Sequence[int],
+    ) -> Any:
+        local_by_original = {
+            int(original): local for local, original in enumerate(incoming_original_indices)
+        }
+        local_indices = self.torch.tensor(
+            [local_by_original[int(original)] for original in selected_original_indices],
+            dtype=self.torch.long,
+            device=visual_masses.device,
+        )
+        return visual_masses.index_select(0, local_indices)
+
+    def _merge_after_selection(
+        self,
+        hidden_states: Any,
+        *,
+        input_ids: Any,
+        attention_mask: Any,
+        original_positions: Any,
+        incoming_original_indices: Sequence[int],
+        selected_original_indices: Sequence[int],
+        visual_masses: Any,
+    ) -> tuple[Any, Any, Any, Any, Any, dict[str, Any]]:
+        """Merge every dropped visual state into its nearest retained raster patch."""
+        ids = input_ids[0] if input_ids.ndim == 2 else input_ids
+        image_positions = self.torch.nonzero(ids == self.image_token_id, as_tuple=False).flatten()
+        incoming = [int(value) for value in incoming_original_indices]
+        selected = [int(value) for value in selected_original_indices]
+        if int(image_positions.numel()) != len(incoming):
+            raise SelectorError("Merge image-position count does not match surviving original indices")
+        if int(visual_masses.numel()) != len(incoming):
+            raise SelectorError("Merge mass count does not match surviving original indices")
+        if not selected:
+            raise SelectorError("Mass-preserving merge requires at least one retained visual token")
+
+        selected_slot = {original: slot for slot, original in enumerate(selected)}
+        selected_tensor = self.torch.tensor(selected, dtype=self.torch.long, device=hidden_states.device)
+        incoming_tensor = self.torch.tensor(incoming, dtype=self.torch.long, device=hidden_states.device)
+        selected_coords = self.torch.stack(
+            (selected_tensor // int(self.grid), selected_tensor % int(self.grid)), dim=1
+        ).to(dtype=self.torch.float32)
+        incoming_coords = self.torch.stack(
+            (incoming_tensor // int(self.grid), incoming_tensor % int(self.grid)), dim=1
+        ).to(dtype=self.torch.float32)
+        distances = ((incoming_coords[:, None, :] - selected_coords[None, :, :]) ** 2).sum(dim=2)
+        assignment_slots = self.torch.argmin(distances, dim=1)
+        for local, original in enumerate(incoming):
+            if original in selected_slot:
+                assignment_slots[local] = int(selected_slot[original])
+
+        states = hidden_states[0] if hidden_states.ndim == 3 else hidden_states
+        image_states = states.index_select(0, image_positions).to(dtype=self.torch.float32)
+        masses = visual_masses.to(device=hidden_states.device, dtype=self.torch.float32)
+        weighted_sums = self.torch.zeros(
+            (len(selected), int(image_states.shape[1])),
+            device=hidden_states.device,
+            dtype=self.torch.float32,
+        )
+        output_masses = self.torch.zeros(
+            len(selected), device=hidden_states.device, dtype=self.torch.float32
+        )
+        weighted_sums.index_add_(0, assignment_slots, image_states * masses[:, None])
+        output_masses.index_add_(0, assignment_slots, masses)
+        if bool(self.torch.any(output_masses <= 0).item()):
+            raise SelectorError("Every retained merged visual token must have positive mass")
+        merged_states = weighted_sums / output_masses[:, None]
+
+        gathered_hidden, gathered_ids, gathered_mask, gathered_positions = self._gather_after_selection(
+            hidden_states,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            original_positions=original_positions,
+            incoming_original_indices=incoming,
+            selected_original_indices=selected,
+        )
+        gathered_image_positions = self.torch.nonzero(
+            gathered_ids[0] == self.image_token_id, as_tuple=False
+        ).flatten()
+        if int(gathered_image_positions.numel()) != len(selected):
+            raise SelectorError("Merged gather did not realize the selected budget")
+        gathered_hidden = gathered_hidden.clone()
+        gathered_hidden[0, gathered_image_positions] = merged_states.to(dtype=gathered_hidden.dtype)
+
+        dropped_assignments = [
+            [original, selected[int(assignment_slots[local].item())]]
+            for local, original in enumerate(incoming)
+            if original not in selected_slot
+        ]
+        mass_values = [float(value) for value in output_masses.detach().cpu().tolist()]
+        diagnostics = {
+            "merge_assignment_count": len(dropped_assignments),
+            "merge_assignment_checksum": _json_checksum(dropped_assignments),
+            "merge_output_masses": mass_values,
+            "merge_mass_checksum": _json_checksum(mass_values),
+            "merge_input_mass": float(masses.sum().item()),
+            "merge_output_mass": float(output_masses.sum().item()),
+        }
+        return (
+            gathered_hidden,
+            gathered_ids,
+            gathered_mask,
+            gathered_positions,
+            output_masses,
+            diagnostics,
         )
 
     def _new_segment(
@@ -571,6 +697,9 @@ class ProgressivePruneForwarder(MidLayerUGPruneForwarder):
         current_mask = attention_mask
         current_positions = original_positions
         surviving = list(range(self.initial_visual_tokens))
+        visual_masses = self.torch.ones(
+            self.initial_visual_tokens, device=inputs_embeds.device, dtype=self.torch.float32
+        )
         traces: list[StageTrace] = []
 
         if initial_retained_indices is not None:
@@ -585,6 +714,11 @@ class ProgressivePruneForwarder(MidLayerUGPruneForwarder):
                 input_ids=current_ids,
                 attention_mask=current_mask,
                 original_positions=current_positions,
+                incoming_original_indices=surviving,
+                selected_original_indices=selected,
+            )
+            visual_masses = self._selected_visual_masses(
+                visual_masses,
                 incoming_original_indices=surviving,
                 selected_original_indices=selected,
             )
@@ -656,14 +790,41 @@ class ProgressivePruneForwarder(MidLayerUGPruneForwarder):
             selection_latency = time.perf_counter() - selection_start
             before_len = int(current_ids.shape[1])
             incoming = list(surviving)
-            hidden, current_ids, current_mask, current_positions = self._gather_after_selection(
-                hidden,
-                input_ids=current_ids,
-                attention_mask=current_mask,
-                original_positions=current_positions,
-                incoming_original_indices=incoming,
-                selected_original_indices=selected,
-            )
+            merge_diagnostics: dict[str, Any] = {}
+            merge_latency = 0.0
+            if event.selector == "query_topk_merge":
+                merge_start = time.perf_counter()
+                (
+                    hidden,
+                    current_ids,
+                    current_mask,
+                    current_positions,
+                    visual_masses,
+                    merge_diagnostics,
+                ) = self._merge_after_selection(
+                    hidden,
+                    input_ids=current_ids,
+                    attention_mask=current_mask,
+                    original_positions=current_positions,
+                    incoming_original_indices=incoming,
+                    selected_original_indices=selected,
+                    visual_masses=visual_masses,
+                )
+                merge_latency = time.perf_counter() - merge_start
+            else:
+                hidden, current_ids, current_mask, current_positions = self._gather_after_selection(
+                    hidden,
+                    input_ids=current_ids,
+                    attention_mask=current_mask,
+                    original_positions=current_positions,
+                    incoming_original_indices=incoming,
+                    selected_original_indices=selected,
+                )
+                visual_masses = self._selected_visual_masses(
+                    visual_masses,
+                    incoming_original_indices=incoming,
+                    selected_original_indices=selected,
+                )
             text_checksum, text_position_checksum = self._text_evidence(current_ids, current_positions)
             if text_checksum != original_text_checksum or text_position_checksum != original_text_position_checksum:
                 raise SelectorError(f"K{event.boundary} altered text tokens or text positions")
@@ -689,6 +850,14 @@ class ProgressivePruneForwarder(MidLayerUGPruneForwarder):
                     outgoing_position_ids=[int(v) for v in current_positions.detach().cpu().tolist()],
                     position_id_checksum=_json_checksum([int(v) for v in current_positions.detach().cpu().tolist()]),
                     selection_latency_s=selection_latency,
+                    merge_applied=event.selector == "query_topk_merge",
+                    merge_assignment_count=int(merge_diagnostics.get("merge_assignment_count", 0)),
+                    merge_assignment_checksum=merge_diagnostics.get("merge_assignment_checksum"),
+                    merge_output_masses=merge_diagnostics.get("merge_output_masses"),
+                    merge_mass_checksum=merge_diagnostics.get("merge_mass_checksum"),
+                    merge_input_mass=merge_diagnostics.get("merge_input_mass"),
+                    merge_output_mass=merge_diagnostics.get("merge_output_mass"),
+                    merge_latency_s=merge_latency,
                 )
             )
             surviving = selected
@@ -740,6 +909,12 @@ class ProgressivePruneForwarder(MidLayerUGPruneForwarder):
             "progressive/cache_implementation": "segment_aware_dynamic_cache",
             "progressive/position_mode": "gap_preserving",
             "progressive/stage_traces": [trace.as_dict() for trace in state.stage_traces],
+            "progressive/query_selection_latency_s": sum(
+                float(trace.selection_latency_s) for trace in state.stage_traces
+            ),
+            "progressive/merge_latency_s": sum(
+                float(trace.merge_latency_s) for trace in state.stage_traces
+            ),
             "progressive/final_retained_indices": list(state.final_retained_indices),
             "progressive/final_retained_indices_checksum": _json_checksum(state.final_retained_indices),
             "progressive/realized_visual_tokens_by_layer": list(state.realized_visual_tokens_by_layer),
