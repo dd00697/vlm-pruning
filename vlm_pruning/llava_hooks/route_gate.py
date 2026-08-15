@@ -548,6 +548,10 @@ class DynamicRouteForwarder(ProgressivePruneForwarder):
         generated_ids = self.torch.cat(generated, dim=1)[0]
         diagnostics = {
             **prefill.diagnostics,
+            # Prefill diagnostics are captured before decode.  Refresh all
+            # state-derived cache counters and byte totals after the final
+            # decode step while retaining the route-gate-only fields above.
+            **self._diagnostics(state),
             "llm_prefill_latency_s": prefill_latency,
             "prefill_latency_s": prefill_latency,
             "time_to_first_token_s": prefill_latency,

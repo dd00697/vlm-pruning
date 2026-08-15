@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -125,6 +126,51 @@ class AdaptiveRouteGateFeatureTests(unittest.TestCase):
         malformed = RouteDecision(SAFE_ROUTE, 0.75, 0.5, (PruningEvent(4, 448, "query_topk"),))
         with self.assertRaises(Exception):
             DynamicRouteForwarder._validate_decision(malformed)
+
+    def test_dynamic_generation_refreshes_state_diagnostics_after_decode(self) -> None:
+        forwarder = object.__new__(DynamicRouteForwarder)
+        forwarder.torch = torch
+        forwarder._cuda_sync = lambda: None
+        state = SimpleNamespace(
+            generated_tokens_cached=0,
+            segments=[],
+            final_retained_indices=[],
+            stage_traces=[],
+        )
+        forwarder.prefill_with_route_gate = lambda **_kwargs: SimpleNamespace(
+            logits=torch.tensor([[[0.0, 1.0]]]),
+            state=state,
+            diagnostics={
+                "progressive/cache_generated_tokens": 0,
+                "gate/route_name": AGGRESSIVE_ROUTE,
+            },
+        )
+
+        def decode(current_state, _token):
+            current_state.generated_tokens_cached += 1
+            return torch.tensor([[[0.0, 1.0]]])
+
+        forwarder.decode_one_with_segment_caches = decode
+        forwarder._diagnostics = lambda current_state: {
+            "progressive/cache_generated_tokens": current_state.generated_tokens_cached,
+        }
+        result = forwarder.generate_with_route_gate(
+            inputs_embeds=None,
+            input_ids=None,
+            attention_mask=None,
+            sample_id="sample",
+            seed=0,
+            query_original_positions=(),
+            width=1,
+            height=1,
+            decide=lambda _vector: RouteDecision(
+                AGGRESSIVE_ROUTE, 0.0, 0.5, AGGRESSIVE_SCHEDULE
+            ),
+            max_new_tokens=2,
+            eos_ids=set(),
+        )
+        self.assertEqual(result.diagnostics["progressive/cache_generated_tokens"], 1)
+        self.assertEqual(result.diagnostics["gate/route_name"], AGGRESSIVE_ROUTE)
 
 
 if __name__ == "__main__":
