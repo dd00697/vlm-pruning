@@ -194,7 +194,11 @@ These are validation-only exploratory results on 1,000 examples; one percentage 
 
 ## Final validation and completion audit
 
-The initial final-suite command omitted the explicit `tests/` discovery root and discovered zero tests. This evidence was rejected; the corrected clean-worktree suite and completion audit remain pending.
+The final clean-worktree CPU suite passed all 160 tests with exit code 0. Command: `/workspace/.followup_venv/bin/python -m unittest discover -s tests -v`. Its captured output SHA-256 is `fdcceb6ceb5649d87310411426af6b415ccd7ad8c6d841010dc7b37832678835`.
+
+The machine-readable completion audit independently revalidates every accepted physical quality and timing artifact and records requirement-level evidence in `FINAL_COMPLETION_REPORT.json`.
+
+An initial audit command omitted the explicit `tests/` discovery root and therefore discovered zero tests. It was rejected, preserved in the registry, and replaced by the clean-worktree command above; zero-test discovery is never accepted as test evidence.
 
 ## Primary recommendation
 

@@ -1,5 +1,5 @@
 {
-  "audited_at_utc": "2026-08-15T00:23:20Z",
+  "audited_at_utc": "2026-08-15T00:26:29Z",
   "campaign_id": "progressive_oracle_refcoco_val_20260814",
   "checks": {
     "all_quality_artifacts_independently_revalidated": {
@@ -326,16 +326,16 @@
     },
     "final_clean_worktree_test_suite": {
       "evidence": {
-        "command": "/workspace/.followup_venv/bin/python -m unittest discover -v",
-        "completed_at_utc": "2026-08-15T00:21:49Z",
+        "command": "/workspace/.followup_venv/bin/python -m unittest discover -s tests -v",
+        "completed_at_utc": "2026-08-15T00:24:55Z",
         "exit_code": 0,
         "output_path": "experiments/progressive_oracle_refcoco_val_20260814/analysis/final_test_suite.txt",
-        "output_sha256": "0022ee81eaae586301bd919619db568337b011018f4f635ccdae17bcdd457edb",
+        "output_sha256": "fdcceb6ceb5649d87310411426af6b415ccd7ad8c6d841010dc7b37832678835",
         "started_from_clean_tracked_worktree": true,
         "status": "pass",
-        "tests": 0
+        "tests": 160
       },
-      "status": "fail"
+      "status": "pass"
     },
     "frozen_discovery_manifest": {
       "evidence": {
@@ -481,12 +481,10 @@
     }
   },
   "schema_version": 1,
-  "status": "fail",
+  "status": "pass",
   "summary": {
     "checks": 13,
-    "failed": [
-      "final_clean_worktree_test_suite"
-    ],
-    "passed": 12
+    "failed": [],
+    "passed": 13
   }
 }

@@ -4134,16 +4134,29 @@
     "strongest_oracle_le_64": "O8"
   },
   "final_validation": {
-    "command": "/workspace/.followup_venv/bin/python -m unittest discover -v",
-    "completed_at_utc": "2026-08-15T00:21:49Z",
+    "command": "/workspace/.followup_venv/bin/python -m unittest discover -s tests -v",
+    "completed_at_utc": "2026-08-15T00:24:55Z",
     "exit_code": 0,
     "output_path": "experiments/progressive_oracle_refcoco_val_20260814/analysis/final_test_suite.txt",
-    "output_sha256": "0022ee81eaae586301bd919619db568337b011018f4f635ccdae17bcdd457edb",
+    "output_sha256": "fdcceb6ceb5649d87310411426af6b415ccd7ad8c6d841010dc7b37832678835",
     "started_from_clean_tracked_worktree": true,
-    "rejection_reason": "zero_tests_discovered",
-    "status": "fail",
-    "tests": 0
+    "status": "pass",
+    "tests": 160
   },
+  "final_validation_attempts": [
+    {
+      "accepted": false,
+      "command": "/workspace/.followup_venv/bin/python -m unittest discover -v",
+      "completed_at_utc": "2026-08-15T00:21:49Z",
+      "exit_code": 0,
+      "output_path": "experiments/progressive_oracle_refcoco_val_20260814/analysis/final_test_suite.txt",
+      "output_sha256": "0022ee81eaae586301bd919619db568337b011018f4f635ccdae17bcdd457edb",
+      "rejection_reason": "zero_tests_discovered",
+      "started_from_clean_tracked_worktree": true,
+      "status": "fail",
+      "tests": 0
+    }
+  ],
   "preflight": {
     "report": "experiments/progressive_oracle_refcoco_val_20260814/preflight/PREFLIGHT_REPORT.json",
     "safe_oracle_parallel_width": 1,
@@ -4512,5 +4525,5 @@
     "accepted_quality": 33,
     "accepted_timing": 1
   },
-  "updated_at_utc": "2026-08-15T00:21:49Z"
+  "updated_at_utc": "2026-08-15T00:24:55Z"
 }
