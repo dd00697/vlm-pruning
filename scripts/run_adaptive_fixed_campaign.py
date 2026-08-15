@@ -143,6 +143,21 @@ def normalized_metrics(validation: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def append_decision_once(registry: dict[str, Any], event: dict[str, Any]) -> None:
+    decision = str(event.get("decision") or "")
+    if not decision:
+        raise FixedCampaignError("Decision event is missing its decision name")
+    for item in registry["decisions"]:
+        if str(item.get("decision") or "") != decision:
+            continue
+        previous = {key: value for key, value in item.items() if key != "at_utc"}
+        proposed = {key: value for key, value in event.items() if key != "at_utc"}
+        if previous != proposed:
+            raise FixedCampaignError(f"Decision {decision} conflicts with its persisted evidence")
+        return
+    registry["decisions"].append(event)
+
+
 def k12_like(metrics: dict[str, Any]) -> bool:
     return (
         float(metrics["acc_at_0_5"]) >= 0.429
@@ -180,6 +195,136 @@ def run_command(command: list[str], log_path: Path) -> int:
 def record_rejected(cell_id: str, attempt: dict[str, Any]) -> None:
     destination = REJECTED_ROOT / f"{cell_id.lower()}_attempt{attempt['attempt']}" / "ATTEMPT.json"
     atomic_json(destination, attempt)
+
+
+def active_runner_processes(run_name: str, *, proc_root: Path = Path("/proc")) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    for process_dir in proc_root.iterdir():
+        if not process_dir.name.isdigit():
+            continue
+        try:
+            raw = (process_dir / "cmdline").read_bytes()
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        command = [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part]
+        if not any(Path(part).name == "run_progressive_oracle_refcoco.py" for part in command):
+            continue
+        try:
+            registered_name = command[command.index("--run-name") + 1]
+        except (ValueError, IndexError):
+            continue
+        if registered_name == run_name:
+            matches.append({"pid": int(process_dir.name), "command": command})
+    return sorted(matches, key=lambda item: int(item["pid"]))
+
+
+def validated_completed_attempt(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    validation = validate_run(run_dir, MANIFEST, expected_rows=EXPECTED_ROWS)
+    metrics = normalized_metrics(validation)
+    completion = read_json(run_dir / "COMPLETED.json")
+    expected = {
+        "status": "complete",
+        "rows": EXPECTED_ROWS,
+        "manifest_sha256": sha256_file(MANIFEST),
+        "source_git_commit": validation["source_git_commit"],
+        "config_sha256": sha256_file(run_dir / "config.json"),
+        "predictions_sha256": sha256_file(run_dir / "predictions.jsonl"),
+        "metrics_sha256": sha256_file(run_dir / "metrics.json"),
+        "integrity_sha256": sha256_file(run_dir / "integrity_report.json"),
+    }
+    for key, value in expected.items():
+        if completion.get(key) != value:
+            raise FixedCampaignError(
+                f"Completed physical attempt has invalid {key}: {completion.get(key)!r} != {value!r}"
+            )
+    evidence = {
+        "run_dir": relative(run_dir),
+        "config_sha256": expected["config_sha256"],
+        "predictions_sha256": expected["predictions_sha256"],
+        "metrics_sha256": expected["metrics_sha256"],
+        "integrity_sha256": expected["integrity_sha256"],
+        "completion_sha256": sha256_file(run_dir / "COMPLETED.json"),
+    }
+    return metrics, evidence
+
+
+def recover_stale_workers(
+    state: dict[str, Any],
+    registry: dict[str, Any],
+    *,
+    proc_root: Path = Path("/proc"),
+) -> list[dict[str, Any]]:
+    workers = list(state.get("active_workers") or [])
+    if not workers:
+        return []
+    recovered: list[dict[str, Any]] = []
+    for cell_id in workers:
+        cell = registry.get("cells", {}).get(cell_id)
+        if not isinstance(cell, dict) or not cell.get("attempts"):
+            raise FixedCampaignError(f"Stale worker {cell_id} has no registered attempt")
+        attempt = cell["attempts"][-1]
+        run_dir = REPO_ROOT / attempt["run_dir"]
+        run_name = run_dir.name
+        live = active_runner_processes(run_name, proc_root=proc_root)
+        if live:
+            raise FixedCampaignError(f"Registered worker {cell_id} is still live: {live}")
+        if not (run_dir / "COMPLETED.json").is_file():
+            partial = run_dir / "predictions.partial.jsonl"
+            suffix = "a resumable partial" if partial.is_file() else "no resumable partial"
+            raise FixedCampaignError(
+                f"Worker {cell_id} is absent but has no completed physical artifact ({suffix}); "
+                "resume it under its immutable source epoch before restarting the controller"
+            )
+        metrics, evidence = validated_completed_attempt(run_dir)
+        if metrics["average_visual_tokens"] != AVERAGES[cell_id]:
+            raise FixedCampaignError(
+                f"Recovered {cell_id} realized average {metrics['average_visual_tokens']} != {AVERAGES[cell_id]}"
+            )
+        previously_accepted = cell.get("status") == "accepted"
+        recovery_time = utc_now()
+        attempt.update(
+            {
+                "status": "accepted",
+                "finished_at_utc": attempt.get("finished_at_utc")
+                or read_json(run_dir / "COMPLETED.json").get("completed_at_utc")
+                or recovery_time,
+                "exit_status": 0,
+                "recovered_at_utc": recovery_time,
+                "recovery_reason": "registered process absent; completed attempt independently validated",
+            }
+        )
+        resume_command = f"{attempt['command']} --resume"
+        if resume_command not in attempt.setdefault("resume_commands", []):
+            attempt["resume_commands"].append(resume_command)
+        cell["status"] = "accepted"
+        cell["metrics"] = metrics
+        cell["accepted_run"] = evidence
+        if not previously_accepted:
+            registry["totals"]["accepted_validation_quality"] += 1
+        event = {
+            "at_utc": recovery_time,
+            "decision": f"recover_completed_stale_worker_{cell_id}",
+            "cell_id": cell_id,
+            "process_scan": {"matching_processes": [], "proc_root": str(proc_root)},
+            "evidence": evidence,
+            "metrics": metrics,
+        }
+        append_decision_once(registry, event)
+        recovered.append(event)
+    state["active_workers"] = []
+    state["state"] = "RECOVERED_COMPLETED_STALE_WORKERS"
+    state["next_required_action"] = "continue_adaptive_fixed_state_machine"
+    state["decision_history"].append(
+        {
+            "phase": "stale_worker_recovery",
+            "status": "complete",
+            "cells": [event["cell_id"] for event in recovered],
+            "process_absence_proved": True,
+            "evidence": [event["evidence"] for event in recovered],
+        }
+    )
+    save_state(state, registry)
+    return recovered
 
 
 def run_cell(cell_id: str, state: dict[str, Any], registry: dict[str, Any]) -> dict[str, Any]:
@@ -271,13 +416,14 @@ def run_cell(cell_id: str, state: dict[str, Any], registry: dict[str, Any]) -> d
                     "completion_sha256": sha256_file(run_dir / "COMPLETED.json"),
                 }
                 registry["totals"]["accepted_validation_quality"] += 1
-                registry["decisions"].append(
+                append_decision_once(
+                    registry,
                     {
                         "at_utc": utc_now(),
                         "decision": f"accept_{cell_id}",
                         "evidence": cell["accepted_run"],
                         "metrics": metrics,
-                    }
+                    },
                 )
                 save_state(state, registry)
                 return metrics
@@ -525,6 +671,7 @@ def main() -> int:
     registry = read_json(REGISTRY_PATH)
     if registry["phases"]["preflight"].get("status") != "complete":
         raise FixedCampaignError("Fixed campaign cannot start before passing preflight")
+    recover_stale_workers(state, registry)
     if state.get("active_workers"):
         raise FixedCampaignError(f"Controller has unresolved active workers: {state['active_workers']}")
 
@@ -533,7 +680,7 @@ def main() -> int:
     if k12_like(c448):
         skip("C480", "C448 passed K12-like; hard expansion was not triggered", registry)
         skip("D1", "C448 passed K12-like; representation-depth control was not triggered", registry)
-        registry["decisions"].append({"at_utc": utc_now(), "decision": "fixed_C448_k12_like", "reason": "skip hard expansion and proceed to hard selection"})
+        append_decision_once(registry, {"at_utc": utc_now(), "decision": "fixed_C448_k12_like", "reason": "skip hard expansion and proceed to hard selection"})
     else:
         acc_delta = c448["acc_at_0_5"] - p3["acc_at_0_5"]
         miou_delta = c448["mean_iou"] - p3["mean_iou"]
@@ -547,7 +694,7 @@ def main() -> int:
         else:
             triggered = ["C480", "D1"]
             reason = "C448 result was ambiguous/discordant under the registered gates"
-        registry["decisions"].append({"at_utc": utc_now(), "decision": "trigger_hard_followup", "triggered": triggered, "reason": reason, "deltas": {"acc": acc_delta, "mean_iou": miou_delta}})
+        append_decision_once(registry, {"at_utc": utc_now(), "decision": "trigger_hard_followup", "triggered": triggered, "reason": reason, "deltas": {"acc": acc_delta, "mean_iou": miou_delta}})
         first_metrics: dict[str, dict[str, Any]] = {}
         for name in triggered:
             first_metrics[name] = run_cell(name, state, registry)
@@ -556,7 +703,7 @@ def main() -> int:
             other = "D1" if name == "C480" else "C480"
             item = first_metrics[name]
             if k12_like(item) or promising(item, c448):
-                registry["decisions"].append({"at_utc": utc_now(), "decision": "trigger_matched_hard_control", "triggered": other, "reason": f"{name} passed the matched-control completion rule"})
+                append_decision_once(registry, {"at_utc": utc_now(), "decision": "trigger_matched_hard_control", "triggered": other, "reason": f"{name} passed the matched-control completion rule"})
                 run_cell(other, state, registry)
             else:
                 skip(other, f"{name} did not pass the matched-control completion rule", registry)
@@ -577,7 +724,7 @@ def main() -> int:
         for name in ("C448", "C480", "D1")
         if registry["cells"][name].get("status") == "accepted"
     )
-    registry["decisions"].append({"at_utc": utc_now(), "decision": "select_strongest_hard", "selected": strongest_hard, "ranking": hard_ranking, "any_new_hard_k12_like": accepted_hard_pass})
+    append_decision_once(registry, {"at_utc": utc_now(), "decision": "select_strongest_hard", "selected": strongest_hard, "ranking": hard_ranking, "any_new_hard_k12_like": accepted_hard_pass})
 
     if accepted_hard_pass:
         skip("M448", "an accepted hard-pruning cell passed K12-like", registry)
@@ -586,14 +733,14 @@ def main() -> int:
     else:
         m448 = run_cell("M448", state, registry)
         merge_evidence = k12_like(m448) or promising(m448, c448)
-        registry["decisions"].append({"at_utc": utc_now(), "decision": "fixed_merge_evidence", "reason": "K12-like or >=0.010 Acc over C448 with mIoU guard" if merge_evidence else "merge evidence gate failed", "passed": merge_evidence})
+        append_decision_once(registry, {"at_utc": utc_now(), "decision": "fixed_merge_evidence", "reason": "K12-like or >=0.010 Acc over C448 with mIoU guard" if merge_evidence else "merge evidence gate failed", "passed": merge_evidence})
         if k12_like(m448):
             skip("B1", "M448 passed K12-like", registry)
             skip("A1", "M448 passed K12-like", registry)
         else:
             b1 = run_cell("B1", state, registry)
             if promising(b1, p3):
-                registry["decisions"].append({"at_utc": utc_now(), "decision": "trigger_A1", "reason": "B1 improved P3 by >=0.010 Acc with the mIoU guard"})
+                append_decision_once(registry, {"at_utc": utc_now(), "decision": "trigger_A1", "reason": "B1 improved P3 by >=0.010 Acc with the mIoU guard"})
                 run_cell("A1", state, registry)
             else:
                 skip("A1", "B1 did not improve P3 by >=0.010 Acc with the mIoU guard", registry)
@@ -608,7 +755,7 @@ def main() -> int:
         "source_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True).strip(),
         "ranking": aggressive_ranking,
     }
-    registry["decisions"].append({"at_utc": utc_now(), "decision": "select_and_freeze_aggressive_route", "selected": aggressive_route, "ranking": aggressive_ranking})
+    append_decision_once(registry, {"at_utc": utc_now(), "decision": "select_and_freeze_aggressive_route", "selected": aggressive_route, "ranking": aggressive_ranking})
     analysis = analyze(registry, aggressive_route, aggressive_ranking)
     analysis_path = ANALYSIS_ROOT / "FIXED_METHOD_RESULTS.json"
     atomic_json(analysis_path, analysis)
