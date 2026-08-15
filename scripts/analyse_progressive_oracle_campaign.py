@@ -587,9 +587,20 @@ def render_report(registry: dict[str, Any]) -> None:
         "",
         "These are validation-only exploratory results on 1,000 examples; one percentage point of accuracy is only ten examples. Marginal 0.5–1.0-point movements are inconclusive. Oracle results use privileged future information. Any dissertation claim or training decision should first consider the deferred full-validation confirmation.",
         "",
-        "## Primary recommendation",
-        "",
     ])
+    final_validation = registry.get("final_validation") or {}
+    if final_validation.get("status") == "pass":
+        sections.extend([
+            "## Final validation and completion audit",
+            "",
+            f"The final clean-worktree CPU suite passed all {int(final_validation['tests'])} tests with exit code 0. "
+            f"Command: `{final_validation['command']}`. Its captured output SHA-256 is "
+            f"`{final_validation['output_sha256']}`.",
+            "",
+            "The machine-readable completion audit independently revalidates every accepted physical quality and timing artifact and records requirement-level evidence in `FINAL_COMPLETION_REPORT.json`.",
+            "",
+        ])
+    sections.extend(["## Primary recommendation", ""])
     if accepted3:
         final = registry["final_exploratory_decision"]
         deployable = registry["cells"][final["strongest_deployable"]]

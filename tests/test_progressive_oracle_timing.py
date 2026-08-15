@@ -57,6 +57,18 @@ class TimingAggregationTests(unittest.TestCase):
 
 
 class TimingGateTests(unittest.TestCase):
+    VALIDATION = {
+        "manifest_order_unique": True,
+        "config_source_protocol": True,
+        "exact_stage_budgets_and_subsets": True,
+        "text_and_gap_positions_preserved": True,
+        "score_maps_recomputed": True,
+        "per_layer_segment_caches": True,
+        "raw_outputs_rescored": True,
+        "oracle_indices_only": False,
+        "oracle_teacher_work_separate": True,
+    }
+
     def make_registry(self) -> dict:
         cells = {
             "T5": {
@@ -86,7 +98,7 @@ class TimingGateTests(unittest.TestCase):
                     "quality/parsed_box_rate": 1.0,
                 },
                 "candidate_average_visual_tokens": average,
-                "validation": {"all_checks": True},
+                "validation": dict(self.VALIDATION),
             }
         return {
             "cells": cells,
@@ -100,8 +112,16 @@ class TimingGateTests(unittest.TestCase):
         self.assertEqual(gates["E1"]["candidate_cell_id"], "T5")
         self.assertFalse(gates["E2"]["passed"])
         self.assertEqual(gates["E2"]["candidate_cell_id"], "P5")
+        self.assertTrue(gates["E2"]["validation_ok"])
         self.assertGreater(gates["E2"]["acc_at_0_5_loss"], 0.02)
         self.assertGreater(gates["E2"]["mean_iou_loss"], 0.01)
+
+    def test_e2_fails_closed_when_an_applicable_validation_check_is_missing(self) -> None:
+        registry = self.make_registry()
+        del registry["cells"]["P5"]["validation"]["per_layer_segment_caches"]
+        gates = evaluate_gates(registry)
+        self.assertFalse(gates["E2"]["validation_ok"])
+        self.assertFalse(gates["E2"]["passed"])
 
 
 if __name__ == "__main__":

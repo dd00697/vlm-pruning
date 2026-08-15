@@ -1,0 +1,47 @@
+{
+  "candidate_cell_id": "T5",
+  "candidate_schedule": [
+    {
+      "boundary": 20,
+      "budget": 0,
+      "selector": "none"
+    }
+  ],
+  "candidate_schedule_string": "20:0:none",
+  "cell_id": "E1",
+  "created_at_utc": "2026-08-14T21:22:48Z",
+  "dataset/manifest": "experiments/progressive_oracle_refcoco_val_20260814/manifests/refcoco_val_discovery1000.jsonl",
+  "dataset/manifest_checksum": "98577029365776a76bd5ec798da4ef06c546e298fd1e950bd238d6b9d127f1cd",
+  "dataset/name": "refcoco",
+  "dataset/num_samples": 1000,
+  "dataset/split": "val",
+  "full_schedule": [],
+  "grid": 24,
+  "matched_full_reference_internal": true,
+  "model/decoding": "deterministic_greedy",
+  "model/max_new_tokens": 48,
+  "model/name": "llava-hf/llava-1.5-7b-hf",
+  "model/precision": "bf16",
+  "original_visual_tokens": 576,
+  "pair_order": "alternating_full_first_by_zero_based_manifest_index",
+  "position_mode": "gap_preserving",
+  "prompt/template": "Identify the target described by this referring expression: \"{query}\".\nReturn exactly one bounding box in normalized 0-1 image coordinates as [x_min, y_min, x_max, y_max]. Do not include any other text.",
+  "run/output_dir": "experiments/progressive_oracle_refcoco_val_20260814/timing/e1_attempt1",
+  "schema_version": 1,
+  "scope": "exploratory_timing",
+  "source/git_commit": "1c39726a6b786e9c071aa00418c139164d8c24f4",
+  "source/git_dirty": false,
+  "source/sha256": {
+    "scripts/run_baseline.py": "1d505adb43bd861acc83d3b084558ee3ddc970068a41b0f477622529c8077747",
+    "scripts/run_progressive_oracle_refcoco.py": "7443f1a1710aec03a9e110b86d1d9a291ff8a620db0fda17cbee63a37239f605",
+    "scripts/run_progressive_oracle_timing.py": "9a198d4f4647c79bacfd6359821e1bb21f285c20ba1737f889419aa6dd9292b1",
+    "scripts/run_progressive_oracle_timing_campaign.py": "3708aafcf83561bbf165c277324251890f08fd5a7e10e9a588b257c28f7863dd",
+    "scripts/validate_progressive_oracle_timing.py": "a912ddb75d362cbab30462b00132dff00ec06b1d8569b48e2f6c9058271ac492",
+    "vlm_pruning/artifacts.py": "145ffd2752a8943ad085765e0a94b7028d00d0b1a89fd898f3d0f66032bbcf18",
+    "vlm_pruning/features/query_tokens.py": "c4c2802c29bad11d3f521d363cdfd7f5999d07482be6b033114420fcf9472a8a",
+    "vlm_pruning/llava_hooks/mid_layer_pruning.py": "b6b4f3ba23b1f013929b3d63cec565e4092097eda7287d3e935aa009fc4a1793",
+    "vlm_pruning/llava_hooks/progressive_pruning.py": "3f3753fd1c516d73da6a515287991da9a17f7da5abf08804f8e336ce6276900b"
+  },
+  "timing_implementation": "paired-progressive-cuda-sync-v1",
+  "warmup_examples_per_path": 20
+}

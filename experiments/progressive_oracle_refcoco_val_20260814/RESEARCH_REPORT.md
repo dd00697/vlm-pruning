@@ -155,13 +155,32 @@ The two rejected preflight-only attempts occurred before scientific inference: t
 
 ## Conditional exploratory timing
 
-### E1: pending
+### E1: accepted
 
-Gate evaluation or execution remains pending.
+Candidate: **T5**; paired rows: 1000; 20 warm-up examples per path; alternating within-pair order; matched full reference measured in the same process.
 
-### E2: pending
+| Quantity | Full mean | Candidate mean | Candidate/full or reduction |
+|---|---:|---:|---:|
+| Vision latency (s) | 0.010720 | 0.010405 | 0.9706× |
+| Projector latency (s) | 0.000355 | 0.000369 | 1.0384× |
+| LLM prefill latency (s) | 0.149224 | 0.126458 | 0.8474× |
+| Selector latency (s) | 0.000000 | 0.059788 | — |
+| Decode latency (s) | 0.693883 | 0.687900 | 0.9914× |
+| End-to-end latency (s) | 0.868920 | 0.839877 | 0.9666× |
+| Generated tokens | 23.469000 | 23.458000 | 0.9995× |
+| Prompt KV bytes | 349390766.080000 | 236138790.912000 | 0.6759× |
+| Final KV bytes | 349390766.080000 | 236138790.912000 | 0.6759× |
+| Average visual tokens | 576.000000 | 360.000000 | 0.6250× |
+| Peak allocated GPU bytes | 14552203264 | 14420242944 | — |
+| Peak reserved GPU bytes | 14755561472 | 14755561472 | — |
 
-Gate evaluation or execution remains pending.
+Prompt/final KV storage is also preserved by decoder-layer segment in the physical timing JSONL. These are exploratory one-pass measurements, not the dissertation's five-repetition final timing protocol.
+
+### E2: skipped_by_design
+
+Candidate: **P5**. Skipped by design: Registered progressive candidate exceeds the Acc@0.5 and mIoU loss tolerances.
+
+Registered gate evidence: `{"acc_at_0_5_loss": 0.032999999999999974, "average_visual_tokens": 186.0, "candidate_cell_id": "P5", "mean_iou_loss": 0.013041949388377938, "parsing_ok": true, "passed": false, "thresholds": {"acc_loss_lte": 0.02, "average_visual_tokens_lt": 246, "miou_loss_lte": 0.01}, "validation_ok": true}`
 
 ## Deferred full-validation recommendation
 

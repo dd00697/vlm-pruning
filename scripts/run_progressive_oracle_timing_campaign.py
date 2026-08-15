@@ -32,6 +32,17 @@ LOG_ROOT = CAMPAIGN_ROOT / "timing_logs"
 PYTHON = Path("/workspace/.followup_venv/bin/python")
 RUNNER = REPO_ROOT / "scripts/run_progressive_oracle_timing.py"
 
+QUALITY_GATE_VALIDATION_CHECKS = (
+    "manifest_order_unique",
+    "config_source_protocol",
+    "exact_stage_budgets_and_subsets",
+    "text_and_gap_positions_preserved",
+    "score_maps_recomputed",
+    "per_layer_segment_caches",
+    "raw_outputs_rescored",
+    "oracle_teacher_work_separate",
+)
+
 
 class TimingCampaignError(RuntimeError):
     """Raised when timing gates or artifacts violate the campaign protocol."""
@@ -85,7 +96,8 @@ def evaluate_gates(registry: dict[str, Any]) -> dict[str, dict[str, Any]]:
     reference = registry["reference"]["discovery_recomputed"]
     acc_loss = float(reference["acc_at_0_5"]) - float(cell["metrics"]["quality/acc_at_0_5"])
     miou_loss = float(reference["mean_iou"]) - float(cell["metrics"]["quality/mean_iou"])
-    validation_ok = all(bool(value) for value in (cell.get("validation") or {}).values())
+    validation = cell.get("validation") or {}
+    validation_ok = all(validation.get(check) is True for check in QUALITY_GATE_VALIDATION_CHECKS)
     return {
         "E1": {
             "passed": b_tail < 48,
