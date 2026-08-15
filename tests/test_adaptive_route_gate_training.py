@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -14,7 +15,7 @@ from scripts.analyse_adaptive_route_gate import (
 )
 from scripts.analyse_adaptive_matched_timing import fixed_trigger, timing_gate
 from scripts.build_adaptive_gate_controls import aggregate as aggregate_control, control_row
-from scripts.run_adaptive_matched_timing_campaign import FIXED_ORDERS, NATURAL_ORDERS
+from scripts.run_adaptive_matched_timing_campaign import FIXED_ORDERS, NATURAL_ORDERS, REPO_ROOT
 from scripts.validate_adaptive_route_gate import aggregate, route_config
 from vlm_pruning.llava_hooks.progressive_pruning import PruningEvent
 from vlm_pruning.llava_hooks.route_gate import FEATURE_DIMENSION, FEATURE_SCHEMA_SHA256
@@ -235,6 +236,7 @@ class AdaptiveRouteGateTrainingTests(unittest.TestCase):
         self.assertEqual((row["width"], row["height"]), (640, 427))
 
     def test_matched_timing_orders_and_triggers_are_exact(self) -> None:
+        self.assertIn(str(REPO_ROOT), sys.path)
         self.assertEqual(
             NATURAL_ORDERS,
             (

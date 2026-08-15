@@ -16,6 +16,8 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 CAMPAIGN_ROOT = REPO_ROOT / "experiments/adaptive_efficiency_refcoco_val_20260815"
 OUTPUT_ROOT = CAMPAIGN_ROOT / "matched_timing"
 LOG_ROOT = CAMPAIGN_ROOT / "matched_timing_logs"
@@ -106,6 +108,37 @@ def prerequisites(mode: str) -> None:
             raise MatchedTimingCampaignError("Fixed timing was not triggered")
 
 
+def recover_completed_attempt(
+    record: dict[str, Any], state: dict[str, Any], *, expected_rows: int
+) -> bool:
+    """Accept a valid child that finished before its controller could register it."""
+
+    from scripts.validate_adaptive_matched_timing_trial import validate_run
+
+    for attempt_record in reversed(record.get("attempts", [])):
+        run_dir = REPO_ROOT / attempt_record["run_dir"]
+        if not (run_dir / "COMPLETED.json").is_file():
+            continue
+        try:
+            report = validate_run(run_dir, MANIFEST, expected_rows=expected_rows)
+        except Exception as exc:
+            attempt_record["status"] = "recovery_validation_failed"
+            attempt_record["recovery_validation_error"] = f"{type(exc).__name__}: {exc}"
+            continue
+        attempt_record["status"] = "accepted_recovered_completed_child"
+        attempt_record["recovered_at_utc"] = utc_now()
+        attempt_record["integrity_sha256"] = sha256_file(run_dir / "integrity_report.json")
+        attempt_record["completion_sha256"] = sha256_file(run_dir / "COMPLETED.json")
+        record["status"] = "accepted"
+        record["accepted_attempt"] = int(attempt_record["attempt"])
+        record["accepted_run_dir"] = str(run_dir.relative_to(REPO_ROOT))
+        record["metrics"] = report["metrics"]
+        state["updated_at_utc"] = utc_now()
+        atomic_json(STATE_PATH, state)
+        return True
+    return False
+
+
 def run(args: argparse.Namespace) -> int:
     prerequisites(args.mode)
     state = json.loads(STATE_PATH.read_text(encoding="utf-8")) if STATE_PATH.is_file() else {
@@ -129,6 +162,8 @@ def run(args: argparse.Namespace) -> int:
             },
         )
         if record.get("status") == "accepted":
+            continue
+        if recover_completed_attempt(record, state, expected_rows=expected_rows):
             continue
         accepted = False
         for attempt in range(len(record["attempts"]) + 1, 3):
