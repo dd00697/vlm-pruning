@@ -243,7 +243,7 @@ def build_config(args: argparse.Namespace, rows: list[dict[str, Any]], run_dir: 
         "command/sha256": json_checksum(command),
         "source/git_commit": source["git_commit"],
         "source/git_dirty": source["git_dirty"],
-        "source/sha256": source["sha256"],
+        "source/sha256": source["source_sha256"],
     }
 
 
