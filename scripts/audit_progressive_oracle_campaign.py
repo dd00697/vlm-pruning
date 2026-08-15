@@ -184,16 +184,17 @@ def run_clean_test_suite() -> dict[str, Any]:
     status = subprocess.check_output(["git", "status", "--porcelain=v1"], cwd=REPO_ROOT, text=True)
     if status.strip():
         raise CompletionAuditError("Final test suite must start from a clean tracked worktree")
-    command = [sys.executable, "-m", "unittest", "discover", "-v"]
+    command = [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"]
     completed = subprocess.run(command, cwd=REPO_ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     TEST_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     TEST_LOG_PATH.write_text(completed.stdout, encoding="utf-8")
     match = re.search(r"Ran (\d+) tests?", completed.stdout)
+    discovered = int(match.group(1)) if match else 0
     evidence = {
-        "status": "pass" if completed.returncode == 0 and match else "fail",
+        "status": "pass" if completed.returncode == 0 and discovered > 0 else "fail",
         "command": " ".join(command),
         "exit_code": completed.returncode,
-        "tests": int(match.group(1)) if match else 0,
+        "tests": discovered,
         "started_from_clean_tracked_worktree": True,
         "completed_at_utc": utc_now(),
         "output_path": str(TEST_LOG_PATH.relative_to(REPO_ROOT)),
@@ -462,6 +463,15 @@ def main() -> int:
     try:
         registry = read_json(REGISTRY_PATH)
         if args.run_final_tests:
+            previous = registry.get("final_validation")
+            if previous:
+                rejected = dict(previous)
+                rejected["accepted"] = False
+                rejected["rejection_reason"] = (
+                    "zero_tests_discovered" if int(previous.get("tests", 0)) == 0
+                    else "superseded_by_explicit_rerun"
+                )
+                registry.setdefault("final_validation_attempts", []).append(rejected)
             registry["final_validation"] = run_clean_test_suite()
             registry["updated_at_utc"] = utc_now()
             atomic_json(REGISTRY_PATH, registry)

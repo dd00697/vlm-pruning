@@ -4133,6 +4133,17 @@
     "strongest_deployable": "T2",
     "strongest_oracle_le_64": "O8"
   },
+  "final_validation": {
+    "command": "/workspace/.followup_venv/bin/python -m unittest discover -v",
+    "completed_at_utc": "2026-08-15T00:21:49Z",
+    "exit_code": 0,
+    "output_path": "experiments/progressive_oracle_refcoco_val_20260814/analysis/final_test_suite.txt",
+    "output_sha256": "0022ee81eaae586301bd919619db568337b011018f4f635ccdae17bcdd457edb",
+    "started_from_clean_tracked_worktree": true,
+    "rejection_reason": "zero_tests_discovered",
+    "status": "fail",
+    "tests": 0
+  },
   "preflight": {
     "report": "experiments/progressive_oracle_refcoco_val_20260814/preflight/PREFLIGHT_REPORT.json",
     "safe_oracle_parallel_width": 1,
@@ -4501,5 +4512,5 @@
     "accepted_quality": 33,
     "accepted_timing": 1
   },
-  "updated_at_utc": "2026-08-15T00:17:00Z"
+  "updated_at_utc": "2026-08-15T00:21:49Z"
 }

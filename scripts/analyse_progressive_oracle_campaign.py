@@ -600,6 +600,11 @@ def render_report(registry: dict[str, Any]) -> None:
             "The machine-readable completion audit independently revalidates every accepted physical quality and timing artifact and records requirement-level evidence in `FINAL_COMPLETION_REPORT.json`.",
             "",
         ])
+        if registry.get("final_validation_attempts"):
+            sections.extend([
+                "An initial audit command omitted the explicit `tests/` discovery root and therefore discovered zero tests. It was rejected, preserved in the registry, and replaced by the clean-worktree command above; zero-test discovery is never accepted as test evidence.",
+                "",
+            ])
     sections.extend(["## Primary recommendation", ""])
     if accepted3:
         final = registry["final_exploratory_decision"]

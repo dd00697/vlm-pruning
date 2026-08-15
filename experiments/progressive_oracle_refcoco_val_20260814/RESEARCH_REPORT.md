@@ -192,6 +192,10 @@ The future 8,811-row recommendation is T2 (K20→16 query top-k) with R16-S0 (K2
 
 These are validation-only exploratory results on 1,000 examples; one percentage point of accuracy is only ten examples. Marginal 0.5–1.0-point movements are inconclusive. Oracle results use privileged future information. Any dissertation claim or training decision should first consider the deferred full-validation confirmation.
 
+## Final validation and completion audit
+
+The initial final-suite command omitted the explicit `tests/` discovery root and discovered zero tests. This evidence was rejected; the corrected clean-worktree suite and completion audit remain pending.
+
 ## Primary recommendation
 
 **C. Even oracle early selection is weak, so selector prediction alone is insufficient and the next work should investigate information transfer, token recovery or another mechanism.**
