@@ -424,6 +424,7 @@ def generate_mid_layer_answer(
     decode_mode: str,
     selection: Any | None = None,
     selection_mode: str = "ug",
+    eos_ids_override: set[int] | None = None,
 ) -> tuple[str, int, float, Any, dict[str, Any]]:
     if int(full_inputs["input_ids"].shape[0]) != 1:
         raise BaselineError("Phase 2B pilot currently supports batch size 1.")
@@ -433,7 +434,7 @@ def generate_mid_layer_answer(
     input_ids = full_inputs["input_ids"]
     inputs_embeds = full_inputs["inputs_embeds"]
     attention_mask = full_inputs["attention_mask"]
-    eos_ids = eos_token_ids(model, processor)
+    eos_ids = eos_token_ids(model, processor) if eos_ids_override is None else set(eos_ids_override)
 
     if decode_mode == "layer_aware_cache":
         generated_result = forwarder.generate_with_layer_aware_cache(
