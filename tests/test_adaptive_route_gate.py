@@ -142,6 +142,8 @@ class AdaptiveRouteGateFeatureTests(unittest.TestCase):
             state=state,
             diagnostics={
                 "progressive/cache_generated_tokens": 0,
+                "cache/prompt_segment_bytes": [10],
+                "cache/prompt_total_bytes": 10,
                 "gate/route_name": AGGRESSIVE_ROUTE,
             },
         )
@@ -153,6 +155,8 @@ class AdaptiveRouteGateFeatureTests(unittest.TestCase):
         forwarder.decode_one_with_segment_caches = decode
         forwarder._diagnostics = lambda current_state: {
             "progressive/cache_generated_tokens": current_state.generated_tokens_cached,
+            "cache/prompt_segment_bytes": [20],
+            "cache/prompt_total_bytes": 20,
         }
         result = forwarder.generate_with_route_gate(
             inputs_embeds=None,
@@ -171,6 +175,8 @@ class AdaptiveRouteGateFeatureTests(unittest.TestCase):
         )
         self.assertEqual(result.diagnostics["progressive/cache_generated_tokens"], 1)
         self.assertEqual(result.diagnostics["gate/route_name"], AGGRESSIVE_ROUTE)
+        self.assertEqual(result.diagnostics["cache/prompt_segment_bytes"], [10])
+        self.assertEqual(result.diagnostics["cache/prompt_total_bytes"], 10)
 
 
 if __name__ == "__main__":

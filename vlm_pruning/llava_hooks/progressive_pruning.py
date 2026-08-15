@@ -1022,8 +1022,20 @@ class ProgressivePruneForwarder(MidLayerUGPruneForwarder):
         self._cuda_sync()
         decode_latency = time.perf_counter() - decode_start
         generated_ids = self.torch.cat(generated, dim=1)[0]
+        final_state_diagnostics = self._diagnostics(state)
+        # ``_diagnostics`` inspects the live cache.  At this point that cache
+        # includes every decoded token, so its prompt-byte fields are final
+        # storage rather than the prefill snapshot.  Refresh mutable cache
+        # lengths/counters while preserving the bytes captured by prefill.
+        final_state_diagnostics["cache/prompt_segment_bytes"] = prefill.diagnostics[
+            "cache/prompt_segment_bytes"
+        ]
+        final_state_diagnostics["cache/prompt_total_bytes"] = prefill.diagnostics[
+            "cache/prompt_total_bytes"
+        ]
         diagnostics = {
-            **self._diagnostics(state),
+            **prefill.diagnostics,
+            **final_state_diagnostics,
             "llm_prefill_latency_s": prefill_latency,
             "prefill_latency_s": prefill_latency,
             "time_to_first_token_s": prefill_latency,

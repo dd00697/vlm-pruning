@@ -230,6 +230,52 @@ class ProgressiveSelectionTests(unittest.TestCase):
 
 
 class ProgressiveRunnerTests(unittest.TestCase):
+    def test_generation_preserves_prefill_cache_storage_snapshot(self) -> None:
+        import torch
+
+        forwarder = object.__new__(ProgressivePruneForwarder)
+        forwarder.torch = torch
+        forwarder._cuda_sync = lambda: None
+        state = SimpleNamespace(
+            generated_tokens_cached=0,
+            segments=[],
+            final_retained_indices=[],
+            stage_traces=[],
+        )
+        forwarder.prefill_with_segment_caches = lambda **_kwargs: SimpleNamespace(
+            logits=torch.tensor([[[0.0, 1.0]]]),
+            state=state,
+            diagnostics={
+                "progressive/cache_generated_tokens": 0,
+                "cache/prompt_segment_bytes": [10],
+                "cache/prompt_total_bytes": 10,
+            },
+        )
+
+        def decode(current_state, _token):
+            current_state.generated_tokens_cached += 1
+            return torch.tensor([[[0.0, 1.0]]])
+
+        forwarder.decode_one_with_segment_caches = decode
+        forwarder._diagnostics = lambda current_state: {
+            "progressive/cache_generated_tokens": current_state.generated_tokens_cached,
+            "cache/prompt_segment_bytes": [20],
+            "cache/prompt_total_bytes": 20,
+        }
+        result = forwarder.generate_with_segment_caches(
+            inputs_embeds=None,
+            input_ids=None,
+            attention_mask=None,
+            sample_id="sample",
+            seed=0,
+            query_original_positions=(),
+            max_new_tokens=2,
+            eos_ids=set(),
+        )
+        self.assertEqual(result.diagnostics["progressive/cache_generated_tokens"], 1)
+        self.assertEqual(result.diagnostics["cache/prompt_segment_bytes"], [10])
+        self.assertEqual(result.diagnostics["cache/prompt_total_bytes"], 10)
+
     def test_relative_output_root_is_normalized_before_provenance_paths(self) -> None:
         from scripts.run_progressive_oracle_refcoco import REPO_ROOT
 

@@ -546,12 +546,20 @@ class DynamicRouteForwarder(ProgressivePruneForwarder):
         self._cuda_sync()
         decode_latency = time.perf_counter() - decode_started
         generated_ids = self.torch.cat(generated, dim=1)[0]
+        final_state_diagnostics = self._diagnostics(state)
+        # Preserve the true pre-decode storage snapshot.  Recomputing the
+        # shared diagnostic block here is still required for final cache
+        # lengths and generated-token counters, but its prompt-byte fields
+        # inspect the now-expanded live cache.
+        final_state_diagnostics["cache/prompt_segment_bytes"] = prefill.diagnostics[
+            "cache/prompt_segment_bytes"
+        ]
+        final_state_diagnostics["cache/prompt_total_bytes"] = prefill.diagnostics[
+            "cache/prompt_total_bytes"
+        ]
         diagnostics = {
             **prefill.diagnostics,
-            # Prefill diagnostics are captured before decode.  Refresh all
-            # state-derived cache counters and byte totals after the final
-            # decode step while retaining the route-gate-only fields above.
-            **self._diagnostics(state),
+            **final_state_diagnostics,
             "llm_prefill_latency_s": prefill_latency,
             "prefill_latency_s": prefill_latency,
             "time_to_first_token_s": prefill_latency,

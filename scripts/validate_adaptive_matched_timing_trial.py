@@ -186,6 +186,10 @@ def validate_run(run_dir: Path, manifest_path: Path, *, expected_rows: int) -> d
         ):
             if int(row.get(field, 0)) <= 0:
                 raise MatchedTimingValidationError(f"row {index} invalid memory field {field}")
+        if generated > 1 and int(row["final_kv_total_bytes"]) <= int(row["prompt_kv_total_bytes"]):
+            raise MatchedTimingValidationError(
+                f"row {index} final KV storage does not exceed the pre-decode snapshot"
+            )
         if config["method"] != "candidate" or config["selected_candidate"] != "GATE_SEED0":
             close(row["route_gate_latency_s"], 0.0, f"row {index} absent gate latency")
         validate_trace(row, config, index)
