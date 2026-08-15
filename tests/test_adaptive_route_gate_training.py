@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from scripts.analyse_adaptive_route_gate import (
+    append_once,
     pareto_frontier,
     route_errors,
     select_project_candidate,
@@ -156,6 +157,11 @@ class AdaptiveRouteGateTrainingTests(unittest.TestCase):
             },
         ]
         self.assertEqual(pareto_frontier(points), ["compute", "quality"])
+
+    def test_analysis_history_refreshes_same_decision_evidence(self) -> None:
+        history = [{"decision": "gate", "evidence_sha256": "old"}]
+        append_once(history, "decision", {"decision": "gate", "evidence_sha256": "new"})
+        self.assertEqual(history, [{"decision": "gate", "evidence_sha256": "new"}])
 
     def test_route_error_analysis_reports_historical_cache_output_drift(self) -> None:
         gate = {

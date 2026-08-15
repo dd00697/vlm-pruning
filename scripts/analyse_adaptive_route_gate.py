@@ -325,8 +325,8 @@ def route_errors(
         "first_output_differences": parity_differences,
         "output_parity_interpretation": (
             "M448 uses the same current progressive cache implementation and must match exactly; "
-            "historical K12 uses an older mid-layer cache implementation, so matching retained "
-            "indices with physical output drift is reported as implementation sensitivity."
+            "historical K12 uses an older mid-layer selector/cache implementation, so retained-"
+            "index and physical-output drift are reported as implementation sensitivity."
         ),
         "physical_metrics": {
             "acc_at_0_5": physical_correct / count,
@@ -347,6 +347,7 @@ def append_once(items: list[dict[str, Any]], key: str, value: dict[str, Any]) ->
     identifier = value[key]
     for existing in items:
         if existing.get(key) == identifier:
+            existing.update(value)
             return
     items.append(value)
 
@@ -477,7 +478,7 @@ def update_report(analysis: dict[str, Any]) -> None:
     lines.extend(
         [
             "",
-            f"The matched-rate random control is {random_metrics['quality/acc_at_0_5']:.3f}/{random_metrics['quality/mean_iou']:.4f} at aggressive rate {random_metrics['routing/aggressive_rate']:.3f}. The privileged no-efficiency oracle ceiling is {oracle_metrics['quality/acc_at_0_5']:.3f}/{oracle_metrics['quality/mean_iou']:.4f}; it assembled already physical rows and ran no LLaVA inference.",
+            f"The matched-rate random control is {random_metrics['quality/acc_at_0_5']:.3f}/{random_metrics['quality/mean_iou']:.4f} at aggressive rate {random_metrics['routing/aggressive_rate']:.3f}. Both physical seed 0 ({primary['acc_at_0_5']:.3f}) and its choices assembled from the same frozen route sources ({primary_route_errors['frozen_source_policy_metrics']['acc_at_0_5']:.3f}) beat that point control. The privileged no-efficiency oracle ceiling is {oracle_metrics['quality/acc_at_0_5']:.3f}/{oracle_metrics['quality/mean_iou']:.4f}; it assembled already physical rows and ran no LLaVA inference.",
             "",
             "Primary-seed paired evidence (10,000 resamples; intervals containing zero are inconclusive):",
             "",
@@ -518,7 +519,7 @@ def update_report(analysis: dict[str, Any]) -> None:
     lines.extend(
         [
             "",
-            f"Primary seed 0 has {primary_route_errors['false_aggressive_critical_safe_correct_aggressive_wrong']} false-aggressive critical errors and {primary_route_errors['false_safe_safe_chosen_when_aggressive_iou_at_least_safe']} false-safe choices. Every dynamic row executed one shared K2 prefix, one gate, and only one route. All aggressive choices exactly match physical M448. The {primary['safe_rows']} safe choices retain exactly the historical K12 indices, but {primary_route_errors['safe_choice_output_differences']} raw outputs differ because the historical source uses the older mid-layer cache implementation; physical seed-0 Acc is {primary_route_errors['physical_metrics']['acc_at_0_5']:.3f} versus {primary_route_errors['frozen_source_policy_metrics']['acc_at_0_5']:.3f} when its identical choices assemble frozen source outputs. This implementation sensitivity is reported rather than treated as route-selection failure.",
+            f"Primary seed 0 has {primary_route_errors['false_aggressive_critical_safe_correct_aggressive_wrong']} false-aggressive critical errors and {primary_route_errors['false_safe_safe_chosen_when_aggressive_iou_at_least_safe']} false-safe choices. Every dynamic row executed one shared K2 prefix, one gate, and only one route. All aggressive choices exactly match physical M448. Among the {primary['safe_rows']} safe choices, {primary_route_errors['safe_retained_index_differences']} retained-index sets and {primary_route_errors['safe_choice_output_differences']} raw outputs differ from the historical K12 source because it uses an older mid-layer selector/cache implementation; physical seed-0 Acc is {primary_route_errors['physical_metrics']['acc_at_0_5']:.3f} versus {primary_route_errors['frozen_source_policy_metrics']['acc_at_0_5']:.3f} when its identical route choices assemble frozen source outputs. This implementation sensitivity is reported rather than hidden or treated as physical-route failure.",
             "",
             f"Registered router decision: `{decision['router_label']}` ({decision['classification']}). Primary seed 0 is {primary['acc_at_0_5']:.3f}/{primary['mean_iou']:.4f} at {primary['average_visual_tokens']:.3f} tokens. The Phase-H project selection is **{selection['selected']}**, using the preregistered within-0.005 accuracy/compute/token/mIoU/overhead ranking.",
             "",
@@ -661,13 +662,25 @@ def main() -> int:
     )
 
     random_metrics = random_integrity["metrics"]
-    beats_random = (
+    physical_beats_random = (
         primary_metrics["acc_at_0_5"] > float(random_metrics["quality/acc_at_0_5"])
         or (
             primary_metrics["acc_at_0_5"] == float(random_metrics["quality/acc_at_0_5"])
             and primary_metrics["mean_iou"] > float(random_metrics["quality/mean_iou"])
         )
     )
+    primary_source_policy = route_error_evidence["seed0"]["frozen_source_policy_metrics"]
+    source_policy_beats_random = (
+        float(primary_source_policy["acc_at_0_5"])
+        > float(random_metrics["quality/acc_at_0_5"])
+        or (
+            float(primary_source_policy["acc_at_0_5"])
+            == float(random_metrics["quality/acc_at_0_5"])
+            and float(primary_source_policy["mean_iou"])
+            > float(random_metrics["quality/mean_iou"])
+        )
+    )
+    beats_random = physical_beats_random and source_policy_beats_random
     contradictory_collapse = any(
         physical[str(seed)]["metrics"]["acc_at_0_5"] < 0.43 - 0.005 - 1e-12
         or physical[str(seed)]["metrics"]["mean_iou"] < 0.4284360666246254 - 0.005 - 1e-12
@@ -712,6 +725,8 @@ def main() -> int:
             "primary_k12_like": physical["0"]["k12_like"],
             "primary_average_tokens_at_most_222": primary_metrics["average_visual_tokens"] <= 222.0,
             "beats_matched_rate_random_point_quality": beats_random,
+            "physical_beats_matched_rate_random_point_quality": physical_beats_random,
+            "frozen_source_policy_beats_matched_rate_random_point_quality": source_policy_beats_random,
             "seed1_or_seed2_contradictory_collapse": contradictory_collapse,
             "acc_improvement_over_aggressive": primary_metrics["acc_at_0_5"] - 0.43,
             "miou_change_over_aggressive": primary_metrics["mean_iou"] - 0.4284360666246254,
