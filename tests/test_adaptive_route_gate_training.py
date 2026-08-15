@@ -6,7 +6,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from scripts.analyse_adaptive_route_gate import pareto_frontier, select_project_candidate
+from scripts.analyse_adaptive_route_gate import (
+    pareto_frontier,
+    route_errors,
+    select_project_candidate,
+)
 from scripts.analyse_adaptive_matched_timing import fixed_trigger, timing_gate
 from scripts.build_adaptive_gate_controls import aggregate as aggregate_control, control_row
 from scripts.run_adaptive_matched_timing_campaign import FIXED_ORDERS, NATURAL_ORDERS
@@ -152,6 +156,38 @@ class AdaptiveRouteGateTrainingTests(unittest.TestCase):
             },
         ]
         self.assertEqual(pareto_frontier(points), ["compute", "quality"])
+
+    def test_route_error_analysis_reports_historical_cache_output_drift(self) -> None:
+        gate = {
+            "sample_id": "sample",
+            "gate_route_choice": "K12_QUERY_TOPK",
+            "raw_model_output": "new-cache-output",
+            "predicted_box": [0.0, 0.0, 1.0, 1.0],
+            "box_iou": 0.6,
+            "success_iou_0_5": True,
+            "final_retained_indices": [1, 2],
+        }
+        safe = {
+            "sample_id": "sample",
+            "raw_model_output": "historical-cache-output",
+            "predicted_box": [0.0, 0.0, 0.9, 0.9],
+            "box_iou": 0.4,
+            "success_iou_0_5": False,
+        }
+        aggressive = {
+            "sample_id": "sample",
+            "raw_model_output": "aggressive",
+            "predicted_box": [0.0, 0.0, 0.8, 0.8],
+            "box_iou": 0.3,
+            "success_iou_0_5": False,
+        }
+        result = route_errors(
+            [gate], [safe], [aggressive], {"sample": {"retained_indices": [1, 2]}}
+        )
+        self.assertEqual(result["safe_choice_output_differences"], 1)
+        self.assertEqual(result["aggressive_choice_output_differences"], 0)
+        self.assertEqual(result["safe_retained_index_differences"], 0)
+        self.assertEqual(result["physical_minus_source_policy"]["acc_at_0_5"], 1.0)
 
     def test_privileged_control_suppresses_efficiency_claim(self) -> None:
         rows = [
