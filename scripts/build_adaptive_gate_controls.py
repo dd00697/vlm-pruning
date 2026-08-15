@@ -106,6 +106,7 @@ def control_row(
     indexed: dict[str, Any],
     source_path: Path,
     source_file_sha256: str,
+    manifest_row: dict[str, Any],
     *,
     privileged: bool,
     rule_evidence: dict[str, Any],
@@ -124,8 +125,11 @@ def control_row(
         "raw_parsed_box": source.get("raw_parsed_box"),
         "predicted_box": source.get("predicted_box"),
         "gt_box": source.get("gt_box"),
-        "width": source.get("width"),
-        "height": source.get("height"),
+        # The historical physical K12 artifact predates duplicated image
+        # dimensions.  Dimensions are immutable manifest metadata, not model
+        # outputs, so attach them from the frozen aligned manifest.
+        "width": int(manifest_row["width"]),
+        "height": int(manifest_row["height"]),
         "valid": bool(source.get("valid")),
         "invalid": bool(source.get("invalid")),
         "parse_failure_reason": source.get("parse_failure_reason"),
@@ -170,6 +174,7 @@ def write_unvalidated_control(run_dir: Path, config: dict[str, Any], rows: list[
 def run(args: argparse.Namespace) -> int:
     manifest = read_jsonl(args.manifest, 1000)
     manifest_ids = [str(row["sample_id"]) for row in manifest]
+    manifest_by_id = {str(row["sample_id"]): row for row in manifest}
     wanted_ids = set(manifest_ids)
     primary = read_jsonl(args.primary_run / "predictions.jsonl", 1000)
     if [str(row["sample_id"]) for row in primary] != manifest_ids:
@@ -232,6 +237,7 @@ def run(args: argparse.Namespace) -> int:
                 random_indexed,
                 random_source,
                 aggressive_file_sha256 if random_route == "M448" else safe_file_sha256,
+                manifest_by_id[sample_id],
                 privileged=False,
                 rule_evidence={
                     "seed": RANDOM_SEED,
@@ -253,6 +259,7 @@ def run(args: argparse.Namespace) -> int:
                 oracle_indexed,
                 oracle_source,
                 safe_file_sha256 if oracle_route == "K12_QUERY_TOPK" else aggressive_file_sha256,
+                manifest_by_id[sample_id],
                 privileged=True,
                 rule_evidence={
                     "safe_iou": safe_iou,

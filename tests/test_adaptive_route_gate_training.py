@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 
 import numpy as np
 import torch
 
 from scripts.analyse_adaptive_route_gate import pareto_frontier, select_project_candidate
 from scripts.analyse_adaptive_matched_timing import fixed_trigger, timing_gate
-from scripts.build_adaptive_gate_controls import aggregate as aggregate_control
+from scripts.build_adaptive_gate_controls import aggregate as aggregate_control, control_row
 from scripts.run_adaptive_matched_timing_campaign import FIXED_ORDERS, NATURAL_ORDERS
 from scripts.validate_adaptive_route_gate import aggregate, route_config
 from vlm_pruning.llava_hooks.progressive_pruning import PruningEvent
@@ -165,6 +166,31 @@ class AdaptiveRouteGateTrainingTests(unittest.TestCase):
         metrics = aggregate_control(rows, privileged=True)
         self.assertIsNone(metrics["tokens/analytical_average_visual_tokens"])
         self.assertFalse(metrics["efficiency_claim"])
+
+    def test_control_uses_frozen_manifest_dimensions_for_historical_source(self) -> None:
+        row = control_row(
+            "sample",
+            "MATCHED_RATE_RANDOM_SEED0",
+            "K12_QUERY_TOPK",
+            {
+                "row": {
+                    "raw_model_output": "[0, 0, 1, 1]",
+                    "gt_box": [0.0, 0.0, 640.0, 427.0],
+                    "valid": True,
+                    "invalid": False,
+                    "box_iou": 1.0,
+                    "success_iou_0_5": True,
+                },
+                "row_index_zero_based": 0,
+                "row_sha256": "row-hash",
+            },
+            Path(__file__).resolve(),
+            "file-hash",
+            {"width": 640, "height": 427},
+            privileged=False,
+            rule_evidence={},
+        )
+        self.assertEqual((row["width"], row["height"]), (640, 427))
 
     def test_matched_timing_orders_and_triggers_are_exact(self) -> None:
         self.assertEqual(

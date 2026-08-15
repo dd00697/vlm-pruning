@@ -90,11 +90,18 @@ def physical_index(path: Path) -> dict[str, dict[str, Any]]:
     return result
 
 
-def independently_rescore(row: dict[str, Any], label: str) -> None:
+def independently_rescore(
+    row: dict[str, Any],
+    label: str,
+    *,
+    width: int,
+    height: int,
+    gt_box: list[float],
+) -> None:
     predicted, raw, failure = parse_box(
-        str(row.get("raw_model_output") or ""), int(row["width"]), int(row["height"])
+        str(row.get("raw_model_output") or ""), width, height
     )
-    iou = box_iou(predicted, list(row["gt_box"])) if predicted is not None else 0.0
+    iou = box_iou(predicted, gt_box) if predicted is not None else 0.0
     equal(row.get("parse_failure_reason"), failure, f"{label} parse failure")
     equal(bool(row.get("valid")), predicted is not None, f"{label} valid")
     equal(bool(row.get("invalid")), predicted is None, f"{label} invalid")
@@ -180,6 +187,7 @@ def validate_run(run_dir: Path, manifest_path: Path, primary_run: Path) -> dict[
 
     for index, row in enumerate(rows):
         sample_id = manifest_ids[index]
+        manifest_row = manifest[index]
         equal(row["control_name"], control_name, f"row {index} control name")
         equal(row["analytical_mixture_no_llava_inference"], True, f"row {index} no-inference flag")
         equal(row["oracle_privileged_non_deployable"], privileged, f"row {index} privileged flag")
@@ -187,8 +195,25 @@ def validate_run(run_dir: Path, manifest_path: Path, primary_run: Path) -> dict[
         aggressive_source = sources["M448"][1].get(sample_id)
         if safe_source is None or aggressive_source is None:
             raise GateControlValidationError(f"Physical source missing row {sample_id}")
-        independently_rescore(safe_source["row"], f"row {index} safe source")
-        independently_rescore(aggressive_source["row"], f"row {index} aggressive source")
+        width = int(manifest_row["width"])
+        height = int(manifest_row["height"])
+        gt_box = list(manifest_row["gt_box"])
+        equal(safe_source["row"].get("gt_box"), gt_box, f"row {index} safe ground truth")
+        equal(aggressive_source["row"].get("gt_box"), gt_box, f"row {index} aggressive ground truth")
+        independently_rescore(
+            safe_source["row"],
+            f"row {index} safe source",
+            width=width,
+            height=height,
+            gt_box=gt_box,
+        )
+        independently_rescore(
+            aggressive_source["row"],
+            f"row {index} aggressive source",
+            width=width,
+            height=height,
+            gt_box=gt_box,
+        )
         if control_name == "MATCHED_RATE_RANDOM_SEED0":
             expected_route = "M448" if sample_id in random_aggressive else "K12_QUERY_TOPK"
             expected_rank = hashlib.sha256(f"{RANDOM_SEED}\0{sample_id}".encode("utf-8")).hexdigest()
@@ -214,8 +239,6 @@ def validate_run(run_dir: Path, manifest_path: Path, primary_run: Path) -> dict[
             "raw_parsed_box",
             "predicted_box",
             "gt_box",
-            "width",
-            "height",
             "valid",
             "invalid",
             "parse_failure_reason",
@@ -223,6 +246,8 @@ def validate_run(run_dir: Path, manifest_path: Path, primary_run: Path) -> dict[
             "success_iou_0_5",
         ):
             equal(row[key], source["row"].get(key), f"row {index} copied {key}")
+        equal(row["width"], width, f"row {index} manifest width")
+        equal(row["height"], height, f"row {index} manifest height")
         expected_tokens = 246.0 if expected_route == "K12_QUERY_TOPK" else 214.0
         close(row["candidate_average_visual_tokens"], expected_tokens, f"row {index} token work")
     metrics = aggregate(rows, privileged)
