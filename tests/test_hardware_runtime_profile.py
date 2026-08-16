@@ -5,6 +5,7 @@ import unittest
 from scripts.run_hardware_runtime_profile import (
     MODES,
     PROFILE_ORDER_PLAN,
+    REPAIR_ORDER_PLAN,
     HardwareProfileError,
     aggregate,
     stage_semantics_match,
@@ -28,6 +29,11 @@ class HardwareProfileProtocolTests(unittest.TestCase):
         for cell_id in ("P_K12", "P_M448", "P_M448_REPLAY"):
             counts = [sum(order[position] == cell_id for order in PROFILE_ORDER_PLAN.values()) for position in range(3)]
             self.assertLessEqual(max(counts) - min(counts), 1)
+        for order in REPAIR_ORDER_PLAN.values():
+            self.assertEqual(
+                set(order),
+                {"R_FUSED_GATHER_MERGE", "R_NATIVE_CACHE", "R_FUSED_NATIVE"},
+            )
 
     def test_resume_requires_an_exact_unique_compatible_prefix(self) -> None:
         expected = [("a", 2), ("b", 2), ("c", 2)]
@@ -90,7 +96,14 @@ class HardwareProfileProtocolTests(unittest.TestCase):
         }
 
     def test_component_gate_distinguishes_live_and_replay(self) -> None:
-        for cell_id in ("P_K12", "P_M448", "P_M448_REPLAY"):
+        for cell_id in (
+            "P_K12",
+            "P_M448",
+            "P_M448_REPLAY",
+            "R_FUSED_GATHER_MERGE",
+            "R_NATIVE_CACHE",
+            "R_FUSED_NATIVE",
+        ):
             with self.subTest(cell_id=cell_id):
                 validate_profile_components(self.profile_row(cell_id), cell_id, 0)
         replay = self.profile_row("P_M448_REPLAY")

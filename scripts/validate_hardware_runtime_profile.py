@@ -20,7 +20,7 @@ for entry in (str(REPO_ROOT), str(SCRIPT_DIR)):
         sys.path.insert(0, entry)
 
 from run_hardware_runtime_profile import (  # noqa: E402
-    CELL_IDS,
+    ALL_CELL_IDS,
     K12_TIMING_SOURCE,
     K12_TIMING_SOURCE_SHA256,
     M448_SOURCE,
@@ -50,6 +50,7 @@ SOURCE_PATHS = (
     Path("vlm_pruning/llava_hooks/mid_layer_pruning.py"),
     Path("vlm_pruning/llava_hooks/progressive_pruning.py"),
     Path("vlm_pruning/llava_hooks/runtime_profile.py"),
+    Path("vlm_pruning/llava_hooks/runtime_repairs.py"),
 )
 
 
@@ -101,15 +102,19 @@ def required_components(cell_id: str) -> tuple[set[str], set[str]]:
     common = {
         "cache_construction",
         "decoder_segment",
-        "index_position_mask_gather",
         "prompt_kv_snapshot",
         "final_kv_snapshot",
         "first_generated_token",
         "later_decode_step",
     }
     if cell_id == "P_K12":
-        return common | {"score_construction", "ranking_and_index_materialization"}, set()
+        return common | {
+            "index_position_mask_gather",
+            "score_construction",
+            "ranking_and_index_materialization",
+        }, set()
     progressive = common | {
+        "index_position_mask_gather",
         "merge_assignment",
         "merge_weighted_reduction",
         "segment_cache_transition",
@@ -117,6 +122,41 @@ def required_components(cell_id: str) -> tuple[set[str], set[str]]:
     }
     if cell_id == "P_M448_REPLAY":
         return progressive | {"replay_index_lookup"}, {"score_construction", "ranking_and_index_materialization"}
+    if cell_id == "R_FUSED_GATHER_MERGE":
+        return (
+            common
+            | {
+                "fused_gather_merge",
+                "score_construction",
+                "ranking_and_index_materialization",
+                "segment_cache_transition",
+                "cache_proxy_dispatch",
+            },
+            {"index_position_mask_gather", "merge_assignment", "merge_weighted_reduction"},
+        )
+    if cell_id == "R_NATIVE_CACHE":
+        return (
+            (progressive - {"cache_proxy_dispatch"})
+            | {"native_cache_direct", "score_construction", "ranking_and_index_materialization"},
+            {"cache_proxy_dispatch", "fused_gather_merge"},
+        )
+    if cell_id == "R_FUSED_NATIVE":
+        return (
+            common
+            | {
+                "fused_gather_merge",
+                "native_cache_direct",
+                "score_construction",
+                "ranking_and_index_materialization",
+                "segment_cache_transition",
+            },
+            {
+                "cache_proxy_dispatch",
+                "index_position_mask_gather",
+                "merge_assignment",
+                "merge_weighted_reduction",
+            },
+        )
     return progressive | {"score_construction", "ranking_and_index_materialization"}, {"replay_index_lookup"}
 
 
@@ -257,7 +297,7 @@ def validate_run(run_dir: Path, manifest_path: Path) -> dict[str, Any]:
     rows = read_jsonl(run_dir / "profiles.jsonl")
     cell_id = str(config.get("cell_id"))
     mode = str(config.get("mode"))
-    require(cell_id in CELL_IDS and mode in MODES, "Unknown profile cell or mode")
+    require(cell_id in ALL_CELL_IDS and mode in MODES, "Unknown profile cell or mode")
     contract = MODES[mode]
     expected_rows = int(contract["limit"]) * int(contract["repetitions"])
     require(len(rows) == expected_rows, f"Expected {expected_rows} profile rows, found {len(rows)}")

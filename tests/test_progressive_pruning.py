@@ -5,11 +5,14 @@ import unittest
 from types import SimpleNamespace
 
 from vlm_pruning.llava_hooks import (
+    FusedGatherMergeProgressiveForwarder,
+    NativeCacheProgressiveForwarder,
     OracleIndexArtifact,
     ProgressivePruneForwarder,
     PruningEvent,
     ProfiledProgressiveForwarder,
     RuntimeProfiler,
+    SegmentCache,
     StageReplay,
     average_visual_tokens,
     deterministic_stage_seed,
@@ -304,6 +307,74 @@ class HardwareRuntimeProfileTests(unittest.TestCase):
         actual = profiled._gather_after_selection(hidden, **kwargs)
         self.assertTrue(all(torch.equal(left, right) for left, right in zip(expected, actual)))
         self.assertEqual(profiled.runtime_profile_snapshot()["records"], [])
+
+    def test_fused_gather_merge_has_exact_base_tensor_and_trace_parity(self) -> None:
+        import torch
+
+        base = object.__new__(ProgressivePruneForwarder)
+        fused = object.__new__(FusedGatherMergeProgressiveForwarder)
+        for forwarder in (base, fused):
+            forwarder.torch = torch
+            forwarder.image_token_id = 32000
+            forwarder.grid = 2
+        ids = torch.tensor([[1, 32000, 32000, 2, 32000, 32000, 3]])
+        hidden = torch.tensor(
+            [[[10.0], [0.0], [1.0], [20.0], [2.0], [3.0], [30.0]]],
+            dtype=torch.float32,
+        )
+        kwargs = {
+            "input_ids": ids,
+            "attention_mask": torch.ones_like(ids),
+            "original_positions": torch.arange(7),
+            "incoming_original_indices": [0, 1, 2, 3],
+            "selected_original_indices": [0, 3],
+            "visual_masses": torch.ones(4, dtype=torch.float32),
+        }
+        expected = base._merge_after_selection(hidden, **kwargs)
+        actual = fused._merge_after_selection(hidden, **kwargs)
+        for left, right in zip(expected[:-1], actual[:-1]):
+            self.assertTrue(torch.equal(left, right))
+        self.assertEqual(expected[-1], actual[-1])
+
+    def test_native_cache_passes_underlying_cache_directly_to_layers(self) -> None:
+        import torch
+
+        received = []
+
+        class Layer:
+            def __call__(self, hidden_states, **kwargs):
+                received.append(kwargs["past_key_value"])
+                return (hidden_states,)
+
+        native_cache = object()
+        language_model = SimpleNamespace(
+            layers=[Layer(), Layer(), Layer()],
+            rotary_emb=lambda hidden_states, position_ids: None,
+        )
+        forwarder = object.__new__(NativeCacheProgressiveForwarder)
+        forwarder.torch = torch
+        forwarder.model = SimpleNamespace(model=SimpleNamespace(language_model=language_model))
+        forwarder._causal_mask = lambda *_args: None
+        forwarder._cache_position = lambda hidden_states, _cache: torch.arange(hidden_states.shape[1])
+        segment = SegmentCache(
+            segment_index=0,
+            start_layer=1,
+            end_layer=3,
+            cache=native_cache,
+            attention_mask=torch.ones((1, 2), dtype=torch.long),
+            prompt_length=2,
+            visual_tokens=1,
+        )
+        forwarder.run_decoder_layers(
+            torch.ones((1, 1, 4)),
+            attention_mask=segment.attention_mask,
+            position_ids=torch.zeros((1, 1), dtype=torch.long),
+            start_layer=1,
+            end_layer=3,
+            past_key_values=segment,
+            use_cache=True,
+        )
+        self.assertEqual(received, [native_cache, native_cache])
 
     def test_replay_bypasses_score_and_rank_but_validates_live_incoming_state(self) -> None:
         import torch

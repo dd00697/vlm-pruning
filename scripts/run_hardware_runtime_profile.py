@@ -38,7 +38,10 @@ from run_progressive_oracle_refcoco import (  # noqa: E402
 )
 from vlm_pruning.artifacts import sha256_file, source_provenance  # noqa: E402
 from vlm_pruning.llava_hooks import (  # noqa: E402
+    ProfiledFusedGatherMergeForwarder,
+    ProfiledFusedNativeForwarder,
     ProfiledMidLayerForwarder,
+    ProfiledNativeCacheForwarder,
     ProfiledProgressiveForwarder,
     PruningEvent,
     RuntimeProfiler,
@@ -61,6 +64,8 @@ M448_SCHEDULE = (
     PruningEvent(12, 48, "query_topk"),
 )
 CELL_IDS = ("P_K12", "P_M448", "P_M448_REPLAY")
+REPAIR_CELL_IDS = ("R_FUSED_GATHER_MERGE", "R_NATIVE_CACHE", "R_FUSED_NATIVE")
+ALL_CELL_IDS = CELL_IDS + REPAIR_CELL_IDS
 MODES = {
     "smoke2": {"limit": 2, "warmup": 0, "repetitions": 1},
     "smoke20": {"limit": 20, "warmup": 2, "repetitions": 1},
@@ -76,6 +81,13 @@ PROFILE_ORDER_PLAN = {
     4: ("P_K12", "P_M448", "P_M448_REPLAY"),
     5: ("P_M448", "P_M448_REPLAY", "P_K12"),
 }
+REPAIR_ORDER_PLAN = {
+    1: ("R_FUSED_GATHER_MERGE", "R_NATIVE_CACHE", "R_FUSED_NATIVE"),
+    2: ("R_NATIVE_CACHE", "R_FUSED_NATIVE", "R_FUSED_GATHER_MERGE"),
+    3: ("R_FUSED_NATIVE", "R_FUSED_GATHER_MERGE", "R_NATIVE_CACHE"),
+    4: ("R_FUSED_GATHER_MERGE", "R_NATIVE_CACHE", "R_FUSED_NATIVE"),
+    5: ("R_NATIVE_CACHE", "R_FUSED_NATIVE", "R_FUSED_GATHER_MERGE"),
+}
 SOURCE_PATHS = (
     Path("scripts/run_hardware_runtime_profile.py"),
     Path("scripts/validate_hardware_runtime_profile.py"),
@@ -88,6 +100,7 @@ SOURCE_PATHS = (
     Path("vlm_pruning/llava_hooks/mid_layer_pruning.py"),
     Path("vlm_pruning/llava_hooks/progressive_pruning.py"),
     Path("vlm_pruning/llava_hooks/runtime_profile.py"),
+    Path("vlm_pruning/llava_hooks/runtime_repairs.py"),
 )
 
 
@@ -128,7 +141,7 @@ def jsonable(value: Any) -> Any:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cell-id", choices=CELL_IDS, required=True)
+    parser.add_argument("--cell-id", choices=ALL_CELL_IDS, required=True)
     parser.add_argument("--mode", choices=sorted(MODES), required=True)
     parser.add_argument("--attempt", type=int, default=1, choices=[1, 2])
     parser.add_argument("--repetition", type=int, choices=PROFILE_REPETITIONS)
@@ -138,7 +151,8 @@ def parse_args() -> argparse.Namespace:
     if args.mode == "profile100":
         if args.repetition is None or args.order_position is None:
             parser.error("profile100 requires --repetition and --order-position")
-        expected_position = PROFILE_ORDER_PLAN[args.repetition].index(args.cell_id) + 1
+        order_plan = PROFILE_ORDER_PLAN if args.cell_id in CELL_IDS else REPAIR_ORDER_PLAN
+        expected_position = order_plan[args.repetition].index(args.cell_id) + 1
         if args.order_position != expected_position:
             parser.error(
                 f"counterbalanced plan requires position {expected_position} for "
@@ -197,12 +211,15 @@ def output_dir(
     order_position: int | None = None,
 ) -> Path:
     if mode.startswith("smoke"):
-        return CAMPAIGN_ROOT / "profiling/smokes" / f"{cell_id.lower()}_{mode}_attempt{attempt}"
+        phase = "profiling" if cell_id in CELL_IDS else "runtime_repairs"
+        return CAMPAIGN_ROOT / phase / "smokes" / f"{cell_id.lower()}_{mode}_attempt{attempt}"
     if repetition is None or order_position is None:
         raise HardwareProfileError("Full profile output requires repetition and order position")
+    phase = "profiling" if cell_id in CELL_IDS else "runtime_repairs/profiling"
     return (
         CAMPAIGN_ROOT
-        / "profiling/trials"
+        / phase
+        / "trials"
         / f"rep{repetition}_pos{order_position}_{cell_id.lower()}_attempt{attempt}"
     )
 
@@ -402,7 +419,14 @@ class ProfileTrial:
                 runtime_profiler=profiler,
             )
         else:
-            self.forwarder = ProfiledProgressiveForwarder(
+            forwarder_class = {
+                "P_M448": ProfiledProgressiveForwarder,
+                "P_M448_REPLAY": ProfiledProgressiveForwarder,
+                "R_FUSED_GATHER_MERGE": ProfiledFusedGatherMergeForwarder,
+                "R_NATIVE_CACHE": ProfiledNativeCacheForwarder,
+                "R_FUSED_NATIVE": ProfiledFusedNativeForwarder,
+            }[config["cell_id"]]
+            self.forwarder = forwarder_class(
                 self.torch,
                 self.model,
                 image_token_id=self.image_token_id,
@@ -751,7 +775,15 @@ def run(args: argparse.Namespace) -> int:
         config = {
             "schema_version": 2,
             "created_at_utc": utc_now(),
-            "scope": "instrumentation_smoke" if args.mode.startswith("smoke") else "runtime_profile",
+            "scope": (
+                "instrumentation_smoke"
+                if args.mode.startswith("smoke") and args.cell_id in CELL_IDS
+                else "runtime_repair_smoke"
+                if args.mode.startswith("smoke")
+                else "runtime_profile"
+                if args.cell_id in CELL_IDS
+                else "runtime_repair_profile"
+            ),
             "cell_id": args.cell_id,
             "mode": args.mode,
             "attempt": args.attempt,

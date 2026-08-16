@@ -36,9 +36,17 @@ from .runtime_profile import (
     ProfileRecord,
     ProfiledMidLayerForwarder,
     ProfiledProgressiveForwarder,
+    ProfiledFusedGatherMergeForwarder,
+    ProfiledFusedNativeForwarder,
+    ProfiledNativeCacheForwarder,
     RuntimeProfiler,
     StageReplay,
     load_stage_replay,
+)
+from .runtime_repairs import (
+    FusedGatherMergeProgressiveForwarder,
+    FusedNativeProgressiveForwarder,
+    NativeCacheProgressiveForwarder,
 )
 
 __all__ = [
@@ -73,6 +81,12 @@ __all__ = [
     "ProfileRecord",
     "ProfiledMidLayerForwarder",
     "ProfiledProgressiveForwarder",
+    "ProfiledFusedGatherMergeForwarder",
+    "ProfiledFusedNativeForwarder",
+    "ProfiledNativeCacheForwarder",
+    "FusedGatherMergeProgressiveForwarder",
+    "FusedNativeProgressiveForwarder",
+    "NativeCacheProgressiveForwarder",
     "RuntimeProfiler",
     "StageReplay",
     "load_stage_replay",

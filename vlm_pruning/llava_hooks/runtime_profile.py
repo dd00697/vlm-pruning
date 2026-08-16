@@ -19,6 +19,11 @@ from vlm_pruning.llava_hooks.progressive_pruning import (
     StageTrace,
     _json_checksum,
 )
+from vlm_pruning.llava_hooks.runtime_repairs import (
+    FusedGatherMergeProgressiveForwarder,
+    FusedNativeProgressiveForwarder,
+    NativeCacheProgressiveForwarder,
+)
 from vlm_pruning.selectors.base import SelectorError
 
 
@@ -336,3 +341,18 @@ class ProfiledProgressiveForwarder(HardwareProfileMixin, ProgressivePruneForward
             raise SelectorError("Replay/live merge output masses mismatch")
         if actual.score_map_recomputed:
             raise SelectorError("Replay unexpectedly recomputed a score map")
+
+
+class ProfiledFusedGatherMergeForwarder(
+    HardwareProfileMixin,
+    FusedGatherMergeProgressiveForwarder,
+):
+    """Profile the exact fused gather/merge repair."""
+
+
+class ProfiledNativeCacheForwarder(HardwareProfileMixin, NativeCacheProgressiveForwarder):
+    """Profile the exact direct native-cache repair."""
+
+
+class ProfiledFusedNativeForwarder(HardwareProfileMixin, FusedNativeProgressiveForwarder):
+    """Profile the composition of both exact repairs."""
