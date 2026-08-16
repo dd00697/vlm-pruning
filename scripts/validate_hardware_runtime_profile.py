@@ -25,6 +25,8 @@ from run_hardware_runtime_profile import (  # noqa: E402
     K12_TIMING_SOURCE_SHA256,
     M448_SOURCE,
     M448_SOURCE_SHA256,
+    M448_TIMING_SOURCE,
+    M448_TIMING_SOURCE_SHA256,
     MODES,
     compact_stage_traces,
     load_historical,
@@ -149,6 +151,7 @@ def validate_semantics(
     *,
     cell_id: str,
     row_index: int,
+    timing_historical: dict[str, Any],
 ) -> None:
     require(row.get("raw_model_output") == historical.get("raw_model_output"), f"row {row_index} raw output drift")
     require(int(row.get("generated_token_count")) == int(historical.get("generated_token_count")), f"row {row_index} generated length drift")
@@ -193,12 +196,10 @@ def validate_semantics(
             "progressive/segment_cache_lengths",
             "progressive/per_layer_cache_lengths",
             "progressive/segment_attention_mask_lengths",
-            "cache/prompt_segment_bytes",
-            "cache/prompt_total_bytes",
-            "cache/final_segment_bytes",
-            "cache/final_total_bytes",
         ):
             require(cache.get(key) == historical.get(key), f"row {row_index} M448 cache drift: {key}")
+        require(int(row["prompt_kv_total_bytes"]) == int(timing_historical["prompt_kv_total_bytes"]), f"row {row_index} M448 prompt KV drift")
+        require(int(row["final_kv_total_bytes"]) == int(timing_historical["final_kv_total_bytes"]), f"row {row_index} M448 final KV drift")
     require(int(row["prompt_kv_total_bytes"]) < int(row["final_kv_total_bytes"]), f"row {row_index} prompt KV does not precede generated growth")
     require(row.get("semantic_match") is True, f"row {row_index} runner semantic gate failed")
     require(all((row.get("semantic_comparison") or {}).values()), f"row {row_index} semantic subcheck failed")
@@ -260,6 +261,9 @@ def validate_run(run_dir: Path, manifest_path: Path) -> dict[str, Any]:
     historical_path = K12_TIMING_SOURCE if cell_id == "P_K12" else M448_SOURCE
     historical_hash = K12_TIMING_SOURCE_SHA256 if cell_id == "P_K12" else M448_SOURCE_SHA256
     historical = load_historical(historical_path, historical_hash, set(prefix_ids))
+    timing_historical_path = K12_TIMING_SOURCE if cell_id == "P_K12" else M448_TIMING_SOURCE
+    timing_historical_hash = K12_TIMING_SOURCE_SHA256 if cell_id == "P_K12" else M448_TIMING_SOURCE_SHA256
+    timing_historical = load_historical(timing_historical_path, timing_historical_hash, set(prefix_ids))
     for row_index, row in enumerate(rows):
         require(row.get("cell_id") == cell_id, f"row {row_index} cell ID differs")
         require(int(row.get("manifest_index")) == prefix_ids.index(str(row["sample_id"])), f"row {row_index} manifest index differs")
@@ -268,7 +272,13 @@ def validate_run(run_dir: Path, manifest_path: Path) -> dict[str, Any]:
         close(float(row["average_visual_tokens"]), sum(expected_trace) / 32, f"row {row_index} average tokens")
         require(int(row["visual_token_layer_work"]) == sum(expected_trace), f"row {row_index} token work differs")
         validate_profile_components(row, cell_id, row_index)
-        validate_semantics(row, historical[str(row["sample_id"])], cell_id=cell_id, row_index=row_index)
+        validate_semantics(
+            row,
+            historical[str(row["sample_id"])],
+            cell_id=cell_id,
+            row_index=row_index,
+            timing_historical=timing_historical[str(row["sample_id"])],
+        )
     for sample_id in prefix_ids:
         sample_rows = [row for row in rows if row["sample_id"] == sample_id]
         require(len({row["raw_model_output"] for row in sample_rows}) == 1, f"Repeated output drift: {sample_id}")

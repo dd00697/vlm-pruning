@@ -52,6 +52,8 @@ MANIFEST = REPO_ROOT / "experiments/progressive_oracle_refcoco_val_20260814/mani
 MANIFEST_SHA256 = "98577029365776a76bd5ec798da4ef06c546e298fd1e950bd238d6b9d127f1cd"
 M448_SOURCE = REPO_ROOT / "experiments/adaptive_efficiency_refcoco_val_20260815/runs/m448_attempt1/predictions.jsonl"
 M448_SOURCE_SHA256 = "52e375657ba259a8785dcea3804770070e57f16f5ccc682b78f5edd167c9574b"
+M448_TIMING_SOURCE = REPO_ROOT / "experiments/adaptive_efficiency_refcoco_val_20260815/matched_timing/natural/rep1_pos3_candidate_attempt1/timing.jsonl"
+M448_TIMING_SOURCE_SHA256 = "ba171c2febf75af3246fad262686c74b2f7b07cfa5ebb5db4c113b7de6e1e34e"
 K12_TIMING_SOURCE = REPO_ROOT / "experiments/adaptive_efficiency_refcoco_val_20260815/matched_timing/natural/rep1_pos2_k12_original_attempt1/timing.jsonl"
 K12_TIMING_SOURCE_SHA256 = "df01a26cceeac1d52b833b85a6101ce71780415dfe997d57069f551c9ca78d6e"
 M448_SCHEDULE = (
@@ -261,9 +263,11 @@ class ProfileTrial:
         *,
         replay: dict[str, Any] | None,
         historical: dict[str, dict[str, Any]],
+        timing_historical: dict[str, dict[str, Any]],
     ) -> None:
         self.config = config
         self.historical = historical
+        self.timing_historical = timing_historical
         self.torch, self.processor, self.model, self.device, self.model_environment = load_model(MODEL, "bf16")
         self.image_token_id = int(getattr(self.model.config, "image_token_index", 32000))
         profiler = RuntimeProfiler(self.torch, enabled=True)
@@ -367,6 +371,7 @@ class ProfileTrial:
         )
         iou = box_iou(predicted_box, sample["gt_box"]) if predicted_box is not None else 0.0
         historical = self.historical[str(sample["sample_id"])]
+        timing_historical = self.timing_historical[str(sample["sample_id"])]
         historical_raw_box, historical_predicted_box, _ = parse_box(
             str(historical["raw_model_output"]),
             int(sample["width"]),
@@ -394,19 +399,19 @@ class ProfileTrial:
                 and max(retained) < ORIGINAL_VISUAL_TOKENS
             )
         else:
-            cache_trace_match = all(
-                diagnostics.get(key) == historical.get(key)
-                for key in (
+            cache_trace_match = (
+                all(
+                    diagnostics.get(key) == historical.get(key)
+                    for key in (
                     "progressive/cache_generated_tokens",
                     "progressive/segment_prompt_lengths",
                     "progressive/segment_cache_lengths",
                     "progressive/per_layer_cache_lengths",
                     "progressive/segment_attention_mask_lengths",
-                    "cache/prompt_segment_bytes",
-                    "cache/prompt_total_bytes",
-                    "cache/final_segment_bytes",
-                    "cache/final_total_bytes",
+                    )
                 )
+                and int(diagnostics["cache/prompt_total_bytes"]) == int(timing_historical["prompt_kv_total_bytes"])
+                and int(diagnostics["cache/final_total_bytes"]) == int(timing_historical["final_kv_total_bytes"])
             )
             stage_match = stage_semantics_match(
                 stage_traces,
@@ -452,6 +457,7 @@ class ProfileTrial:
                 for key, value in diagnostics.items()
                 if key.startswith("progressive/segment_")
                 or key.startswith("progressive/per_layer_cache")
+                or key == "progressive/cache_generated_tokens"
                 or key.startswith("mid_layer/") and ("cache" in key or "attention_mask" in key)
                 or key.startswith("cache/prompt_")
                 or key.startswith("cache/final_")
@@ -467,6 +473,7 @@ class ProfileTrial:
             "semantic_comparison": semantic,
             "semantic_match": all(semantic.values()),
             "historical_source_sha256": self.config["historical_source_sha256"],
+            "historical_timing_source_sha256": self.config["historical_timing_source_sha256"],
         }
         for image in images:
             image.close()
@@ -527,6 +534,9 @@ def run(args: argparse.Namespace) -> int:
     historical_path = K12_TIMING_SOURCE if args.cell_id == "P_K12" else M448_SOURCE
     historical_hash = K12_TIMING_SOURCE_SHA256 if args.cell_id == "P_K12" else M448_SOURCE_SHA256
     historical = load_historical(historical_path, historical_hash, wanted)
+    timing_historical_path = K12_TIMING_SOURCE if args.cell_id == "P_K12" else M448_TIMING_SOURCE
+    timing_historical_hash = K12_TIMING_SOURCE_SHA256 if args.cell_id == "P_K12" else M448_TIMING_SOURCE_SHA256
+    timing_historical = load_historical(timing_historical_path, timing_historical_hash, wanted)
     replay = None
     if args.cell_id == "P_M448_REPLAY":
         replay = load_stage_replay(M448_SOURCE, expected_sha256=M448_SOURCE_SHA256, sample_ids=wanted)
@@ -558,6 +568,8 @@ def run(args: argparse.Namespace) -> int:
         "sample_index_by_id": {str(row["sample_id"]): index for index, row in enumerate(rows)},
         "historical_source_path": relative(historical_path),
         "historical_source_sha256": historical_hash,
+        "historical_timing_source_path": relative(timing_historical_path),
+        "historical_timing_source_sha256": timing_historical_hash,
         "model": MODEL,
         "precision": "bf16",
         "decoding": "deterministic_greedy",
@@ -575,7 +587,12 @@ def run(args: argparse.Namespace) -> int:
     run_dir.mkdir(parents=True)
     atomic_write(run_dir / "config.json", canonical_bytes(config))
     config_sha = sha256_file(run_dir / "config.json")
-    trial = ProfileTrial(config, replay=replay, historical=historical)
+    trial = ProfileTrial(
+        config,
+        replay=replay,
+        historical=historical,
+        timing_historical=timing_historical,
+    )
     environment = {
         "created_at_utc": utc_now(),
         "python": sys.version,
