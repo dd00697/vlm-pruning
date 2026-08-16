@@ -18,6 +18,7 @@ from scripts.init_hardware_aware_zero_tail_campaign import (
     validate_ordered_ids,
     Phase0Error,
 )
+from scripts.verify_hardware_aware_preflight import PreflightValidationError, require
 
 
 class HardwareAwarePhase0Tests(unittest.TestCase):
@@ -67,6 +68,11 @@ class HardwareAwarePhase0Tests(unittest.TestCase):
             second = tree_sha256(root)
             self.assertNotEqual(first[0], second[0])
             self.assertEqual(second[1:], (2, 6))
+
+    def test_independent_validator_require_fails_closed(self) -> None:
+        require(True, "unused")
+        with self.assertRaisesRegex(PreflightValidationError, "evidence"):
+            require(False, "missing evidence")
 
 
 if __name__ == "__main__":
