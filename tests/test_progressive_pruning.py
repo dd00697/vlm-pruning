@@ -8,6 +8,9 @@ from vlm_pruning.llava_hooks import (
     OracleIndexArtifact,
     ProgressivePruneForwarder,
     PruningEvent,
+    ProfiledProgressiveForwarder,
+    RuntimeProfiler,
+    StageReplay,
     average_visual_tokens,
     deterministic_stage_seed,
     realized_visual_trace,
@@ -227,6 +230,121 @@ class ProgressiveSelectionTests(unittest.TestCase):
             diagnostics["merge_assignment_checksum"], repeat[-1]["merge_assignment_checksum"]
         )
         self.assertTrue(torch.equal(merged, repeat[0]))
+
+
+class HardwareRuntimeProfileTests(unittest.TestCase):
+    @staticmethod
+    def checksum(values) -> str:
+        import hashlib
+
+        return hashlib.sha256(
+            json.dumps(values, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def replay_stage(self) -> StageReplay:
+        incoming = [0, 1, 2, 3]
+        outgoing = [0, 3]
+        return StageReplay.from_trace(
+            {
+                "boundary": 4,
+                "selector": "query_topk_merge",
+                "requested_budget": 2,
+                "incoming_original_indices": incoming,
+                "outgoing_original_indices": outgoing,
+                "incoming_indices_checksum": self.checksum(incoming),
+                "outgoing_indices_checksum": self.checksum(outgoing),
+                "score_map_checksum": "scores",
+                "merge_assignment_checksum": "assignments",
+                "merge_mass_checksum": "masses",
+                "merge_output_masses": [3.0, 1.0],
+            }
+        )
+
+    def test_profiler_disabled_is_inert_and_enabled_reports_cpu_wall(self) -> None:
+        import torch
+
+        disabled = RuntimeProfiler(torch, enabled=False)
+        with disabled.measure("work"):
+            value = torch.arange(4).sum().item()
+        self.assertEqual(value, 6)
+        self.assertEqual(disabled.snapshot()["records"], [])
+
+        enabled = RuntimeProfiler(torch, enabled=True)
+        with enabled.measure("work", stage=1):
+            torch.arange(4).sum().item()
+        snapshot = enabled.snapshot()
+        self.assertEqual(snapshot["components"]["work"]["count"], 1)
+        self.assertGreaterEqual(snapshot["components"]["work"]["cpu_wall_total_s"], 0.0)
+        if torch.cuda.is_available():
+            self.assertGreaterEqual(snapshot["components"]["work"]["cuda_event_total_s"], 0.0)
+        else:
+            self.assertIsNone(snapshot["components"]["work"]["cuda_event_total_s"])
+
+    def test_profiler_disabled_gather_has_exact_base_parity(self) -> None:
+        import torch
+
+        base = object.__new__(ProgressivePruneForwarder)
+        profiled = object.__new__(ProfiledProgressiveForwarder)
+        for forwarder in (base, profiled):
+            forwarder.torch = torch
+            forwarder.image_token_id = 32000
+        profiled.runtime_profiler = RuntimeProfiler(torch, enabled=False)
+        ids = torch.tensor([[1, 32000, 32000, 2]])
+        hidden = torch.arange(4, dtype=torch.float32).reshape(1, 4, 1)
+        mask = torch.ones_like(ids)
+        positions = torch.arange(4)
+        kwargs = {
+            "input_ids": ids,
+            "attention_mask": mask,
+            "original_positions": positions,
+            "incoming_original_indices": [0, 1],
+            "selected_original_indices": [1],
+        }
+        expected = base._gather_after_selection(hidden, **kwargs)
+        actual = profiled._gather_after_selection(hidden, **kwargs)
+        self.assertTrue(all(torch.equal(left, right) for left, right in zip(expected, actual)))
+        self.assertEqual(profiled.runtime_profile_snapshot()["records"], [])
+
+    def test_replay_bypasses_score_and_rank_but_validates_live_incoming_state(self) -> None:
+        import torch
+
+        forwarder = object.__new__(ProfiledProgressiveForwarder)
+        forwarder.torch = torch
+        forwarder.runtime_profiler = RuntimeProfiler(torch, enabled=False)
+        forwarder.stage_replay_by_sample = {"sample": (self.replay_stage(),)}
+        selected, checksum, recomputed, derived = forwarder.select_stage_indices(
+            None,
+            input_ids=None,
+            original_positions=None,
+            incoming_original_indices=[0, 1, 2, 3],
+            event=PruningEvent(4, 2, "query_topk_merge"),
+            stage_index=0,
+            sample_id="sample",
+            seed=0,
+            query_original_positions=[],
+        )
+        self.assertEqual(selected, [0, 3])
+        self.assertEqual(checksum, "scores")
+        self.assertFalse(recomputed)
+        self.assertIsNone(derived)
+        with self.assertRaisesRegex(SelectorError, "incoming indices differ"):
+            forwarder.select_stage_indices(
+                None,
+                input_ids=None,
+                original_positions=None,
+                incoming_original_indices=[0, 1, 2, 4],
+                event=PruningEvent(4, 2, "query_topk_merge"),
+                stage_index=0,
+                sample_id="sample",
+                seed=0,
+                query_original_positions=[],
+            )
+
+    def test_corrupt_replay_checksum_fails_closed(self) -> None:
+        trace = self.replay_stage().__dict__.copy()
+        trace["incoming_indices_checksum"] = "corrupt"
+        with self.assertRaisesRegex(SelectorError, "incoming-index checksum"):
+            StageReplay(**trace).validate()
 
 
 class ProgressiveRunnerTests(unittest.TestCase):

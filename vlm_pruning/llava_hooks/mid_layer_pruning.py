@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -347,6 +348,11 @@ class MidLayerUGPruneForwarder:
     def _subtiming_sync(self) -> None:
         if self.synchronise_subtimings:
             self._cuda_sync()
+
+    def _profile_scope(self, component: str, **metadata: Any) -> Any:
+        """Return an inert scope unless an opt-in profiling subclass overrides it."""
+        del component, metadata
+        return nullcontext()
 
     def cache_seq_len(self, cache: Any, layer_idx: int) -> int:
         value = cache.get_seq_length(int(layer_idx))
@@ -899,29 +905,31 @@ class MidLayerUGPruneForwarder:
         self._subtiming_sync()
         map_start = time.perf_counter()
         if self._supports_fast_frozen_selection(original_tokens, config):
-            fused_scores, layer_keys, map_stats = self._extract_fused_map_torch(
-                hidden_states=hidden_states,
-                input_ids=input_ids,
-                query_token_positions=query_token_positions,
-                selector_config=config,
-            )
+            with self._profile_scope("score_construction", method="k12_original"):
+                fused_scores, layer_keys, map_stats = self._extract_fused_map_torch(
+                    hidden_states=hidden_states,
+                    input_ids=input_ids,
+                    query_token_positions=query_token_positions,
+                    selector_config=config,
+                )
             self._subtiming_sync()
             map_latency = time.perf_counter() - map_start
             self._subtiming_sync()
             selection_start = time.perf_counter()
-            selection, selected_tensor = self._selection_from_fused_torch(
-                scores=fused_scores,
-                sample_id=sample_id,
-                original_tokens=original_tokens,
-                seed=seed,
-                map_key="+".join(layer_keys),
-                map_stats=map_stats,
-                query_text=query_text,
-                query_token_status=query_token_status,
-                query_token_positions=query_token_positions,
-                selector_config=config,
-                target_visual_tokens=target_budget,
-            )
+            with self._profile_scope("ranking_and_index_materialization", method="k12_original"):
+                selection, selected_tensor = self._selection_from_fused_torch(
+                    scores=fused_scores,
+                    sample_id=sample_id,
+                    original_tokens=original_tokens,
+                    seed=seed,
+                    map_key="+".join(layer_keys),
+                    map_stats=map_stats,
+                    query_text=query_text,
+                    query_token_status=query_token_status,
+                    query_token_positions=query_token_positions,
+                    selector_config=config,
+                    target_visual_tokens=target_budget,
+                )
             self._subtiming_sync()
             selection_latency = time.perf_counter() - selection_start
             stat_diagnostics = {f"ug/map_{key}": value for key, value in selection.metadata.get("map_stats", {}).items()}
@@ -1002,18 +1010,19 @@ class MidLayerUGPruneForwarder:
     def _new_cache(self) -> Any:
         from transformers.cache_utils import DynamicCache
 
-        try:
-            return DynamicCache(config=self.language_model.config)
-        except TypeError as exc:
-            # Transformers 4.55 accepts ``config`` at the public constructor
-            # but forwards an unsupported ``max_cache_len`` argument to its
-            # dynamic layer.  The lazily growing form is semantically
-            # equivalent for these unbounded decoder caches.
-            if "max_cache_len" not in str(exc):
-                raise
-            cache = DynamicCache()
-            cache.append_new_layers(self.num_layers - 1)
-            return cache
+        with self._profile_scope("cache_construction", implementation="dynamic_cache"):
+            try:
+                return DynamicCache(config=self.language_model.config)
+            except TypeError as exc:
+                # Transformers 4.55 accepts ``config`` at the public constructor
+                # but forwards an unsupported ``max_cache_len`` argument to its
+                # dynamic layer.  The lazily growing form is semantically
+                # equivalent for these unbounded decoder caches.
+                if "max_cache_len" not in str(exc):
+                    raise
+                cache = DynamicCache()
+                cache.append_new_layers(self.num_layers - 1)
+                return cache
 
     def _base_cache_diagnostics(self, state: LayerAwareCacheState) -> dict[str, Any]:
         return {
@@ -1132,34 +1141,35 @@ class MidLayerUGPruneForwarder:
             )
         selection = selected.selection
         fused = selected.fused
-        if selected.selected_indices_tensor is not None:
-            selected_positions = selected_positions_for_retained_tensor(
-                self.torch,
-                input_ids,
-                self.image_token_id,
-                selected.selected_indices_tensor,
-                sort_retained=True,
-            )
-        else:
-            selected_positions = selected_positions_for_retained(
-                self.torch,
-                input_ids,
-                self.image_token_id,
-                selection.selected_indices,
-                sort_retained=True,
-            )
-        pruned_hidden = early_hidden[:, selected_positions, :]
-        pruned_attention_mask = attention_mask[:, selected_positions].clone()
-        if self.selector_config.position_mode == "gap_preserving":
-            pruned_position_ids = selected_positions.unsqueeze(0).to(
-                device=inputs_embeds.device,
-                dtype=self.torch.long,
-            )
-        else:
-            pruned_position_ids = self.position_ids_for(
-                int(selected_positions.numel()),
-                inputs_embeds.device,
-            )
+        with self._profile_scope("index_position_mask_gather", method="k12_original"):
+            if selected.selected_indices_tensor is not None:
+                selected_positions = selected_positions_for_retained_tensor(
+                    self.torch,
+                    input_ids,
+                    self.image_token_id,
+                    selected.selected_indices_tensor,
+                    sort_retained=True,
+                )
+            else:
+                selected_positions = selected_positions_for_retained(
+                    self.torch,
+                    input_ids,
+                    self.image_token_id,
+                    selection.selected_indices,
+                    sort_retained=True,
+                )
+            pruned_hidden = early_hidden[:, selected_positions, :]
+            pruned_attention_mask = attention_mask[:, selected_positions].clone()
+            if self.selector_config.position_mode == "gap_preserving":
+                pruned_position_ids = selected_positions.unsqueeze(0).to(
+                    device=inputs_embeds.device,
+                    dtype=self.torch.long,
+                )
+            else:
+                pruned_position_ids = self.position_ids_for(
+                    int(selected_positions.numel()),
+                    inputs_embeds.device,
+                )
         late_cache = self._new_cache()
         late_proxy = CacheLengthProxy(late_cache, default_layer_idx=self.prune_after_layer)
 
@@ -1195,8 +1205,9 @@ class MidLayerUGPruneForwarder:
             generated_tokens_cached=0,
         )
         self.assert_cache_lengths(state)
-        prompt_early_cache_bytes = cache_tensor_bytes(early_cache)
-        prompt_late_cache_bytes = cache_tensor_bytes(late_cache)
+        with self._profile_scope("prompt_kv_snapshot", method="k12_original"):
+            prompt_early_cache_bytes = cache_tensor_bytes(early_cache)
+            prompt_late_cache_bytes = cache_tensor_bytes(late_cache)
         diagnostics = {
             "ug/frozen_config": FROZEN_UG_GAP58_NAME,
             "ug/prune_after_layer": self.prune_after_layer,
@@ -1310,21 +1321,22 @@ class MidLayerUGPruneForwarder:
         generated_ids: list[Any] = []
         self._cuda_sync()
         prefill_start = time.perf_counter()
-        with self.torch.inference_mode():
-            prefill = self.prefill_with_layer_aware_cache(
-                inputs_embeds=inputs_embeds,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                sample_id=sample_id,
-                original_tokens=original_tokens,
-                seed=seed,
-                query_text=query_text,
-                query_token_status=query_token_status,
-                query_token_positions=query_token_positions,
-                selection=selection,
-                selection_mode=selection_mode,
-            )
-            next_token = self.torch.argmax(prefill.logits[:, -1, :], dim=-1, keepdim=True)
+        with self._profile_scope("first_generated_token", method="k12_original"):
+            with self.torch.inference_mode():
+                prefill = self.prefill_with_layer_aware_cache(
+                    inputs_embeds=inputs_embeds,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    sample_id=sample_id,
+                    original_tokens=original_tokens,
+                    seed=seed,
+                    query_text=query_text,
+                    query_token_status=query_token_status,
+                    query_token_positions=query_token_positions,
+                    selection=selection,
+                    selection_mode=selection_mode,
+                )
+                next_token = self.torch.argmax(prefill.logits[:, -1, :], dim=-1, keepdim=True)
         self._cuda_sync()
         prefill_latency = time.perf_counter() - prefill_start
         generated_ids.append(next_token)
@@ -1335,8 +1347,9 @@ class MidLayerUGPruneForwarder:
         decode_start = time.perf_counter()
         with self.torch.inference_mode():
             while len(generated_ids) < max_new_tokens and not finished:
-                logits = self.decode_one_with_layer_aware_cache(state, next_token)
-                next_token = self.torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+                with self._profile_scope("later_decode_step", method="k12_original", step=len(generated_ids)):
+                    logits = self.decode_one_with_layer_aware_cache(state, next_token)
+                    next_token = self.torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
                 generated_ids.append(next_token)
                 finished = bool(eos_ids and int(next_token.item()) in eos_ids)
         self._cuda_sync()
@@ -1355,8 +1368,9 @@ class MidLayerUGPruneForwarder:
             "time_to_first_token_s": prefill_latency,
             "decode_latency_s": decode_latency,
         }
-        final_early_cache_bytes = cache_tensor_bytes(state.early_cache)
-        final_late_cache_bytes = cache_tensor_bytes(state.late_cache)
+        with self._profile_scope("final_kv_snapshot", method="k12_original"):
+            final_early_cache_bytes = cache_tensor_bytes(state.early_cache)
+            final_late_cache_bytes = cache_tensor_bytes(state.late_cache)
         diagnostics.update(
             {
                 "cache/final_early_bank_bytes": final_early_cache_bytes,

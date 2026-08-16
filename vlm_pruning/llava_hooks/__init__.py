@@ -31,6 +31,15 @@ from .progressive_pruning import (
     uniform_original_indices,
     validate_schedule,
 )
+from .runtime_profile import (
+    HardwareProfileMixin,
+    ProfileRecord,
+    ProfiledMidLayerForwarder,
+    ProfiledProgressiveForwarder,
+    RuntimeProfiler,
+    StageReplay,
+    load_stage_replay,
+)
 
 __all__ = [
     "CacheLengthProxy",
@@ -60,4 +69,11 @@ __all__ = [
     "realized_visual_trace",
     "uniform_original_indices",
     "validate_schedule",
+    "HardwareProfileMixin",
+    "ProfileRecord",
+    "ProfiledMidLayerForwarder",
+    "ProfiledProgressiveForwarder",
+    "RuntimeProfiler",
+    "StageReplay",
+    "load_stage_replay",
 ]

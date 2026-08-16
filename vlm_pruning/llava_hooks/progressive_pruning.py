@@ -407,19 +407,21 @@ class ProgressivePruneForwarder(MidLayerUGPruneForwarder):
         recomputed = False
         derived_seed: int | None = None
         if event.selector in {"query_topk", "query_topk_merge", "none"}:
-            scores, _ = self.score_current_visual_tokens(
-                hidden_states,
-                input_ids=input_ids,
-                original_positions=original_positions,
-                query_original_positions=query_original_positions,
-            )
-            score_checksum = _tensor_checksum(scores)
+            with self._profile_scope("score_construction", boundary=event.boundary):
+                scores, _ = self.score_current_visual_tokens(
+                    hidden_states,
+                    input_ids=input_ids,
+                    original_positions=original_positions,
+                    query_original_positions=query_original_positions,
+                )
+                score_checksum = _tensor_checksum(scores)
             recomputed = True
-            if event.selector == "none":
-                selected: list[int] = []
-            else:
-                ranked_local = self.torch.argsort(scores, descending=True, stable=True)
-                selected = sorted(incoming[int(value)] for value in ranked_local[: event.budget].detach().cpu().tolist())
+            with self._profile_scope("ranking_and_index_materialization", boundary=event.boundary):
+                if event.selector == "none":
+                    selected: list[int] = []
+                else:
+                    ranked_local = self.torch.argsort(scores, descending=True, stable=True)
+                    selected = sorted(incoming[int(value)] for value in ranked_local[: event.budget].detach().cpu().tolist())
         else:
             derived_seed = deterministic_stage_seed(
                 sample_id=sample_id,
@@ -441,22 +443,23 @@ class ProgressivePruneForwarder(MidLayerUGPruneForwarder):
         incoming_original_indices: Sequence[int],
         selected_original_indices: Sequence[int],
     ) -> tuple[Any, Any, Any, Any]:
-        ids = input_ids[0] if input_ids.ndim == 2 else input_ids
-        image_positions = self.torch.nonzero(ids == self.image_token_id, as_tuple=False).flatten()
-        if int(image_positions.numel()) != len(incoming_original_indices):
-            raise SelectorError("Current image-position count does not match surviving original indices")
-        selected_set = set(int(value) for value in selected_original_indices)
-        keep_mask = self.torch.ones(ids.shape[0], dtype=self.torch.bool, device=ids.device)
-        for local, original in enumerate(incoming_original_indices):
-            if int(original) not in selected_set:
-                keep_mask[image_positions[local]] = False
-        keep_positions = self.torch.nonzero(keep_mask, as_tuple=False).flatten()
-        return (
-            hidden_states.index_select(1, keep_positions),
-            input_ids.index_select(1, keep_positions),
-            attention_mask.index_select(1, keep_positions),
-            original_positions.index_select(0, keep_positions),
-        )
+        with self._profile_scope("index_position_mask_gather", method="progressive"):
+            ids = input_ids[0] if input_ids.ndim == 2 else input_ids
+            image_positions = self.torch.nonzero(ids == self.image_token_id, as_tuple=False).flatten()
+            if int(image_positions.numel()) != len(incoming_original_indices):
+                raise SelectorError("Current image-position count does not match surviving original indices")
+            selected_set = set(int(value) for value in selected_original_indices)
+            keep_mask = self.torch.ones(ids.shape[0], dtype=self.torch.bool, device=ids.device)
+            for local, original in enumerate(incoming_original_indices):
+                if int(original) not in selected_set:
+                    keep_mask[image_positions[local]] = False
+            keep_positions = self.torch.nonzero(keep_mask, as_tuple=False).flatten()
+            return (
+                hidden_states.index_select(1, keep_positions),
+                input_ids.index_select(1, keep_positions),
+                attention_mask.index_select(1, keep_positions),
+                original_positions.index_select(0, keep_positions),
+            )
 
     def _selected_visual_masses(
         self,
@@ -498,37 +501,39 @@ class ProgressivePruneForwarder(MidLayerUGPruneForwarder):
         if not selected:
             raise SelectorError("Mass-preserving merge requires at least one retained visual token")
 
-        selected_slot = {original: slot for slot, original in enumerate(selected)}
-        selected_tensor = self.torch.tensor(selected, dtype=self.torch.long, device=hidden_states.device)
-        incoming_tensor = self.torch.tensor(incoming, dtype=self.torch.long, device=hidden_states.device)
-        selected_coords = self.torch.stack(
-            (selected_tensor // int(self.grid), selected_tensor % int(self.grid)), dim=1
-        ).to(dtype=self.torch.float32)
-        incoming_coords = self.torch.stack(
-            (incoming_tensor // int(self.grid), incoming_tensor % int(self.grid)), dim=1
-        ).to(dtype=self.torch.float32)
-        distances = ((incoming_coords[:, None, :] - selected_coords[None, :, :]) ** 2).sum(dim=2)
-        assignment_slots = self.torch.argmin(distances, dim=1)
-        for local, original in enumerate(incoming):
-            if original in selected_slot:
-                assignment_slots[local] = int(selected_slot[original])
+        with self._profile_scope("merge_assignment", method="nearest_raster"):
+            selected_slot = {original: slot for slot, original in enumerate(selected)}
+            selected_tensor = self.torch.tensor(selected, dtype=self.torch.long, device=hidden_states.device)
+            incoming_tensor = self.torch.tensor(incoming, dtype=self.torch.long, device=hidden_states.device)
+            selected_coords = self.torch.stack(
+                (selected_tensor // int(self.grid), selected_tensor % int(self.grid)), dim=1
+            ).to(dtype=self.torch.float32)
+            incoming_coords = self.torch.stack(
+                (incoming_tensor // int(self.grid), incoming_tensor % int(self.grid)), dim=1
+            ).to(dtype=self.torch.float32)
+            distances = ((incoming_coords[:, None, :] - selected_coords[None, :, :]) ** 2).sum(dim=2)
+            assignment_slots = self.torch.argmin(distances, dim=1)
+            for local, original in enumerate(incoming):
+                if original in selected_slot:
+                    assignment_slots[local] = int(selected_slot[original])
 
-        states = hidden_states[0] if hidden_states.ndim == 3 else hidden_states
-        image_states = states.index_select(0, image_positions).to(dtype=self.torch.float32)
-        masses = visual_masses.to(device=hidden_states.device, dtype=self.torch.float32)
-        weighted_sums = self.torch.zeros(
-            (len(selected), int(image_states.shape[1])),
-            device=hidden_states.device,
-            dtype=self.torch.float32,
-        )
-        output_masses = self.torch.zeros(
-            len(selected), device=hidden_states.device, dtype=self.torch.float32
-        )
-        weighted_sums.index_add_(0, assignment_slots, image_states * masses[:, None])
-        output_masses.index_add_(0, assignment_slots, masses)
-        if bool(self.torch.any(output_masses <= 0).item()):
-            raise SelectorError("Every retained merged visual token must have positive mass")
-        merged_states = weighted_sums / output_masses[:, None]
+        with self._profile_scope("merge_weighted_reduction", method="mass_preserving"):
+            states = hidden_states[0] if hidden_states.ndim == 3 else hidden_states
+            image_states = states.index_select(0, image_positions).to(dtype=self.torch.float32)
+            masses = visual_masses.to(device=hidden_states.device, dtype=self.torch.float32)
+            weighted_sums = self.torch.zeros(
+                (len(selected), int(image_states.shape[1])),
+                device=hidden_states.device,
+                dtype=self.torch.float32,
+            )
+            output_masses = self.torch.zeros(
+                len(selected), device=hidden_states.device, dtype=self.torch.float32
+            )
+            weighted_sums.index_add_(0, assignment_slots, image_states * masses[:, None])
+            output_masses.index_add_(0, assignment_slots, masses)
+            if bool(self.torch.any(output_masses <= 0).item()):
+                raise SelectorError("Every retained merged visual token must have positive mass")
+            merged_states = weighted_sums / output_masses[:, None]
 
         gathered_hidden, gathered_ids, gathered_mask, gathered_positions = self._gather_after_selection(
             hidden_states,
@@ -579,20 +584,31 @@ class ProgressivePruneForwarder(MidLayerUGPruneForwarder):
         prompt_length: int,
         visual_tokens: int,
     ) -> SegmentCache:
-        return SegmentCache(
+        with self._profile_scope(
+            "segment_cache_transition",
             segment_index=segment_index,
             start_layer=start_layer,
             end_layer=end_layer,
-            cache=self._new_cache(),
-            attention_mask=attention_mask.clone(),
-            prompt_length=int(prompt_length),
-            visual_tokens=int(visual_tokens),
-        )
+        ):
+            return SegmentCache(
+                segment_index=segment_index,
+                start_layer=start_layer,
+                end_layer=end_layer,
+                cache=self._new_cache(),
+                attention_mask=attention_mask.clone(),
+                prompt_length=int(prompt_length),
+                visual_tokens=int(visual_tokens),
+            )
 
     def _cache_for_segment(self, segment: SegmentCache) -> Any:
-        if segment.start_layer == 0:
-            return segment.cache
-        return CacheLengthProxy(segment.cache, default_layer_idx=segment.start_layer)
+        with self._profile_scope(
+            "cache_proxy_dispatch",
+            segment_index=segment.segment_index,
+            start_layer=segment.start_layer,
+        ):
+            if segment.start_layer == 0:
+                return segment.cache
+            return CacheLengthProxy(segment.cache, default_layer_idx=segment.start_layer)
 
     def assert_segment_cache_lengths(self, state: ProgressiveCacheState) -> None:
         for segment in state.segments:
@@ -904,7 +920,11 @@ class ProgressivePruneForwarder(MidLayerUGPruneForwarder):
         return ProgressivePrefillResult(logits=logits, state=state, diagnostics=diagnostics)
 
     def _diagnostics(self, state: ProgressiveCacheState) -> dict[str, Any]:
-        prompt_bytes = [cache_tensor_bytes(segment.cache) for segment in state.segments]
+        snapshot_component = (
+            "prompt_kv_snapshot" if state.generated_tokens_cached == 0 else "final_kv_live_diagnostics"
+        )
+        with self._profile_scope(snapshot_component, method="progressive"):
+            prompt_bytes = [cache_tensor_bytes(segment.cache) for segment in state.segments]
         return {
             "progressive/cache_implementation": "segment_aware_dynamic_cache",
             "progressive/position_mode": "gap_preserving",
@@ -992,20 +1012,21 @@ class ProgressivePruneForwarder(MidLayerUGPruneForwarder):
     ) -> ProgressiveGenerationResult:
         self._cuda_sync()
         prefill_start = time.perf_counter()
-        with self.torch.inference_mode():
-            prefill = self.prefill_with_segment_caches(
-                inputs_embeds=inputs_embeds,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                sample_id=sample_id,
-                seed=seed,
-                query_original_positions=query_original_positions,
-                initial_retained_indices=initial_retained_indices,
-                initial_selector=initial_selector,
-                initial_selection_checksum=initial_selection_checksum,
-                initial_derived_random_seed=initial_derived_random_seed,
-            )
-            next_token = self.torch.argmax(prefill.logits[:, -1, :], dim=-1, keepdim=True)
+        with self._profile_scope("first_generated_token", method="progressive"):
+            with self.torch.inference_mode():
+                prefill = self.prefill_with_segment_caches(
+                    inputs_embeds=inputs_embeds,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    sample_id=sample_id,
+                    seed=seed,
+                    query_original_positions=query_original_positions,
+                    initial_retained_indices=initial_retained_indices,
+                    initial_selector=initial_selector,
+                    initial_selection_checksum=initial_selection_checksum,
+                    initial_derived_random_seed=initial_derived_random_seed,
+                )
+                next_token = self.torch.argmax(prefill.logits[:, -1, :], dim=-1, keepdim=True)
         self._cuda_sync()
         prefill_latency = time.perf_counter() - prefill_start
         generated = [next_token]
@@ -1015,8 +1036,9 @@ class ProgressivePruneForwarder(MidLayerUGPruneForwarder):
         decode_start = time.perf_counter()
         with self.torch.inference_mode():
             while len(generated) < int(max_new_tokens) and not finished:
-                logits = self.decode_one_with_segment_caches(state, next_token)
-                next_token = self.torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+                with self._profile_scope("later_decode_step", method="progressive", step=len(generated)):
+                    logits = self.decode_one_with_segment_caches(state, next_token)
+                    next_token = self.torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
                 generated.append(next_token)
                 finished = bool(eos_ids and int(next_token.item()) in eos_ids)
         self._cuda_sync()
@@ -1040,8 +1062,11 @@ class ProgressivePruneForwarder(MidLayerUGPruneForwarder):
             "prefill_latency_s": prefill_latency,
             "time_to_first_token_s": prefill_latency,
             "decode_latency_s": decode_latency,
-            "cache/final_segment_bytes": [cache_tensor_bytes(segment.cache) for segment in state.segments],
         }
+        with self._profile_scope("final_kv_snapshot", method="progressive"):
+            diagnostics["cache/final_segment_bytes"] = [
+                cache_tensor_bytes(segment.cache) for segment in state.segments
+            ]
         diagnostics["cache/final_total_bytes"] = sum(diagnostics["cache/final_segment_bytes"])
         return ProgressiveGenerationResult(
             generated_ids=generated_ids,
