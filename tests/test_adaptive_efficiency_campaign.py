@@ -4,6 +4,7 @@ import unittest
 
 import numpy as np
 
+from scripts.finalize_adaptive_efficiency_goal import FinalAuditError, validate_registry
 from scripts.init_adaptive_efficiency_campaign import (
     box_iou,
     error_profile,
@@ -60,6 +61,45 @@ class AdaptiveA0AnalysisTests(unittest.TestCase):
         self.assertEqual(profile["candidate_correct_k12_wrong"], 1)
         self.assertEqual(profile["near_miss_candidate_iou_0_40_to_0_50_when_k12_correct"], 1)
         self.assertEqual(profile["catastrophic_candidate_iou_below_0_10_when_k12_correct"], 1)
+
+
+class AdaptiveFinalAuditTests(unittest.TestCase):
+    def registry(self) -> dict:
+        return {
+            "phases": {
+                name: {"status": "complete"}
+                for name in ("A0", "preflight", "fixed_methods", "official_methods", "route_gate", "timing")
+            },
+            "cells": {
+                **{
+                    name: {"status": "accepted"}
+                    for name in (
+                        "C448",
+                        "C480",
+                        "D1",
+                        "M448",
+                        "OFF_PDROP_L2_192",
+                        "OFF_PDROP_REROUTE_192",
+                        "GATE_SEED0",
+                        "GATE_SEED1",
+                        "GATE_SEED2",
+                        "GATE_RANDOM_RATE_CONTROL",
+                        "GATE_PRIVILEGED_ORACLE_CONTROL",
+                    )
+                },
+                **{
+                    name: {"status": "skipped"}
+                    for name in ("B1", "A1", "OFF_NUWA_192", "OFF_NUWA_REROUTE_192")
+                },
+            },
+        }
+
+    def test_final_auditor_uses_canonical_uppercase_a0_phase_key(self) -> None:
+        registry = self.registry()
+        self.assertEqual(validate_registry(registry)["required_phases_complete"][0], "A0")
+        registry["phases"]["a0"] = registry["phases"].pop("A0")
+        with self.assertRaisesRegex(FinalAuditError, "A0"):
+            validate_registry(registry)
 
 
 if __name__ == "__main__":

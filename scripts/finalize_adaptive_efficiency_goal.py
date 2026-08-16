@@ -204,7 +204,7 @@ def command_strings(value: Any) -> list[str]:
 
 
 def validate_registry(registry: dict[str, Any]) -> dict[str, Any]:
-    required_phases = ("a0", "preflight", "fixed_methods", "official_methods", "route_gate", "timing")
+    required_phases = ("A0", "preflight", "fixed_methods", "official_methods", "route_gate", "timing")
     missing = [name for name in required_phases if registry.get("phases", {}).get(name, {}).get("status") != "complete"]
     if missing:
         raise FinalAuditError(f"Campaign phases are not complete: {missing}")
