@@ -143,7 +143,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cell-id", choices=ALL_CELL_IDS, required=True)
     parser.add_argument("--mode", choices=sorted(MODES), required=True)
-    parser.add_argument("--attempt", type=int, default=1, choices=[1, 2])
+    parser.add_argument("--attempt", type=int, default=1, choices=[1, 2, 3])
     parser.add_argument("--repetition", type=int, choices=PROFILE_REPETITIONS)
     parser.add_argument("--order-position", type=int, choices=(1, 2, 3))
     parser.add_argument("--resume", action="store_true")

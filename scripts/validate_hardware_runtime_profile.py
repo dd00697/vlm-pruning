@@ -127,12 +127,13 @@ def required_components(cell_id: str) -> tuple[set[str], set[str]]:
             common
             | {
                 "fused_gather_merge",
+                "index_position_mask_gather",
                 "score_construction",
                 "ranking_and_index_materialization",
                 "segment_cache_transition",
                 "cache_proxy_dispatch",
             },
-            {"index_position_mask_gather", "merge_assignment", "merge_weighted_reduction"},
+            {"merge_assignment", "merge_weighted_reduction"},
         )
     if cell_id == "R_NATIVE_CACHE":
         return (
@@ -145,6 +146,7 @@ def required_components(cell_id: str) -> tuple[set[str], set[str]]:
             common
             | {
                 "fused_gather_merge",
+                "index_position_mask_gather",
                 "native_cache_direct",
                 "score_construction",
                 "ranking_and_index_materialization",
@@ -152,7 +154,6 @@ def required_components(cell_id: str) -> tuple[set[str], set[str]]:
             },
             {
                 "cache_proxy_dispatch",
-                "index_position_mask_gather",
                 "merge_assignment",
                 "merge_weighted_reduction",
             },
