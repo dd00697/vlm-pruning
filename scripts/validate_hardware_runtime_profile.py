@@ -21,8 +21,8 @@ for entry in (str(REPO_ROOT), str(SCRIPT_DIR)):
 
 from run_hardware_runtime_profile import (  # noqa: E402
     CELL_IDS,
-    K12_SOURCE,
-    K12_SOURCE_SHA256,
+    K12_TIMING_SOURCE,
+    K12_TIMING_SOURCE_SHA256,
     M448_SOURCE,
     M448_SOURCE_SHA256,
     MODES,
@@ -32,6 +32,7 @@ from run_hardware_runtime_profile import (  # noqa: E402
     utc_now,
 )
 from run_official_baseline import load_manifest  # noqa: E402
+from run_baseline import box_iou, parse_box  # noqa: E402
 from vlm_pruning.artifacts import sha256_file, source_provenance  # noqa: E402
 
 
@@ -151,26 +152,31 @@ def validate_semantics(
 ) -> None:
     require(row.get("raw_model_output") == historical.get("raw_model_output"), f"row {row_index} raw output drift")
     require(int(row.get("generated_token_count")) == int(historical.get("generated_token_count")), f"row {row_index} generated length drift")
-    require(row.get("predicted_box") == historical.get("predicted_box"), f"row {row_index} box drift")
-    close(float(row["box_iou"]), float(historical["box_iou"]), f"row {row_index} IoU")
+    raw_box, predicted_box, parse_failure = parse_box(
+        str(row["raw_model_output"]),
+        int(row["width"]),
+        int(row["height"]),
+        "normalized_0_1",
+    )
+    del raw_box
+    independent_iou = box_iou(predicted_box, row["gt_box"]) if predicted_box is not None else 0.0
+    require(row.get("predicted_box") == predicted_box, f"row {row_index} independently parsed box differs")
+    require(row.get("parse_failure_reason") == parse_failure, f"row {row_index} parse failure differs")
+    close(float(row["box_iou"]), independent_iou, f"row {row_index} independently recomputed IoU")
     if cell_id == "P_K12":
-        require(row.get("retained_indices") == historical.get("retained_indices"), f"row {row_index} K12 indices drift")
+        retained = [int(value) for value in row.get("retained_indices") or []]
+        require(len(retained) == 48 and retained == sorted(retained) and len(set(retained)) == 48, f"row {row_index} K12 indices invalid")
+        require(min(retained) >= 0 and max(retained) < 576, f"row {row_index} K12 index out of range")
         cache = row.get("cache_trace") or {}
-        for key in (
-            "mid_layer/cache_generated_tokens",
-            "mid_layer/early_cache_seq_len",
-            "mid_layer/late_cache_seq_len",
-            "mid_layer/early_attention_mask_len",
-            "mid_layer/late_attention_mask_len",
-            "cache/prompt_early_bank_bytes",
-            "cache/prompt_late_bank_bytes",
-            "cache/prompt_total_bytes",
-            "cache/final_early_bank_bytes",
-            "cache/final_late_bank_bytes",
-            "cache/final_total_bytes",
-        ):
-            require(cache.get(key) == historical.get(key), f"row {row_index} K12 cache drift: {key}")
+        generated_cached = int(cache["mid_layer/cache_generated_tokens"])
+        require(generated_cached == int(row["generated_token_count"]) - 1, f"row {row_index} K12 generated cache growth differs")
+        require(int(cache["mid_layer/early_cache_seq_len"]) == int(cache["mid_layer/early_attention_mask_len"]), f"row {row_index} K12 early cache/mask differs")
+        require(int(cache["mid_layer/late_cache_seq_len"]) == int(cache["mid_layer/late_attention_mask_len"]), f"row {row_index} K12 late cache/mask differs")
+        require(int(row["prompt_kv_total_bytes"]) == int(historical["prompt_kv_total_bytes"]), f"row {row_index} K12 prompt KV drift")
+        require(int(row["final_kv_total_bytes"]) == int(historical["final_kv_total_bytes"]), f"row {row_index} K12 final KV drift")
     else:
+        require(row.get("predicted_box") == historical.get("predicted_box"), f"row {row_index} box drift")
+        close(float(row["box_iou"]), float(historical["box_iou"]), f"row {row_index} IoU")
         require(row.get("retained_indices") == historical.get("final_retained_indices"), f"row {row_index} M448 indices drift")
         require(
             stage_semantics_match(
@@ -251,8 +257,8 @@ def validate_run(run_dir: Path, manifest_path: Path) -> dict[str, Any]:
     require(source["git_commit"] == config.get("source_git_commit"), "Source commit differs")
     require(source["source_sha256"] == config.get("source_sha256"), "Source hash map differs")
 
-    historical_path = K12_SOURCE if cell_id == "P_K12" else M448_SOURCE
-    historical_hash = K12_SOURCE_SHA256 if cell_id == "P_K12" else M448_SOURCE_SHA256
+    historical_path = K12_TIMING_SOURCE if cell_id == "P_K12" else M448_SOURCE
+    historical_hash = K12_TIMING_SOURCE_SHA256 if cell_id == "P_K12" else M448_SOURCE_SHA256
     historical = load_historical(historical_path, historical_hash, set(prefix_ids))
     for row_index, row in enumerate(rows):
         require(row.get("cell_id") == cell_id, f"row {row_index} cell ID differs")

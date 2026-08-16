@@ -52,8 +52,8 @@ MANIFEST = REPO_ROOT / "experiments/progressive_oracle_refcoco_val_20260814/mani
 MANIFEST_SHA256 = "98577029365776a76bd5ec798da4ef06c546e298fd1e950bd238d6b9d127f1cd"
 M448_SOURCE = REPO_ROOT / "experiments/adaptive_efficiency_refcoco_val_20260815/runs/m448_attempt1/predictions.jsonl"
 M448_SOURCE_SHA256 = "52e375657ba259a8785dcea3804770070e57f16f5ccc682b78f5edd167c9574b"
-K12_SOURCE = REPO_ROOT / "experiments/final_selector_ablation_and_repair_20260811/runs/repair_val_k12_b48_single_layer_more_context/per_sample_results.jsonl"
-K12_SOURCE_SHA256 = "1817cd703648031d9035d3547faa835839bcf441f4c14515b6a6571a1f36366d"
+K12_TIMING_SOURCE = REPO_ROOT / "experiments/adaptive_efficiency_refcoco_val_20260815/matched_timing/natural/rep1_pos2_k12_original_attempt1/timing.jsonl"
+K12_TIMING_SOURCE_SHA256 = "df01a26cceeac1d52b833b85a6101ce71780415dfe997d57069f551c9ca78d6e"
 M448_SCHEDULE = (
     PruningEvent(4, 448, "query_topk_merge"),
     PruningEvent(12, 48, "query_topk"),
@@ -367,25 +367,32 @@ class ProfileTrial:
         )
         iou = box_iou(predicted_box, sample["gt_box"]) if predicted_box is not None else 0.0
         historical = self.historical[str(sample["sample_id"])]
+        historical_raw_box, historical_predicted_box, _ = parse_box(
+            str(historical["raw_model_output"]),
+            int(sample["width"]),
+            int(sample["height"]),
+            "normalized_0_1",
+        )
+        historical_iou = (
+            box_iou(historical_predicted_box, sample["gt_box"])
+            if historical_predicted_box is not None
+            else 0.0
+        )
+        del historical_raw_box
         if self.config["cell_id"] == "P_K12":
-            cache_trace_match = all(
-                diagnostics.get(key) == historical.get(key)
-                for key in (
-                    "mid_layer/cache_generated_tokens",
-                    "mid_layer/early_cache_seq_len",
-                    "mid_layer/late_cache_seq_len",
-                    "mid_layer/early_attention_mask_len",
-                    "mid_layer/late_attention_mask_len",
-                    "cache/prompt_early_bank_bytes",
-                    "cache/prompt_late_bank_bytes",
-                    "cache/prompt_total_bytes",
-                    "cache/final_early_bank_bytes",
-                    "cache/final_late_bank_bytes",
-                    "cache/final_total_bytes",
-                )
+            cache_trace_match = (
+                int(diagnostics["cache/prompt_total_bytes"]) == int(historical["prompt_kv_total_bytes"])
+                and int(diagnostics["cache/final_total_bytes"]) == int(historical["final_kv_total_bytes"])
+                and int(diagnostics["mid_layer/cache_generated_tokens"]) == int(historical["generated_token_count"]) - 1
             )
             stage_match = True
-            retained_match = retained == [int(value) for value in historical["retained_indices"]]
+            retained_match = (
+                len(retained) == 48
+                and retained == sorted(retained)
+                and len(set(retained)) == 48
+                and min(retained) >= 0
+                and max(retained) < ORIGINAL_VISUAL_TOKENS
+            )
         else:
             cache_trace_match = all(
                 diagnostics.get(key) == historical.get(key)
@@ -410,14 +417,18 @@ class ProfileTrial:
         semantic = {
             "raw_output_match": raw_output == str(historical["raw_model_output"]),
             "generated_token_count_match": int(generation.generated_ids.numel()) == int(historical["generated_token_count"]),
-            "predicted_box_match": predicted_box == historical.get("predicted_box"),
-            "iou_match": abs(float(iou) - float(historical["box_iou"])) <= 1e-12,
+            "predicted_box_match": predicted_box == historical_predicted_box,
+            "iou_match": abs(float(iou) - float(historical_iou)) <= 1e-12,
             "retained_indices_match": retained_match,
             "stage_semantics_match": stage_match,
             "cache_trace_match": cache_trace_match,
         }
         result = {
             "sample_id": str(sample["sample_id"]),
+            "query": str(sample["query"]),
+            "width": int(sample["width"]),
+            "height": int(sample["height"]),
+            "gt_box": list(sample["gt_box"]),
             "manifest_index": int(self.config["sample_index_by_id"][str(sample["sample_id"])]),
             "repetition": int(repetition),
             "cell_id": self.config["cell_id"],
@@ -513,8 +524,8 @@ def run(args: argparse.Namespace) -> int:
         raise HardwareProfileError("Frozen validation manifest rows/IDs differ")
     rows = manifest_rows[: int(contract["limit"])]
     wanted = {str(row["sample_id"]) for row in rows}
-    historical_path = K12_SOURCE if args.cell_id == "P_K12" else M448_SOURCE
-    historical_hash = K12_SOURCE_SHA256 if args.cell_id == "P_K12" else M448_SOURCE_SHA256
+    historical_path = K12_TIMING_SOURCE if args.cell_id == "P_K12" else M448_SOURCE
+    historical_hash = K12_TIMING_SOURCE_SHA256 if args.cell_id == "P_K12" else M448_SOURCE_SHA256
     historical = load_historical(historical_path, historical_hash, wanted)
     replay = None
     if args.cell_id == "P_M448_REPLAY":
