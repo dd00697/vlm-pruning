@@ -41,6 +41,7 @@ from run_official_baseline import load_manifest, load_model, load_sample_images,
 from vlm_pruning.artifacts import sha256_file, source_provenance  # noqa: E402
 from vlm_pruning.features import resolve_query_token_positions  # noqa: E402
 from vlm_pruning.llava_hooks import (  # noqa: E402
+    FusedNativeProgressiveForwarder,
     OracleIndexArtifact,
     ProgressivePruneForwarder,
     PruningEvent,
@@ -134,6 +135,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name")
     parser.add_argument("--schedule", type=parse_schedule, default=())
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--runtime-implementation",
+        choices=["original", "fused_native"],
+        default="original",
+    )
     parser.add_argument("--pre-llm-selector", choices=["none", "oracle", "random", "uniform"], default="none")
     parser.add_argument("--pre-llm-budget", type=int)
     parser.add_argument("--oracle-teacher-layer", type=int, choices=[12, 20])
@@ -167,6 +173,15 @@ def validate_cli(args: argparse.Namespace) -> None:
         if not args.oracle_index_input.is_file():
             raise ProgressiveRunError(f"Oracle index input does not exist: {args.oracle_index_input}")
     validate_schedule(args.schedule)
+    if args.runtime_implementation == "fused_native":
+        required_prefix = (
+            PruningEvent(4, 448, "query_topk_merge"),
+            PruningEvent(12, 48, "query_topk"),
+        )
+        if tuple(args.schedule[:2]) != required_prefix:
+            raise ProgressiveRunError(
+                "fused_native is restricted to the registered M448 schedule prefix"
+            )
     if args.limit is not None and args.limit <= 0:
         raise ProgressiveRunError("--limit must be positive")
 
@@ -184,6 +199,7 @@ def source_contract() -> dict[str, Any]:
         Path("vlm_pruning/features/query_tokens.py"),
         Path("vlm_pruning/llava_hooks/mid_layer_pruning.py"),
         Path("vlm_pruning/llava_hooks/progressive_pruning.py"),
+        Path("vlm_pruning/llava_hooks/runtime_repairs.py"),
     ]
     provenance = source_provenance(REPO_ROOT, paths)
     # Campaign registry/report updates are intentionally tracked during a long
@@ -232,6 +248,7 @@ def build_config(args: argparse.Namespace, rows: list[dict[str, Any]], run_dir: 
         "grid": GRID,
         "schedule": [event.as_dict() for event in args.schedule],
         "schedule_string": schedule_string(args.schedule),
+        "runtime_implementation": str(args.runtime_implementation),
         "position_mode": "gap_preserving",
         "query_map": "current_boundary_hidden_query_patch_cosine_query_max",
         "query_tie_break": "descending_relevance_then_lower_surviving_original_raster_index",
@@ -254,7 +271,7 @@ IMMUTABLE_CONFIG_KEYS = {
     "model/name", "model/precision", "model/decoding", "model/max_new_tokens",
     "dataset/name", "dataset/split", "dataset/manifest", "dataset/manifest_checksum",
     "dataset/num_samples", "prompt/template", "original_visual_tokens", "grid",
-    "schedule", "position_mode", "query_map", "seed", "pre_llm_selector",
+    "schedule", "runtime_implementation", "position_mode", "query_map", "seed", "pre_llm_selector",
     "pre_llm_budget", "oracle_teacher_layer", "limit", "scope",
     "oracle_index_input", "oracle_index_input_sha256",
 }
@@ -448,7 +465,12 @@ def run(args: argparse.Namespace) -> int:
     torch, processor, model, device, model_env = load_model(args.model_path, args.precision)
     model_load_latency = time.perf_counter() - model_load_start
     image_token_id = int(getattr(model.config, "image_token_index", 32000))
-    forwarder = ProgressivePruneForwarder(
+    forwarder_class = (
+        FusedNativeProgressiveForwarder
+        if args.runtime_implementation == "fused_native"
+        else ProgressivePruneForwarder
+    )
+    forwarder = forwarder_class(
         torch,
         model,
         image_token_id=image_token_id,

@@ -137,6 +137,11 @@ def validate_config(config: dict[str, Any], manifest_path: Path, manifest_rows: 
     }
     for key, expected in checks.items():
         _equal(config.get(key), expected, f"config {key}")
+    implementation = config.get("runtime_implementation", "original")
+    if implementation not in {"original", "fused_native"}:
+        raise ProgressiveValidationError(
+            f"Unsupported runtime implementation {implementation}"
+        )
     if config.get("scope") == "discovery":
         _equal(len(manifest_rows), 1000, "discovery row count")
         _equal(sha256_file(manifest_path), EXPECTED_DISCOVERY_SHA256, "discovery manifest hash")
@@ -229,10 +234,13 @@ def validate_stage_traces(row: dict[str, Any], config: dict[str, Any], row_index
         _equal(trace.get("position_id_checksum"), json_checksum(expected_positions), f"{label} position checksum")
         _equal(int(trace.get("incoming_sequence_length", -1)), previous_sequence_length, f"{label} incoming sequence")
         _equal(int(trace.get("outgoing_sequence_length", -1)), len(expected_positions), f"{label} outgoing sequence")
-        if spec["selector"] in {"query_topk", "query_topk_merge", "none"}:
+        if spec["selector"] in {"query_topk", "query_topk_merge", "k12_original"}:
             _equal(trace.get("score_map_recomputed"), True, f"{label} score recomputation")
             if not isinstance(trace.get("score_map_checksum"), str) or len(trace["score_map_checksum"]) != 64:
                 raise ProgressiveValidationError(f"{label} score checksum missing")
+        elif spec["selector"] == "none":
+            _equal(trace.get("score_map_recomputed"), False, f"{label} zero-tail scoring")
+            _equal(trace.get("score_map_checksum"), None, f"{label} zero-tail score checksum")
         elif spec["selector"] == "random" and spec["boundary"] > 0:
             expected_seed = deterministic_stage_seed(
                 sample_id=str(row["sample_id"]),
@@ -467,7 +475,8 @@ def validate_run(
             "config_source_protocol": True,
             "exact_stage_budgets_and_subsets": True,
             "text_and_gap_positions_preserved": True,
-            "score_maps_recomputed": True,
+            "score_maps_recomputed_for_relevance_events_only": True,
+            "zero_tail_has_no_scoring_or_ranking": True,
             "registered_merge_mass_and_assignment_contract": True,
             "per_layer_segment_caches": True,
             "raw_outputs_rescored": True,

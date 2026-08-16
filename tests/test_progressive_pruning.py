@@ -20,9 +20,35 @@ from vlm_pruning.llava_hooks import (
     validate_schedule,
 )
 from vlm_pruning.selectors.base import SelectorError
+from scripts.run_progressive_oracle_refcoco import ProgressiveRunError, validate_cli
 
 
 class ProgressiveScheduleTests(unittest.TestCase):
+    def test_fused_native_runner_is_restricted_to_m448_prefix(self) -> None:
+        base = {
+            "pre_llm_selector": "none",
+            "pre_llm_budget": None,
+            "oracle_teacher_layer": None,
+            "oracle_index_input": None,
+            "runtime_implementation": "fused_native",
+            "limit": 2,
+        }
+        validate_cli(
+            SimpleNamespace(
+                **base,
+                schedule=validate_schedule(
+                    [(4, 448, "query_topk_merge"), (12, 48), (20, 0, "none")]
+                ),
+            )
+        )
+        with self.assertRaises(ProgressiveRunError):
+            validate_cli(
+                SimpleNamespace(
+                    **base,
+                    schedule=validate_schedule([(12, 48, "k12_original"), (20, 0, "none")]),
+                )
+            )
+
     def test_registered_progressive_averages(self) -> None:
         expected = {
             ((8, 256), (12, 48)): 206,
