@@ -42,9 +42,9 @@ REFERENCE_SOURCES = {
         "df01a26cceeac1d52b833b85a6101ce71780415dfe997d57069f551c9ca78d6e",
     ),
     "M448_OPT": (
-        Path("experiments/adaptive_efficiency_refcoco_val_20260815/runs/")
-        / "m448_attempt1/predictions.jsonl",
-        "52e375657ba259a8785dcea3804770070e57f16f5ccc682b78f5edd167c9574b",
+        Path("experiments/adaptive_efficiency_refcoco_val_20260815/matched_timing/natural/")
+        / "rep1_pos3_candidate_attempt1/timing.jsonl",
+        "ba171c2febf75af3246fad262686c74b2f7b07cfa5ebb5db4c113b7de6e1e34e",
     ),
     "Z_K12_0": (
         Path("experiments/hardware_aware_zero_tail_refcoco_val_20260816/zero_tail/runs/")
@@ -57,6 +57,11 @@ REFERENCE_SOURCES = {
         "8f7ac62796e4ec6af703b198fc06c204c5c6774677a190cb1f19898b611e3f75",
     ),
 }
+M448_RETAINED_SOURCE = (
+    Path("experiments/adaptive_efficiency_refcoco_val_20260815/runs/")
+    / "m448_attempt1/predictions.jsonl",
+    "52e375657ba259a8785dcea3804770070e57f16f5ccc682b78f5edd167c9574b",
+)
 EXPECTED_TRACES = {
     "K12_ORIGINAL": [576] * 12 + [48] * 20,
     "M448_OPT": [576] * 4 + [448] * 8 + [48] * 20,
@@ -235,6 +240,22 @@ def validate_reference_semantics(
             reference_retained = reference.get("final_retained_indices")
             if reference_retained is not None:
                 equal(row["retained_indices"], reference_retained, f"row {index} retained indices")
+    if config["method"] == "M448_OPT":
+        retained_relative, retained_hash = M448_RETAINED_SOURCE
+        retained_path = REPO_ROOT / retained_relative
+        equal(sha256_file(retained_path), retained_hash, "M448 retained-index reference hash")
+        retained_references = read_jsonl(retained_path)[:expected_rows]
+        equal(
+            [row["sample_id"] for row in rows],
+            [row["sample_id"] for row in retained_references],
+            "M448 retained-index reference order",
+        )
+        for index, (row, reference) in enumerate(zip(rows, retained_references)):
+            equal(
+                row["retained_indices"],
+                reference["final_retained_indices"],
+                f"row {index} M448 retained indices",
+            )
 
 
 def validate_run(run_dir: Path, manifest_path: Path, *, expected_rows: int) -> dict[str, Any]:
