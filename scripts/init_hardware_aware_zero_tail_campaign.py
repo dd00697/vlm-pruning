@@ -298,7 +298,7 @@ def validate_m448(registry: dict[str, Any], validation_ids: list[str]) -> dict[s
         "acc_at_0_5": float(metrics["quality/acc_at_0_5"]),
         "mean_iou": float(metrics["quality/mean_iou"]),
         "parse_rate": float(metrics["quality/parsed_box_rate"]),
-        "average_visual_tokens": float(metrics["tokens/average_visual_tokens"]),
+        "average_visual_tokens": float(metrics["tokens/candidate_average_visual_tokens"]),
     }
     for key, expected in EXPECTED_M448_METRICS.items():
         if abs(normalized_metrics[key] - expected) > 1e-12:
