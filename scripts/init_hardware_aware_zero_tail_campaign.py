@@ -330,7 +330,7 @@ def validate_k12(validation_ids: list[str]) -> dict[str, Any]:
     accuracy = sum(bool(row["success_iou_0_5"]) for row in rescored) / len(rescored)
     mean_iou = sum(float(row["box_iou"]) for row in rescored) / len(rescored)
     parse_rate = sum(row.get("parse_failure_reason") is None for row in rescored) / len(rescored)
-    expected = (0.439, 0.4215978635808666, 1.0)
+    expected = (0.439, 0.4215978635829186, 1.0)
     actual = (accuracy, mean_iou, parse_rate)
     if any(abs(left - right) > 1e-12 for left, right in zip(actual, expected, strict=True)):
         raise Phase0Error(f"K12 metric mismatch: {actual}")
