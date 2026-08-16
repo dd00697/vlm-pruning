@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -61,6 +62,38 @@ class HardwareProfileValidationError(RuntimeError):
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise HardwareProfileValidationError(message)
+
+
+def source_hashes_at_commit(commit: str, paths: tuple[Path, ...]) -> dict[str, str]:
+    """Hash the executable sources from the run's recorded Git epoch."""
+    try:
+        resolved = subprocess.check_output(
+            ["git", "rev-parse", "--verify", f"{commit}^{{commit}}"],
+            cwd=REPO_ROOT,
+            text=True,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise HardwareProfileValidationError(
+            f"Recorded source commit is unavailable: {commit}"
+        ) from exc
+    if resolved != commit:
+        raise HardwareProfileValidationError(
+            f"Recorded source commit is not canonical: {commit} != {resolved}"
+        )
+    hashes: dict[str, str] = {}
+    for path in paths:
+        relative = path.as_posix()
+        try:
+            payload = subprocess.check_output(
+                ["git", "show", f"{commit}:{relative}"],
+                cwd=REPO_ROOT,
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise HardwareProfileValidationError(
+                f"Recorded source path is unavailable at {commit}: {relative}"
+            ) from exc
+        hashes[relative] = hashlib.sha256(payload).hexdigest()
+    return hashes
 
 
 def canonical_bytes(value: Any) -> bytes:
@@ -325,9 +358,10 @@ def validate_run(run_dir: Path, manifest_path: Path) -> dict[str, Any]:
     require(actual_order == expected_order, "Profile row sample/repetition order differs")
     config_sha = sha256_file(run_dir / "config.json")
     require(all(row.get("config_sha256") == config_sha for row in rows), "Row config hash differs")
-    source = source_provenance(REPO_ROOT, SOURCE_PATHS)
-    require(source["git_commit"] == config.get("source_git_commit"), "Source commit differs")
-    require(source["source_sha256"] == config.get("source_sha256"), "Source hash map differs")
+    recorded_commit = str(config.get("source_git_commit") or "")
+    recorded_hashes = source_hashes_at_commit(recorded_commit, SOURCE_PATHS)
+    require(recorded_hashes == config.get("source_sha256"), "Recorded source hash map differs")
+    validator_source = source_provenance(REPO_ROOT, SOURCE_PATHS)
 
     historical_path = K12_TIMING_SOURCE if cell_id == "P_K12" else M448_SOURCE
     historical_hash = K12_TIMING_SOURCE_SHA256 if cell_id == "P_K12" else M448_SOURCE_SHA256
@@ -384,6 +418,8 @@ def validate_run(run_dir: Path, manifest_path: Path) -> dict[str, Any]:
         "profiles_sha256": sha256_file(run_dir / "profiles.jsonl"),
         "metrics_sha256": sha256_file(run_dir / "metrics.json"),
         "source_git_commit": config["source_git_commit"],
+        "validator_git_commit": validator_source["git_commit"],
+        "validator_source_sha256": validator_source["source_sha256"],
         "recomputed": recomputed,
     }
     if config.get("torch_profiler_capture"):

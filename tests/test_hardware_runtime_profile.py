@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import subprocess
 import unittest
+from pathlib import Path
 
 from scripts.run_hardware_runtime_profile import (
     MODES,
@@ -14,11 +16,26 @@ from scripts.run_hardware_runtime_profile import (
 from scripts.validate_hardware_runtime_profile import (
     HardwareProfileValidationError,
     required_components,
+    source_hashes_at_commit,
     validate_profile_components,
 )
 
 
 class HardwareProfileProtocolTests(unittest.TestCase):
+    def test_historical_source_hashes_are_resolved_from_recorded_commit(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo_root, text=True
+        ).strip()
+        paths = (Path("vlm_pruning/artifacts.py"),)
+        expected = subprocess.check_output(
+            ["git", "show", f"{commit}:{paths[0].as_posix()}"], cwd=repo_root
+        )
+        hashes = source_hashes_at_commit(commit, paths)
+        import hashlib
+
+        self.assertEqual(hashes[paths[0].as_posix()], hashlib.sha256(expected).hexdigest())
+
     def test_frozen_modes_encode_two_twenty_and_profile_contracts(self) -> None:
         self.assertEqual(MODES["smoke2"], {"limit": 2, "warmup": 0, "repetitions": 1})
         self.assertEqual(MODES["smoke20"], {"limit": 20, "warmup": 2, "repetitions": 1})
