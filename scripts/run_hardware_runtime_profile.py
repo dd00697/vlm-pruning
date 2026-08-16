@@ -64,7 +64,17 @@ CELL_IDS = ("P_K12", "P_M448", "P_M448_REPLAY")
 MODES = {
     "smoke2": {"limit": 2, "warmup": 0, "repetitions": 1},
     "smoke20": {"limit": 20, "warmup": 2, "repetitions": 1},
-    "profile100": {"limit": 100, "warmup": 20, "repetitions": 5},
+    # Full profiling is split into isolated trials so method order can be
+    # counterbalanced across the five repetitions without co-resident models.
+    "profile100": {"limit": 100, "warmup": 20, "repetitions": 1},
+}
+PROFILE_REPETITIONS = (1, 2, 3, 4, 5)
+PROFILE_ORDER_PLAN = {
+    1: ("P_K12", "P_M448", "P_M448_REPLAY"),
+    2: ("P_M448", "P_M448_REPLAY", "P_K12"),
+    3: ("P_M448_REPLAY", "P_K12", "P_M448"),
+    4: ("P_K12", "P_M448", "P_M448_REPLAY"),
+    5: ("P_M448", "P_M448_REPLAY", "P_K12"),
 }
 SOURCE_PATHS = (
     Path("scripts/run_hardware_runtime_profile.py"),
@@ -121,7 +131,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cell-id", choices=CELL_IDS, required=True)
     parser.add_argument("--mode", choices=sorted(MODES), required=True)
     parser.add_argument("--attempt", type=int, default=1, choices=[1, 2])
-    return parser.parse_args()
+    parser.add_argument("--repetition", type=int, choices=PROFILE_REPETITIONS)
+    parser.add_argument("--order-position", type=int, choices=(1, 2, 3))
+    parser.add_argument("--resume", action="store_true")
+    args = parser.parse_args()
+    if args.mode == "profile100":
+        if args.repetition is None or args.order_position is None:
+            parser.error("profile100 requires --repetition and --order-position")
+        expected_position = PROFILE_ORDER_PLAN[args.repetition].index(args.cell_id) + 1
+        if args.order_position != expected_position:
+            parser.error(
+                f"counterbalanced plan requires position {expected_position} for "
+                f"{args.cell_id} repetition {args.repetition}"
+            )
+    elif args.repetition is not None or args.order_position is not None:
+        parser.error("--repetition/--order-position are reserved for profile100")
+    return args
 
 
 def relative(path: Path) -> str:
@@ -163,10 +188,23 @@ def assert_storage_and_gpu_idle() -> dict[str, Any]:
     return {"available_bytes": usage.free, "available_gib": usage.free / 1024**3, "gpu": gpu, "active_compute_processes": active}
 
 
-def output_dir(cell_id: str, mode: str, attempt: int) -> Path:
+def output_dir(
+    cell_id: str,
+    mode: str,
+    attempt: int,
+    *,
+    repetition: int | None = None,
+    order_position: int | None = None,
+) -> Path:
     if mode.startswith("smoke"):
         return CAMPAIGN_ROOT / "profiling/smokes" / f"{cell_id.lower()}_{mode}_attempt{attempt}"
-    return CAMPAIGN_ROOT / "profiling" / f"{cell_id.lower()}_attempt{attempt}"
+    if repetition is None or order_position is None:
+        raise HardwareProfileError("Full profile output requires repetition and order position")
+    return (
+        CAMPAIGN_ROOT
+        / "profiling/trials"
+        / f"rep{repetition}_pos{order_position}_{cell_id.lower()}_attempt{attempt}"
+    )
 
 
 def load_historical(path: Path, expected_hash: str, wanted: set[str]) -> dict[str, dict[str, Any]]:
@@ -186,6 +224,75 @@ def load_historical(path: Path, expected_hash: str, wanted: set[str]) -> dict[st
     if set(output) != wanted:
         raise HardwareProfileError(f"Historical source misses {len(wanted - set(output))} profile samples")
     return output
+
+
+def read_jsonl_prefix(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if not path.exists():
+        return rows
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                raise HardwareProfileError(f"Blank partial row at line {line_number}: {path}")
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                raise HardwareProfileError(f"Non-object partial row at line {line_number}: {path}")
+            rows.append(row)
+    return rows
+
+
+def validate_resume_prefix(
+    rows: list[dict[str, Any]],
+    *,
+    expected_order: list[tuple[str, int]],
+    config_sha256: str,
+) -> None:
+    if len(rows) > len(expected_order):
+        raise HardwareProfileError("Partial profile contains more rows than the frozen contract")
+    actual_order = [(str(row.get("sample_id")), int(row.get("repetition", -1))) for row in rows]
+    if actual_order != expected_order[: len(rows)]:
+        raise HardwareProfileError("Partial profile is not an exact ordered manifest prefix")
+    if len(actual_order) != len(set(actual_order)):
+        raise HardwareProfileError("Partial profile contains duplicate sample/repetition rows")
+    for row_index, row in enumerate(rows):
+        if row.get("config_sha256") != config_sha256:
+            raise HardwareProfileError(f"Partial row {row_index} has a different config hash")
+        if row.get("semantic_match") is not True:
+            raise HardwareProfileError(f"Partial row {row_index} did not pass semantic parity")
+
+
+def summarize_torch_profiler(profile: Any) -> dict[str, Any]:
+    events = list(profile.events())
+    kernel_events = [event for event in events if str(getattr(event, "device_type", "")).lower().endswith("cuda")]
+    averages = list(profile.key_averages(group_by_input_shape=True))
+    averages.sort(key=lambda event: float(getattr(event, "self_cuda_time_total", 0.0)), reverse=True)
+    operators = []
+    for event in averages[:100]:
+        operators.append(
+            {
+                "name": str(getattr(event, "key", "")),
+                "count": int(getattr(event, "count", 0)),
+                "self_cpu_time_total_us": float(getattr(event, "self_cpu_time_total", 0.0)),
+                "cpu_time_total_us": float(getattr(event, "cpu_time_total", 0.0)),
+                "self_cuda_time_total_us": float(getattr(event, "self_cuda_time_total", 0.0)),
+                "cuda_time_total_us": float(getattr(event, "cuda_time_total", 0.0)),
+                "input_shapes": jsonable(getattr(event, "input_shapes", None)),
+            }
+        )
+    return {
+        "schema_version": 1,
+        "capture_scope": "one_post_measurement_natural_inference",
+        "event_count": len(events),
+        "cuda_kernel_event_count": len(kernel_events),
+        "operator_shape_group_count": len(averages),
+        "operator_self_cpu_time_total_us": sum(
+            float(getattr(event, "self_cpu_time_total", 0.0)) for event in averages
+        ),
+        "operator_self_cuda_time_total_us": sum(
+            float(getattr(event, "self_cuda_time_total", 0.0)) for event in averages
+        ),
+        "operators_top100_by_self_cuda_time": operators,
+    }
 
 
 def compact_stage_traces(traces: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -318,6 +425,10 @@ class ProfileTrial:
             torch.cuda.reset_peak_memory_stats()
         wall_started = time.perf_counter()
         inputs, prep = prepare_full_inputs(torch, self.processor, self.model, self.device, images, prompt)
+        full_prompt_length = int(inputs["inputs_embeds"].shape[1])
+        text_token_count = full_prompt_length - ORIGINAL_VISUAL_TOKENS
+        if text_token_count <= 0:
+            raise HardwareProfileError("Expanded prompt does not contain a valid text-token complement")
         resolution = query_resolution(
             self.processor,
             text_prompt,
@@ -450,6 +561,12 @@ class ProfileTrial:
             "realized_visual_tokens_by_layer": realized_trace,
             "average_visual_tokens": sum(realized_trace) / 32,
             "visual_token_layer_work": sum(realized_trace),
+            "prompt_text_token_count": text_token_count,
+            "prompt_sequence_lengths_by_layer": [text_token_count + tokens for tokens in realized_trace],
+            "sequence_layer_work": sum(text_token_count + tokens for tokens in realized_trace),
+            "quadratic_sequence_layer_work": sum(
+                (text_token_count + tokens) ** 2 for tokens in realized_trace
+            ),
             "prompt_kv_total_bytes": int(diagnostics["cache/prompt_total_bytes"]),
             "final_kv_total_bytes": int(diagnostics["cache/final_total_bytes"]),
             "cache_trace": {
@@ -466,6 +583,10 @@ class ProfileTrial:
             "projector_latency_s": float(prep["projector_latency_s"]),
             "prefill_latency_s": float(diagnostics["llm_prefill_latency_s"]),
             "decode_latency_s": float(diagnostics["decode_latency_s"]),
+            "decode_latency_per_generated_token_s": (
+                float(diagnostics["decode_latency_s"])
+                / max(int(generation.generated_ids.numel()) - 1, 1)
+            ),
             "end_to_end_latency_s": float(wall_latency),
             "peak_allocated_gpu_bytes": int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0,
             "peak_reserved_gpu_bytes": int(torch.cuda.max_memory_reserved()) if torch.cuda.is_available() else 0,
@@ -480,6 +601,38 @@ class ProfileTrial:
         del inputs, prep, resolution, generation
         gc.collect()
         return result
+
+
+def capture_torch_profiler(trial: ProfileTrial, sample: dict[str, Any], run_dir: Path) -> dict[str, Any]:
+    torch = trial.torch
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+    with torch.profiler.profile(
+        activities=activities,
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=False,
+    ) as profile:
+        row = trial.infer(sample, 0)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    if row.get("semantic_match") is not True:
+        raise HardwareProfileError("PyTorch-profiler capture changed inference semantics")
+    trace_path = run_dir / "torch_profiler_trace.json"
+    profile.export_chrome_trace(str(trace_path))
+    summary = summarize_torch_profiler(profile)
+    summary.update(
+        {
+            "sample_id": row["sample_id"],
+            "raw_model_output": row["raw_model_output"],
+            "semantic_match": True,
+            "synchronization_policy": row["runtime_profile"]["synchronization_policy"],
+            "trace_sha256": sha256_file(trace_path),
+        }
+    )
+    atomic_write(run_dir / "torch_profiler_summary.json", canonical_bytes(summary))
+    return summary
 
 
 def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -498,6 +651,8 @@ def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "event_count_total": sum(int(value["count"]) for value in values),
         }
     scalar_fields = (
+        "vision_encoder_latency_s",
+        "projector_latency_s",
         "prefill_latency_s",
         "decode_latency_s",
         "end_to_end_latency_s",
@@ -505,7 +660,10 @@ def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "final_kv_total_bytes",
         "average_visual_tokens",
         "visual_token_layer_work",
+        "sequence_layer_work",
+        "quadratic_sequence_layer_work",
         "generated_token_count",
+        "decode_latency_per_generated_token_s",
     )
     return {
         "status": "measured_pending_independent_validation",
@@ -540,85 +698,157 @@ def run(args: argparse.Namespace) -> int:
     replay = None
     if args.cell_id == "P_M448_REPLAY":
         replay = load_stage_replay(M448_SOURCE, expected_sha256=M448_SOURCE_SHA256, sample_ids=wanted)
-    run_dir = output_dir(args.cell_id, args.mode, args.attempt)
-    if run_dir.exists():
+    run_dir = output_dir(
+        args.cell_id,
+        args.mode,
+        args.attempt,
+        repetition=args.repetition,
+        order_position=args.order_position,
+    )
+    if run_dir.exists() and not args.resume:
         raise HardwareProfileError(f"Profile run directory already exists: {run_dir}")
+    if not run_dir.exists() and args.resume:
+        raise HardwareProfileError(f"Cannot resume a missing profile run: {run_dir}")
     launch = assert_storage_and_gpu_idle()
     source = git_source()
+    global_repetition = int(args.repetition or 1)
     semantic_command = {
         "program": "scripts/run_hardware_runtime_profile.py",
         "cell_id": args.cell_id,
         "mode": args.mode,
         "attempt": args.attempt,
+        "global_repetition": global_repetition,
+        "counterbalanced_order_position": args.order_position,
         **contract,
     }
-    config = {
-        "schema_version": 1,
-        "created_at_utc": utc_now(),
-        "scope": "instrumentation_smoke" if args.mode.startswith("smoke") else "runtime_profile",
-        "cell_id": args.cell_id,
-        "mode": args.mode,
-        "attempt": args.attempt,
-        "limit": contract["limit"],
-        "warmup_examples": contract["warmup"],
-        "measured_repetitions_per_example": contract["repetitions"],
-        "manifest_path": relative(MANIFEST),
-        "manifest_sha256": MANIFEST_SHA256,
-        "manifest_prefix_order_sha256": hashlib.sha256("\n".join(str(row["sample_id"]) for row in rows).encode()).hexdigest(),
-        "sample_index_by_id": {str(row["sample_id"]): index for index, row in enumerate(rows)},
-        "historical_source_path": relative(historical_path),
-        "historical_source_sha256": historical_hash,
-        "historical_timing_source_path": relative(timing_historical_path),
-        "historical_timing_source_sha256": timing_historical_hash,
-        "model": MODEL,
-        "precision": "bf16",
-        "decoding": "deterministic_greedy",
-        "max_new_tokens": MAX_NEW_TOKENS,
-        "schedule": [event.as_dict() for event in M448_SCHEDULE] if args.cell_id != "P_K12" else [{"boundary": 12, "budget": 48, "selector": "original_k12_ug"}],
-        "replay_score_and_rank_disabled_only": args.cell_id == "P_M448_REPLAY",
-        "runtime_profiler": "synchronized_cpu_wall_and_cuda_event_v1",
-        "source_git_commit": source["git_commit"],
-        "source_sha256": source["source_sha256"],
-        "semantic_command": semantic_command,
-        "semantic_command_sha256": hashlib.sha256(json.dumps(semantic_command, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
-        "run_dir": relative(run_dir),
-        "launch_storage_and_gpu": launch,
-    }
-    run_dir.mkdir(parents=True)
-    atomic_write(run_dir / "config.json", canonical_bytes(config))
+    semantic_command_sha = hashlib.sha256(
+        json.dumps(semantic_command, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    if args.resume:
+        for forbidden in ("profiles.jsonl", "metrics.json", "integrity_report.json", "COMPLETED.json"):
+            if (run_dir / forbidden).exists():
+                raise HardwareProfileError(f"Refusing to resume after finalized output exists: {forbidden}")
+        with (run_dir / "config.json").open("r", encoding="utf-8") as handle:
+            config = json.load(handle)
+        required_resume_values = {
+            "cell_id": args.cell_id,
+            "mode": args.mode,
+            "attempt": args.attempt,
+            "global_repetition": global_repetition,
+            "counterbalanced_order_position": args.order_position,
+            "manifest_sha256": MANIFEST_SHA256,
+            "source_git_commit": source["git_commit"],
+            "source_sha256": source["source_sha256"],
+            "semantic_command_sha256": semantic_command_sha,
+            "run_dir": relative(run_dir),
+        }
+        for key, expected in required_resume_values.items():
+            if config.get(key) != expected:
+                raise HardwareProfileError(f"Resume config differs for {key}")
+        if not (run_dir / "environment.json").is_file():
+            raise HardwareProfileError("Resume run lacks its immutable environment artifact")
+    else:
+        config = {
+            "schema_version": 2,
+            "created_at_utc": utc_now(),
+            "scope": "instrumentation_smoke" if args.mode.startswith("smoke") else "runtime_profile",
+            "cell_id": args.cell_id,
+            "mode": args.mode,
+            "attempt": args.attempt,
+            "global_repetition": global_repetition,
+            "counterbalanced_order_position": args.order_position,
+            "limit": contract["limit"],
+            "warmup_examples": contract["warmup"],
+            "measured_repetitions_per_example": contract["repetitions"],
+            "manifest_path": relative(MANIFEST),
+            "manifest_sha256": MANIFEST_SHA256,
+            "manifest_prefix_order_sha256": hashlib.sha256(
+                "\n".join(str(row["sample_id"]) for row in rows).encode()
+            ).hexdigest(),
+            "sample_index_by_id": {
+                str(row["sample_id"]): index for index, row in enumerate(rows)
+            },
+            "historical_source_path": relative(historical_path),
+            "historical_source_sha256": historical_hash,
+            "historical_timing_source_path": relative(timing_historical_path),
+            "historical_timing_source_sha256": timing_historical_hash,
+            "model": MODEL,
+            "precision": "bf16",
+            "decoding": "deterministic_greedy",
+            "max_new_tokens": MAX_NEW_TOKENS,
+            "schedule": (
+                [event.as_dict() for event in M448_SCHEDULE]
+                if args.cell_id != "P_K12"
+                else [{"boundary": 12, "budget": 48, "selector": "original_k12_ug"}]
+            ),
+            "replay_score_and_rank_disabled_only": args.cell_id == "P_M448_REPLAY",
+            "runtime_profiler": "synchronized_cpu_wall_and_cuda_event_v1",
+            "torch_profiler_capture": args.mode == "profile100" and global_repetition == 1,
+            "nsight_systems": {
+                "available": shutil.which("nsys") is not None,
+                "status": "skipped_not_installed" if shutil.which("nsys") is None else "available_noninteractive",
+            },
+            "source_git_commit": source["git_commit"],
+            "source_sha256": source["source_sha256"],
+            "semantic_command": semantic_command,
+            "semantic_command_sha256": semantic_command_sha,
+            "run_dir": relative(run_dir),
+            "launch_storage_and_gpu": launch,
+        }
+        run_dir.mkdir(parents=True)
+        atomic_write(run_dir / "config.json", canonical_bytes(config))
     config_sha = sha256_file(run_dir / "config.json")
+    expected_order = [(str(sample["sample_id"]), global_repetition) for sample in rows]
+    partial = run_dir / "profiles.partial.jsonl"
+    measured = read_jsonl_prefix(partial) if args.resume else []
+    validate_resume_prefix(measured, expected_order=expected_order, config_sha256=config_sha)
+    model_load_started = time.perf_counter()
     trial = ProfileTrial(
         config,
         replay=replay,
         historical=historical,
         timing_historical=timing_historical,
     )
-    environment = {
-        "created_at_utc": utc_now(),
-        "python": sys.version,
-        "platform": platform.platform(),
-        "torch": trial.torch.__version__,
-        "cuda": trial.torch.version.cuda,
-        "model_environment": trial.model_environment,
-        "launch": launch,
-    }
-    atomic_write(run_dir / "environment.json", canonical_bytes(jsonable(environment)))
+    model_load_cold_start_s = time.perf_counter() - model_load_started
+    if not args.resume:
+        environment = {
+            "created_at_utc": utc_now(),
+            "python": sys.version,
+            "platform": platform.platform(),
+            "torch": trial.torch.__version__,
+            "cuda": trial.torch.version.cuda,
+            "model_environment": trial.model_environment,
+            "model_load_cold_start_s": model_load_cold_start_s,
+            "launch": launch,
+        }
+        atomic_write(run_dir / "environment.json", canonical_bytes(jsonable(environment)))
     for sample in manifest_rows[: int(contract["warmup"])]:
         trial.infer(sample, 0)
     if trial.torch.cuda.is_available():
         trial.torch.cuda.synchronize()
-    measured: list[dict[str, Any]] = []
-    partial = run_dir / "profiles.partial.jsonl"
-    with partial.open("w", encoding="utf-8") as handle:
-        for manifest_index, sample in enumerate(rows):
-            for repetition in range(1, int(contract["repetitions"]) + 1):
-                result = trial.infer(sample, repetition)
-                result["config_sha256"] = config_sha
-                result["source_git_commit"] = config["source_git_commit"]
-                measured.append(result)
-                handle.write(json.dumps(jsonable(result), sort_keys=True, ensure_ascii=True) + "\n")
-                handle.flush()
-            print(f"PROFILE {args.cell_id} {args.mode}: {manifest_index + 1}/{len(rows)}", flush=True)
+    with partial.open("a" if args.resume else "w", encoding="utf-8") as handle:
+        for row_index in range(len(measured), len(expected_order)):
+            sample = rows[row_index]
+            result = trial.infer(sample, global_repetition)
+            result["config_sha256"] = config_sha
+            result["source_git_commit"] = config["source_git_commit"]
+            measured.append(result)
+            handle.write(json.dumps(jsonable(result), sort_keys=True, ensure_ascii=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            print(f"PROFILE {args.cell_id} {args.mode}: {row_index + 1}/{len(rows)}", flush=True)
+    if config.get("torch_profiler_capture"):
+        trace_path = run_dir / "torch_profiler_trace.json"
+        summary_path = run_dir / "torch_profiler_summary.json"
+        if trace_path.exists() or summary_path.exists():
+            if not trace_path.is_file() or not summary_path.is_file():
+                raise HardwareProfileError("Incomplete prior PyTorch-profiler capture")
+            with summary_path.open("r", encoding="utf-8") as handle:
+                prior_summary = json.load(handle)
+            if prior_summary.get("trace_sha256") != sha256_file(trace_path):
+                raise HardwareProfileError("Prior PyTorch-profiler trace hash differs")
+        else:
+            capture_torch_profiler(trial, rows[0], run_dir)
     os.replace(partial, run_dir / "profiles.jsonl")
     metrics = aggregate(measured)
     atomic_write(run_dir / "metrics.json", canonical_bytes(metrics))

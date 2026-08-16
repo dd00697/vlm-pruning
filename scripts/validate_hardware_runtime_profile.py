@@ -143,6 +143,20 @@ def validate_profile_components(row: dict[str, Any], cell_id: str, row_index: in
     expected_ranges = {(0, 12), (12, 32)} if cell_id == "P_K12" else {(0, 4), (4, 12), (12, 32)}
     require({(start, end) for phase, start, end in segments if phase == "prefill"} == expected_ranges, f"row {row_index} prefill decoder ranges differ")
     require({(start, end) for phase, start, end in segments if phase == "decode"} == expected_ranges, f"row {row_index} decode decoder ranges differ")
+    sequence_trace = row.get("prompt_sequence_lengths_by_layer") or []
+    require(len(sequence_trace) == 32, f"row {row_index} lacks a 32-layer full sequence trace")
+    for record in records:
+        if record["component"] != "decoder_segment":
+            continue
+        metadata = record["metadata"]
+        start_layer = int(metadata["start_layer"])
+        if metadata["phase"] == "prefill":
+            require(
+                int(metadata["sequence_length"]) == int(sequence_trace[start_layer]),
+                f"row {row_index} decoder segment sequence length differs",
+            )
+        else:
+            require(int(metadata["sequence_length"]) == 1, f"row {row_index} decode input is not one token")
 
 
 def validate_semantics(
@@ -175,6 +189,16 @@ def validate_semantics(
         require(generated_cached == int(row["generated_token_count"]) - 1, f"row {row_index} K12 generated cache growth differs")
         require(int(cache["mid_layer/early_cache_seq_len"]) == int(cache["mid_layer/early_attention_mask_len"]), f"row {row_index} K12 early cache/mask differs")
         require(int(cache["mid_layer/late_cache_seq_len"]) == int(cache["mid_layer/late_attention_mask_len"]), f"row {row_index} K12 late cache/mask differs")
+        require(
+            int(cache["mid_layer/early_cache_seq_len"])
+            == int(row["prompt_sequence_lengths_by_layer"][0]) + generated_cached,
+            f"row {row_index} K12 early cache length differs",
+        )
+        require(
+            int(cache["mid_layer/late_cache_seq_len"])
+            == int(row["prompt_sequence_lengths_by_layer"][12]) + generated_cached,
+            f"row {row_index} K12 late cache length differs",
+        )
         require(int(row["prompt_kv_total_bytes"]) == int(historical["prompt_kv_total_bytes"]), f"row {row_index} K12 prompt KV drift")
         require(int(row["final_kv_total_bytes"]) == int(historical["final_kv_total_bytes"]), f"row {row_index} K12 final KV drift")
     else:
@@ -245,10 +269,16 @@ def validate_run(run_dir: Path, manifest_path: Path) -> dict[str, Any]:
         hashlib.sha256("\n".join(prefix_ids).encode()).hexdigest() == config.get("manifest_prefix_order_sha256"),
         "Manifest prefix order hash mismatch",
     )
+    global_repetition = int(config.get("global_repetition", 1))
+    expected_repetitions = (
+        [global_repetition]
+        if mode == "profile100"
+        else list(range(1, int(contract["repetitions"]) + 1))
+    )
     expected_order = [
         (sample_id, repetition)
         for sample_id in prefix_ids
-        for repetition in range(1, int(contract["repetitions"]) + 1)
+        for repetition in expected_repetitions
     ]
     actual_order = [(str(row.get("sample_id")), int(row.get("repetition"))) for row in rows]
     require(actual_order == expected_order, "Profile row sample/repetition order differs")
@@ -271,6 +301,20 @@ def validate_run(run_dir: Path, manifest_path: Path) -> dict[str, Any]:
         require(row.get("realized_visual_tokens_by_layer") == expected_trace, f"row {row_index} visual trace differs")
         close(float(row["average_visual_tokens"]), sum(expected_trace) / 32, f"row {row_index} average tokens")
         require(int(row["visual_token_layer_work"]) == sum(expected_trace), f"row {row_index} token work differs")
+        text_tokens = int(row["prompt_text_token_count"])
+        sequence_lengths = [text_tokens + tokens for tokens in expected_trace]
+        require(
+            row.get("prompt_sequence_lengths_by_layer") == sequence_lengths,
+            f"row {row_index} full sequence trace differs",
+        )
+        require(
+            int(row["sequence_layer_work"]) == sum(sequence_lengths),
+            f"row {row_index} full sequence work differs",
+        )
+        require(
+            int(row["quadratic_sequence_layer_work"]) == sum(length**2 for length in sequence_lengths),
+            f"row {row_index} quadratic sequence work differs",
+        )
         validate_profile_components(row, cell_id, row_index)
         validate_semantics(
             row,
@@ -284,7 +328,7 @@ def validate_run(run_dir: Path, manifest_path: Path) -> dict[str, Any]:
         require(len({row["raw_model_output"] for row in sample_rows}) == 1, f"Repeated output drift: {sample_id}")
         require(len({row["retained_indices_checksum"] for row in sample_rows}) == 1, f"Repeated index drift: {sample_id}")
     recomputed = recompute_metrics(rows, metrics)
-    return {
+    report = {
         "schema_version": 1,
         "status": "pass",
         "validated_at_utc": utc_now(),
@@ -301,6 +345,18 @@ def validate_run(run_dir: Path, manifest_path: Path) -> dict[str, Any]:
         "source_git_commit": config["source_git_commit"],
         "recomputed": recomputed,
     }
+    if config.get("torch_profiler_capture"):
+        summary_path = run_dir / "torch_profiler_summary.json"
+        trace_path = run_dir / "torch_profiler_trace.json"
+        require(summary_path.is_file() and trace_path.is_file(), "Required PyTorch-profiler artifacts are missing")
+        summary = read_json(summary_path)
+        require(summary.get("semantic_match") is True, "PyTorch-profiler capture changed semantics")
+        require(int(summary.get("cuda_kernel_event_count", 0)) > 0, "PyTorch profiler captured no CUDA kernels")
+        require(summary.get("trace_sha256") == sha256_file(trace_path), "PyTorch trace hash differs")
+        report["torch_profiler_summary_sha256"] = sha256_file(summary_path)
+        report["torch_profiler_trace_sha256"] = sha256_file(trace_path)
+        report["torch_profiler_cuda_kernel_event_count"] = int(summary["cuda_kernel_event_count"])
+    return report
 
 
 def validate_and_finalize(run_dir: Path, manifest_path: Path) -> dict[str, Any]:
@@ -324,6 +380,9 @@ def validate_and_finalize(run_dir: Path, manifest_path: Path) -> dict[str, Any]:
         "source_git_commit": report["source_git_commit"],
         "all_semantic_matches": True,
     }
+    for key in ("torch_profiler_summary_sha256", "torch_profiler_trace_sha256"):
+        if key in report:
+            completion[key] = report[key]
     atomic_write(completion_path, canonical_bytes(completion))
     return {"integrity": report, "completion": completion, "metrics": read_json(run_dir / "metrics.json")}
 
@@ -332,9 +391,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--check-only", action="store_true")
     args = parser.parse_args()
     try:
-        result = validate_and_finalize(args.run_dir, args.manifest)
+        result = (
+            {"integrity": validate_run(args.run_dir, args.manifest)}
+            if args.check_only
+            else validate_and_finalize(args.run_dir, args.manifest)
+        )
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
     except (HardwareProfileValidationError, OSError, ValueError, KeyError, json.JSONDecodeError) as exc:

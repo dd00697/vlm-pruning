@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import unittest
 
-from scripts.run_hardware_runtime_profile import MODES, aggregate, stage_semantics_match
+from scripts.run_hardware_runtime_profile import (
+    MODES,
+    PROFILE_ORDER_PLAN,
+    HardwareProfileError,
+    aggregate,
+    stage_semantics_match,
+    validate_resume_prefix,
+)
 from scripts.validate_hardware_runtime_profile import (
     HardwareProfileValidationError,
     required_components,
@@ -14,7 +21,29 @@ class HardwareProfileProtocolTests(unittest.TestCase):
     def test_frozen_modes_encode_two_twenty_and_profile_contracts(self) -> None:
         self.assertEqual(MODES["smoke2"], {"limit": 2, "warmup": 0, "repetitions": 1})
         self.assertEqual(MODES["smoke20"], {"limit": 20, "warmup": 2, "repetitions": 1})
-        self.assertEqual(MODES["profile100"], {"limit": 100, "warmup": 20, "repetitions": 5})
+        self.assertEqual(MODES["profile100"], {"limit": 100, "warmup": 20, "repetitions": 1})
+        self.assertEqual(set(PROFILE_ORDER_PLAN), {1, 2, 3, 4, 5})
+        for order in PROFILE_ORDER_PLAN.values():
+            self.assertEqual(set(order), {"P_K12", "P_M448", "P_M448_REPLAY"})
+        for cell_id in ("P_K12", "P_M448", "P_M448_REPLAY"):
+            counts = [sum(order[position] == cell_id for order in PROFILE_ORDER_PLAN.values()) for position in range(3)]
+            self.assertLessEqual(max(counts) - min(counts), 1)
+
+    def test_resume_requires_an_exact_unique_compatible_prefix(self) -> None:
+        expected = [("a", 2), ("b", 2), ("c", 2)]
+        prefix = [
+            {"sample_id": "a", "repetition": 2, "config_sha256": "config", "semantic_match": True},
+            {"sample_id": "b", "repetition": 2, "config_sha256": "config", "semantic_match": True},
+        ]
+        validate_resume_prefix(prefix, expected_order=expected, config_sha256="config")
+        with self.assertRaisesRegex(HardwareProfileError, "ordered manifest prefix"):
+            validate_resume_prefix(list(reversed(prefix)), expected_order=expected, config_sha256="config")
+        duplicate = [prefix[0], prefix[0]]
+        with self.assertRaises(HardwareProfileError):
+            validate_resume_prefix(duplicate, expected_order=expected, config_sha256="config")
+        wrong_hash = [{**prefix[0], "config_sha256": "other"}]
+        with self.assertRaisesRegex(HardwareProfileError, "different config hash"):
+            validate_resume_prefix(wrong_hash, expected_order=expected, config_sha256="config")
 
     def profile_row(self, cell_id: str) -> dict:
         required, _ = required_components(cell_id)
@@ -45,6 +74,7 @@ class HardwareProfileProtocolTests(unittest.TestCase):
             for component in required - {"decoder_segment"}
         )
         return {
+            "prompt_sequence_lengths_by_layer": [10] * 32,
             "runtime_profile": {
                 "enabled": True,
                 "records": records,
@@ -111,6 +141,8 @@ class HardwareProfileProtocolTests(unittest.TestCase):
                 "sample_id": "sample",
                 "repetition": repetition,
                 "semantic_match": True,
+                "vision_encoder_latency_s": 0.1,
+                "projector_latency_s": 0.01,
                 "prefill_latency_s": 1.0,
                 "decode_latency_s": 2.0,
                 "end_to_end_latency_s": 3.0,
@@ -118,7 +150,10 @@ class HardwareProfileProtocolTests(unittest.TestCase):
                 "final_kv_total_bytes": 12,
                 "average_visual_tokens": 246,
                 "visual_token_layer_work": 7872,
+                "sequence_layer_work": 9000,
+                "quadratic_sequence_layer_work": 3_000_000,
                 "generated_token_count": 20,
+                "decode_latency_per_generated_token_s": 2.0 / 19.0,
                 "peak_allocated_gpu_bytes": 100,
                 "peak_reserved_gpu_bytes": 120,
                 "runtime_profile": {
