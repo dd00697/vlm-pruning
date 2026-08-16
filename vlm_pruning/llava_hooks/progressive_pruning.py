@@ -15,7 +15,11 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
 from vlm_pruning.efficiency import cache_tensor_bytes
-from vlm_pruning.llava_hooks.mid_layer_pruning import CacheLengthProxy, MidLayerUGPruneForwarder
+from vlm_pruning.llava_hooks.mid_layer_pruning import (
+    CacheLengthProxy,
+    MidLayerUGPruneForwarder,
+    ug_gap58_config_for_prune_layer,
+)
 from vlm_pruning.selectors import UGPruneConfig
 from vlm_pruning.selectors.base import SelectorError
 
@@ -68,7 +72,7 @@ def validate_schedule(
         parsed.append(event)
     previous_boundary = 0
     previous_budget = int(initial_visual_tokens)
-    allowed = {"query_topk", "query_topk_merge", "random", "none"}
+    allowed = {"query_topk", "query_topk_merge", "k12_original", "random", "none"}
     merge_seen = False
     for event in parsed:
         if event.boundary <= previous_boundary or event.boundary >= int(num_layers):
@@ -91,6 +95,11 @@ def validate_schedule(
                     "query_topk_merge is restricted to the registered first event K4->448 from 576 tokens"
                 )
             merge_seen = True
+        if event.selector == "k12_original":
+            if event.boundary != 12 or event.budget != 48 or previous_budget != 576:
+                raise SelectorError(
+                    "k12_original is restricted to the first K12->48 event from 576 tokens"
+                )
         previous_boundary = event.boundary
         previous_budget = event.budget
     return tuple(parsed)
@@ -406,7 +415,66 @@ class ProgressivePruneForwarder(MidLayerUGPruneForwarder):
         score_checksum: str | None = None
         recomputed = False
         derived_seed: int | None = None
-        if event.selector in {"query_topk", "query_topk_merge", "none"}:
+        if event.selector == "k12_original":
+            config = ug_gap58_config_for_prune_layer(
+                12,
+                map_source="query_max",
+                fusion_mode="single_layer",
+                probe_layers=(12,),
+                position_mode="gap_preserving",
+                target_ratio=0.45,
+                context_ratio=0.40,
+                anchor_ratio=0.15,
+            )
+            query_positions = self._current_query_positions(
+                original_positions,
+                query_original_positions,
+            )
+            query_position_list = [
+                int(value) for value in query_positions.detach().cpu().tolist()
+            ]
+            # The original K12 implementation captures every intermediate
+            # state, but its frozen single-layer selector reads only layer 12.
+            frozen_hidden_states = [None] * 12 + [hidden_states]
+            with self._profile_scope(
+                "score_construction",
+                boundary=event.boundary,
+                method="k12_original",
+            ):
+                scores, layer_keys, map_stats = self._extract_fused_map_torch(
+                    hidden_states=frozen_hidden_states,
+                    input_ids=input_ids,
+                    query_token_positions=query_position_list,
+                    selector_config=config,
+                    target_visual_tokens=event.budget,
+                )
+                score_checksum = _tensor_checksum(scores)
+            recomputed = True
+            with self._profile_scope(
+                "ranking_and_index_materialization",
+                boundary=event.boundary,
+                method="k12_original",
+            ):
+                selection, _ = self._selection_from_fused_torch(
+                    scores=scores,
+                    sample_id=sample_id,
+                    original_tokens=len(incoming),
+                    seed=seed,
+                    map_key="+".join(layer_keys),
+                    map_stats=map_stats,
+                    query_text="",
+                    query_token_status="pre_resolved",
+                    query_token_positions=query_position_list,
+                    selector_config=config,
+                    target_visual_tokens=event.budget,
+                )
+                selected = [int(value) for value in selection.selected_indices]
+        elif event.selector == "none":
+            # B=0 is a literal zero-tail drop.  There is nothing to rank, and
+            # running the relevance scorer here would add selector overhead to
+            # a boundary whose result is known a priori.
+            selected: list[int] = []
+        elif event.selector in {"query_topk", "query_topk_merge"}:
             with self._profile_scope("score_construction", boundary=event.boundary):
                 scores, _ = self.score_current_visual_tokens(
                     hidden_states,
@@ -417,11 +485,8 @@ class ProgressivePruneForwarder(MidLayerUGPruneForwarder):
                 score_checksum = _tensor_checksum(scores)
             recomputed = True
             with self._profile_scope("ranking_and_index_materialization", boundary=event.boundary):
-                if event.selector == "none":
-                    selected: list[int] = []
-                else:
-                    ranked_local = self.torch.argsort(scores, descending=True, stable=True)
-                    selected = sorted(incoming[int(value)] for value in ranked_local[: event.budget].detach().cpu().tolist())
+                ranked_local = self.torch.argsort(scores, descending=True, stable=True)
+                selected = sorted(incoming[int(value)] for value in ranked_local[: event.budget].detach().cpu().tolist())
         else:
             derived_seed = deterministic_stage_seed(
                 sample_id=sample_id,

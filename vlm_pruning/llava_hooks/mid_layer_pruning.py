@@ -569,7 +569,12 @@ class MidLayerUGPruneForwarder:
         normalised = (values - values.mean()) / torch.clamp(std, min=eps)
         return torch.where(std < eps, torch.zeros_like(normalised), normalised)
 
-    def _score_map_stats_torch(self, scores: Any) -> dict[str, float | int]:
+    def _score_map_stats_torch(
+        self,
+        scores: Any,
+        *,
+        target_visual_tokens: int | None = None,
+    ) -> dict[str, float | int]:
         torch = self.torch
         values = scores.float().reshape(-1)
         probs = torch.softmax(values, dim=0)
@@ -588,7 +593,10 @@ class MidLayerUGPruneForwarder:
         if int(values.numel()) % per_image != 0:
             raise SelectorError(f"Score map has {int(values.numel())} tokens, not whole image grids.")
         grid_tensors = self._grid_tensors(values.device, int(values.numel()) // per_image)
-        top_counts = sorted({16, 29, 48, 58, 72, 96, int(self.target_visual_tokens)})
+        target_budget = int(
+            self.target_visual_tokens if target_visual_tokens is None else target_visual_tokens
+        )
+        top_counts = sorted({16, 29, 48, 58, 72, 96, target_budget})
         for k in top_counts:
             count = min(int(k), int(values.numel()))
             top = torch.topk(probs, count, largest=True, sorted=False).indices
@@ -642,6 +650,7 @@ class MidLayerUGPruneForwarder:
         input_ids: Any,
         query_token_positions: Sequence[int],
         selector_config: UGPruneConfig | None = None,
+        target_visual_tokens: int | None = None,
     ) -> tuple[Any, tuple[str, ...], dict[str, float]]:
         torch = self.torch
         config = selector_config or self.selector_config
@@ -683,7 +692,10 @@ class MidLayerUGPruneForwarder:
         else:
             raise SelectorError(f"Fast benchmark path does not support fusion_mode={config.fusion_mode}.")
         flat = fused.reshape(-1)
-        return flat, tuple(keys), self._score_map_stats_torch(flat)
+        return flat, tuple(keys), self._score_map_stats_torch(
+            flat,
+            target_visual_tokens=target_visual_tokens,
+        )
 
     def _select_top_ranked(self, ranked: Any, mask: Any, count: int) -> Any:
         if count <= 0:
@@ -911,6 +923,7 @@ class MidLayerUGPruneForwarder:
                     input_ids=input_ids,
                     query_token_positions=query_token_positions,
                     selector_config=config,
+                    target_visual_tokens=target_budget,
                 )
             self._subtiming_sync()
             map_latency = time.perf_counter() - map_start

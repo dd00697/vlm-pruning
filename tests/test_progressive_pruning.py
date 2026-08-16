@@ -44,6 +44,18 @@ class ProgressiveScheduleTests(unittest.TestCase):
         with self.assertRaisesRegex(SelectorError, "reserved"):
             validate_schedule([(20, 4, "none")])
 
+    def test_original_k12_selector_is_restricted_to_frozen_stage(self) -> None:
+        events = validate_schedule([(12, 48, "k12_original"), (20, 0, "none")])
+        self.assertEqual(events[0], PruningEvent(12, 48, "k12_original"))
+        for schedule in (
+            [(8, 48, "k12_original")],
+            [(12, 96, "k12_original")],
+            [(4, 448), (12, 48, "k12_original")],
+        ):
+            with self.subTest(schedule=schedule):
+                with self.assertRaises(SelectorError):
+                    validate_schedule(schedule)
+
     def test_schedule_fails_closed_on_order_and_budget_growth(self) -> None:
         for schedule in (
             [(12, 48), (8, 32)],
@@ -168,6 +180,68 @@ class ProgressiveSelectionTests(unittest.TestCase):
         self.assertEqual(merge_checksum, checksum)
         self.assertEqual(merge_recomputed, recomputed)
         self.assertEqual(merge_derived, derived)
+
+    def test_zero_tail_drops_without_scoring_or_ranking(self) -> None:
+        import torch
+
+        forwarder = self.make_forwarder_without_model()
+
+        def fail_if_scored(*_args, **_kwargs):
+            raise AssertionError("zero-tail must not construct a relevance score map")
+
+        forwarder.score_current_visual_tokens = fail_if_scored
+        input_ids = torch.tensor([[1, 32000, 32000, 32000, 32000, 7]])
+        selected, checksum, recomputed, derived = forwarder.select_stage_indices(
+            torch.zeros((1, input_ids.shape[1], 4), dtype=torch.float32),
+            input_ids=input_ids,
+            original_positions=torch.arange(input_ids.shape[1]),
+            incoming_original_indices=[0, 1, 2, 3],
+            event=PruningEvent(20, 0, "none"),
+            stage_index=1,
+            sample_id="sample",
+            seed=0,
+            query_original_positions=[5],
+        )
+        self.assertEqual(selected, [])
+        self.assertIsNone(checksum)
+        self.assertFalse(recomputed)
+        self.assertIsNone(derived)
+
+    def test_frozen_original_k12_selector_returns_structured_exact_budget(self) -> None:
+        import torch
+        from vlm_pruning.selectors import UGPruneConfig
+
+        torch.manual_seed(0)
+        forwarder = self.make_forwarder_without_model()
+        forwarder.grid = 24
+        forwarder.initial_visual_tokens = 576
+        forwarder.target_visual_tokens = 576
+        forwarder.selector_config = UGPruneConfig(
+            selector_strategy="query_topk",
+            probe_layers=(1,),
+            fusion_mode="single_layer",
+            position_mode="gap_preserving",
+        )
+        forwarder._grid_tensor_cache = {}
+        input_ids = torch.tensor([[32000] * 576 + [7, 8]])
+        hidden = torch.randn((1, input_ids.shape[1], 16), dtype=torch.float32)
+        selected, checksum, recomputed, derived = forwarder.select_stage_indices(
+            hidden,
+            input_ids=input_ids,
+            original_positions=torch.arange(input_ids.shape[1]),
+            incoming_original_indices=list(range(576)),
+            event=PruningEvent(12, 48, "k12_original"),
+            stage_index=0,
+            sample_id="sample",
+            seed=0,
+            query_original_positions=[576, 577],
+        )
+        self.assertEqual(len(selected), 48)
+        self.assertEqual(selected, sorted(selected))
+        self.assertEqual(len(set(selected)), 48)
+        self.assertIsNotNone(checksum)
+        self.assertTrue(recomputed)
+        self.assertIsNone(derived)
 
     def test_gather_retains_all_text_and_supports_empty_visual_set(self) -> None:
         import torch
