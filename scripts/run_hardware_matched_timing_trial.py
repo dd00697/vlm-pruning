@@ -479,7 +479,7 @@ class Trial:
             dtype=inputs["input_ids"].dtype,
             device=inputs["input_ids"].device,
         )
-        return generated, prefill.selection, diagnostics
+        return generated, state.selection, diagnostics
 
     def fixed_progressive_generation(
         self,
