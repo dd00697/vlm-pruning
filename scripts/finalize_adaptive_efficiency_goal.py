@@ -78,6 +78,15 @@ def is_campaign_report_markdown(path: Path) -> bool:
     return bool(relative_parts) and relative_parts[0] != "official_sources"
 
 
+def is_forbidden_confirmation_or_heldout_path(path: Path) -> bool:
+    """Inspect campaign-owned outputs, not immutable third-party source files."""
+    relative_parts = path.resolve().relative_to(CAMPAIGN_ROOT).parts
+    if not relative_parts or relative_parts[0] == "official_sources":
+        return False
+    lowered_name = path.name.lower()
+    return any(term in lowered_name for term in ("8811", "testa", "testb"))
+
+
 def run_tests() -> dict[str, Any]:
     command = [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"]
     process = subprocess.run(
@@ -400,7 +409,7 @@ def main() -> int:
     forbidden_paths = [
         relative(path)
         for path in CAMPAIGN_ROOT.rglob("*")
-        if "8811" in path.name.lower() or "testa" in path.name.lower() or "testb" in path.name.lower()
+        if is_forbidden_confirmation_or_heldout_path(path)
     ]
     if forbidden_paths:
         raise FinalAuditError(f"Forbidden confirmation/held-out campaign paths exist: {forbidden_paths[:3]}")

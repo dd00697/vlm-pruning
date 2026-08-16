@@ -8,6 +8,7 @@ from scripts.finalize_adaptive_efficiency_goal import (
     CAMPAIGN_ROOT,
     FinalAuditError,
     is_campaign_report_markdown,
+    is_forbidden_confirmation_or_heldout_path,
     validate_registry,
 )
 from scripts.init_adaptive_efficiency_campaign import (
@@ -112,6 +113,23 @@ class AdaptiveFinalAuditTests(unittest.TestCase):
         )
         self.assertTrue(is_campaign_report_markdown(CAMPAIGN_ROOT / "RESEARCH_REPORT.md"))
         self.assertTrue(is_campaign_report_markdown(CAMPAIGN_ROOT / "analysis/EXTRA_REPORT.md"))
+
+    def test_heldout_path_audit_excludes_only_pinned_official_source_files(self) -> None:
+        self.assertFalse(
+            is_forbidden_confirmation_or_heldout_path(
+                CAMPAIGN_ROOT / "official_sources/checkouts/method/configs/refcoco_testA.yaml"
+            )
+        )
+        self.assertTrue(
+            is_forbidden_confirmation_or_heldout_path(
+                CAMPAIGN_ROOT / "matched_timing/refcoco_testA_results.json"
+            )
+        )
+        self.assertTrue(
+            is_forbidden_confirmation_or_heldout_path(
+                CAMPAIGN_ROOT / "analysis/future_8811_confirmation.json"
+            )
+        )
 
 
 if __name__ == "__main__":
