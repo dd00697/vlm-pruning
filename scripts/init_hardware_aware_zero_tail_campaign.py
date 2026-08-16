@@ -7,10 +7,12 @@ registered artifacts and writes only beneath the new campaign root.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -250,15 +252,72 @@ def validate_train_partitions(rows: list[dict[str, Any]], validation_rows: list[
     overlap = validation_ids & train_ids
     if overlap:
         raise Phase0Error(f"Train/validation sample-ID leakage: {len(overlap)} rows")
-    validation_images = {str(row.get("image_id")) for row in validation_rows}
-    train_images = {str(row.get("image_id")) for row in rows}
+    validation_images = {canonical_coco_image_id(row) for row in validation_rows}
+    train_images = {canonical_coco_image_id(row) for row in rows}
+    image_overlap = validation_images & train_images
+    if len(image_overlap) != 90:
+        raise Phase0Error(f"Unexpected train/validation underlying COCO-image overlap: {len(image_overlap)}")
     return {
         "gate_partition_counts": expected_gate,
         "training_partition_counts": expected_training,
         "validation_sample_id_overlap": 0,
-        "validation_image_id_overlap": len(validation_images & train_images),
-        "validation_image_overlap_note": "Historical manifest mixes source COCO splits; record overlap is zero and image overlap is diagnostic only.",
+        "validation_underlying_coco_image_overlap": len(image_overlap),
+        "validation_underlying_coco_image_overlap_first10": sorted(image_overlap)[:10],
+        "validation_image_overlap_note": "Historical sources encode image identity differently. Record-ID overlap is zero; 90 underlying COCO images overlap and are disclosed as diagnostic provenance.",
     }
+
+
+def canonical_coco_image_id(row: dict[str, Any]) -> int:
+    metadata = row.get("metadata") or {}
+    if metadata.get("coco_image_id") is not None:
+        return int(metadata["coco_image_id"])
+    for key in ("image_id", "image_path"):
+        match = re.search(r"(?<!\d)(\d{12})(?!\d)", str(row.get(key) or ""))
+        if match:
+            return int(match.group(1))
+    raise Phase0Error(f"Cannot resolve underlying COCO image ID for {row.get('sample_id')}")
+
+
+def prepare_campaign_root(*, archive_failed_phase0: bool) -> dict[str, Any] | None:
+    if not CAMPAIGN_ROOT.exists() or not any(CAMPAIGN_ROOT.iterdir()):
+        return None
+    if not archive_failed_phase0:
+        raise Phase0Error(f"Campaign root is not empty; refusing to overwrite: {CAMPAIGN_ROOT}")
+    expected = {
+        "CONTROLLER_STATE.json",
+        "EXPERIMENT_REGISTRY.json",
+        "PREFLIGHT_AUDIT.json",
+        "RESEARCH_REPORT.md",
+        "STORAGE_BUDGET.json",
+        "analysis/PHASE0_COMPLETED.json",
+    }
+    actual = {
+        path.relative_to(CAMPAIGN_ROOT).as_posix()
+        for path in CAMPAIGN_ROOT.rglob("*")
+        if path.is_file()
+    }
+    if actual != expected:
+        raise Phase0Error(f"Recovery expected only the first rejected Phase 0 files: {sorted(actual)}")
+    archive = CAMPAIGN_ROOT / "rejected_runs/phase0_attempt1"
+    if archive.exists():
+        raise Phase0Error(f"Rejected Phase 0 archive already exists: {archive}")
+    original_hashes = {name: sha256_file(CAMPAIGN_ROOT / name) for name in sorted(expected)}
+    for name in sorted(expected):
+        source = CAMPAIGN_ROOT / name
+        archived_name = "RESEARCH_REPORT.md.rejected" if name == "RESEARCH_REPORT.md" else name
+        destination = archive / archived_name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(source, destination)
+    rejection = {
+        "status": "rejected_before_independent_acceptance",
+        "archived_at_utc": utc_now(),
+        "reason": "train/validation underlying COCO-image overlap was incorrectly recorded as zero because heterogeneous image_id encodings were compared literally",
+        "original_hashes": original_hashes,
+        "preserved_byte_for_byte": True,
+        "replacement_attempt": "phase0_attempt2",
+    }
+    atomic_json(archive / "REJECTION.json", rejection)
+    return {"archive_path": relative(archive), "rejection_sha256": sha256_file(archive / "REJECTION.json")}
 
 
 def verify_file_hashes(root: Path, expected: dict[str, str | None]) -> dict[str, str]:
@@ -544,8 +603,14 @@ def report_markdown(audit: dict[str, Any]) -> str:
 
 
 def main() -> int:
-    if CAMPAIGN_ROOT.exists() and any(CAMPAIGN_ROOT.iterdir()):
-        raise Phase0Error(f"Campaign root is not empty; refusing to overwrite: {CAMPAIGN_ROOT}")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--archive-failed-phase0",
+        action="store_true",
+        help="Archive the exact unaccepted first Phase 0 output before a corrected initialization",
+    )
+    args = parser.parse_args()
+    rejected_phase0 = prepare_campaign_root(archive_failed_phase0=args.archive_failed_phase0)
 
     validation_rows, validation_evidence = validate_manifest(VALIDATION_MANIFEST, VALIDATION_SHA256, 1000, split="val")
     train_rows, train_evidence = validate_manifest(TRAIN_MANIFEST, TRAIN_SHA256, 3000, split="train")
@@ -589,7 +654,8 @@ def main() -> int:
             "timing": validate_timing(validation_ids),
         },
         "source_inventory": {name: sha256_file(REPO_ROOT / name) for name in SOURCE_INVENTORY},
-        "new_root_forbidden_output_scan": {"root_existed_before_initialization": CAMPAIGN_ROOT.exists(), "forbidden_paths": []},
+        "new_root_forbidden_output_scan": {"root_existed_before_initialization": rejected_phase0 is not None, "forbidden_paths": []},
+        "rejected_phase0_attempt": rejected_phase0,
         "dissertation_read_only_snapshot": {
             "source_path": str(WORKSPACE / "Dissertation_Draft"),
             "source_tree_sha256": dissertation_tree_hash,

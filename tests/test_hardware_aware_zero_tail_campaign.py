@@ -11,6 +11,7 @@ from scripts.init_hardware_aware_zero_tail_campaign import (
     K12_RESCORED,
     K12_SOURCE,
     PROGRESSIVE_ROOT,
+    canonical_coco_image_id,
     order_sha256,
     sha256_file,
     tree_sha256,
@@ -42,6 +43,12 @@ class HardwareAwarePhase0Tests(unittest.TestCase):
         self.assertEqual(sha256_file(K12_SOURCE), EXPECTED_K12_HASHES["source"])
         for name, expected in EXPECTED_PROGRESSIVE_HASHES.items():
             self.assertEqual(sha256_file(PROGRESSIVE_ROOT / name), expected)
+
+    def test_canonical_coco_id_handles_both_manifest_encodings(self) -> None:
+        validation = {"sample_id": "v", "image_id": "COCO_train2014_000000580374_2.jpg"}
+        training = {"sample_id": "t", "metadata": {"coco_image_id": 580374}}
+        self.assertEqual(canonical_coco_image_id(validation), 580374)
+        self.assertEqual(canonical_coco_image_id(training), 580374)
 
     def test_order_validator_rejects_reordering(self) -> None:
         rows = [{"sample_id": "a"}, {"sample_id": "b"}]
