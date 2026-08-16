@@ -9,19 +9,34 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from scripts.init_hardware_aware_zero_tail_campaign import (
-    CAMPAIGN_ROOT,
-    CELLS,
-    REPO_ROOT,
-    VALIDATION_MANIFEST,
-    VALIDATION_SHA256,
-    atomic_json,
-    canonical_coco_image_id,
-    read_json,
-    read_jsonl,
-    sha256_file,
-    utc_now,
-)
+try:
+    from scripts.init_hardware_aware_zero_tail_campaign import (
+        CAMPAIGN_ROOT,
+        CELLS,
+        REPO_ROOT,
+        VALIDATION_MANIFEST,
+        VALIDATION_SHA256,
+        atomic_json,
+        canonical_coco_image_id,
+        read_json,
+        read_jsonl,
+        sha256_file,
+        utc_now,
+    )
+except ModuleNotFoundError:  # Direct `python scripts/...py` execution.
+    from init_hardware_aware_zero_tail_campaign import (  # type: ignore[no-redef]
+        CAMPAIGN_ROOT,
+        CELLS,
+        REPO_ROOT,
+        VALIDATION_MANIFEST,
+        VALIDATION_SHA256,
+        atomic_json,
+        canonical_coco_image_id,
+        read_json,
+        read_jsonl,
+        sha256_file,
+        utc_now,
+    )
 
 
 class PreflightValidationError(RuntimeError):
