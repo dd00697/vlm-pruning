@@ -426,6 +426,9 @@ class ProfileTrial:
                 "R_NATIVE_CACHE": ProfiledNativeCacheForwarder,
                 "R_FUSED_NATIVE": ProfiledFusedNativeForwarder,
             }[config["cell_id"]]
+            forwarder_kwargs: dict[str, Any] = {}
+            if config["cell_id"] in {"P_M448", "P_M448_REPLAY"}:
+                forwarder_kwargs["stage_replay_by_sample"] = replay
             self.forwarder = forwarder_class(
                 self.torch,
                 self.model,
@@ -434,7 +437,7 @@ class ProfileTrial:
                 diagnostics_mode="benchmark",
                 synchronise_subtimings=False,
                 runtime_profiler=profiler,
-                stage_replay_by_sample=replay,
+                **forwarder_kwargs,
             )
 
     def infer(self, sample: dict[str, Any], repetition: int) -> dict[str, Any]:
