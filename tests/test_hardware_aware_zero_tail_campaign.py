@@ -6,7 +6,13 @@ from pathlib import Path
 
 from scripts.init_hardware_aware_zero_tail_campaign import (
     CELLS,
+    EXPECTED_K12_HASHES,
+    EXPECTED_PROGRESSIVE_HASHES,
+    K12_RESCORED,
+    K12_SOURCE,
+    PROGRESSIVE_ROOT,
     order_sha256,
+    sha256_file,
     tree_sha256,
     validate_ordered_ids,
     Phase0Error,
@@ -30,6 +36,12 @@ class HardwareAwarePhase0Tests(unittest.TestCase):
         self.assertEqual(CELLS["Z_K12_0"]["average_visual_tokens"], 228.0)
         self.assertEqual(CELLS["Z_M448_0"]["average_visual_tokens"], 196.0)
         self.assertEqual(CELLS["Z_M448_16"]["average_visual_tokens"], 202.0)
+
+    def test_historical_hash_locks_match_physical_files(self) -> None:
+        self.assertEqual(sha256_file(K12_RESCORED), EXPECTED_K12_HASHES["rescored"])
+        self.assertEqual(sha256_file(K12_SOURCE), EXPECTED_K12_HASHES["source"])
+        for name, expected in EXPECTED_PROGRESSIVE_HASHES.items():
+            self.assertEqual(sha256_file(PROGRESSIVE_ROOT / name), expected)
 
     def test_order_validator_rejects_reordering(self) -> None:
         rows = [{"sample_id": "a"}, {"sample_id": "b"}]
