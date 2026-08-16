@@ -4,7 +4,12 @@ import unittest
 
 import numpy as np
 
-from scripts.finalize_adaptive_efficiency_goal import FinalAuditError, validate_registry
+from scripts.finalize_adaptive_efficiency_goal import (
+    CAMPAIGN_ROOT,
+    FinalAuditError,
+    is_campaign_report_markdown,
+    validate_registry,
+)
 from scripts.init_adaptive_efficiency_campaign import (
     box_iou,
     error_profile,
@@ -100,6 +105,13 @@ class AdaptiveFinalAuditTests(unittest.TestCase):
         registry["phases"]["a0"] = registry["phases"].pop("A0")
         with self.assertRaisesRegex(FinalAuditError, "A0"):
             validate_registry(registry)
+
+    def test_single_report_audit_excludes_only_pinned_official_source_docs(self) -> None:
+        self.assertFalse(
+            is_campaign_report_markdown(CAMPAIGN_ROOT / "official_sources/checkouts/method/README.md")
+        )
+        self.assertTrue(is_campaign_report_markdown(CAMPAIGN_ROOT / "RESEARCH_REPORT.md"))
+        self.assertTrue(is_campaign_report_markdown(CAMPAIGN_ROOT / "analysis/EXTRA_REPORT.md"))
 
 
 if __name__ == "__main__":

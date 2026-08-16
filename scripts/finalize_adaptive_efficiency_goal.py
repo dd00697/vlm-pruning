@@ -72,6 +72,12 @@ def relative(path: Path) -> str:
     return str(path.resolve().relative_to(REPO_ROOT))
 
 
+def is_campaign_report_markdown(path: Path) -> bool:
+    """Exclude documentation belonging to pinned third-party source checkouts."""
+    relative_parts = path.resolve().relative_to(CAMPAIGN_ROOT).parts
+    return bool(relative_parts) and relative_parts[0] != "official_sources"
+
+
 def run_tests() -> dict[str, Any]:
     command = [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"]
     process = subprocess.run(
@@ -314,7 +320,9 @@ def validate_gate_and_timing() -> dict[str, Any]:
 
 
 def validate_report(report: str, timing: dict[str, Any]) -> dict[str, Any]:
-    markdown = sorted(CAMPAIGN_ROOT.rglob("*.md"))
+    markdown = sorted(
+        path for path in CAMPAIGN_ROOT.rglob("*.md") if is_campaign_report_markdown(path)
+    )
     if markdown != [REPORT_PATH]:
         raise FinalAuditError(f"Campaign has more than its single cumulative Markdown report: {markdown}")
     required_headers = (
