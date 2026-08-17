@@ -344,6 +344,7 @@ def run_cache(args: argparse.Namespace) -> int:
     rows = frozen_manifest(TRAIN_MANIFEST, TRAIN_SHA256, 3000)
     selected = rows[: args.limit] if args.limit else rows
     output_root = args.output_root or CACHE_ROOT
+    output_root = output_root.resolve() if output_root.is_absolute() else (REPO_ROOT / output_root).resolve()
     index_path = output_root / "INDEX.jsonl"
     if index_path.exists() and not args.resume:
         raise CampaignError(f"Cache index already exists; use --resume: {index_path}")
@@ -560,7 +561,8 @@ def run_train_smoke(args: argparse.Namespace) -> int:
 
     import torch
 
-    records = records_from_root(args.cache_root, require_full=False)
+    cache_root = args.cache_root.resolve() if args.cache_root.is_absolute() else (REPO_ROOT / args.cache_root).resolve()
+    records = records_from_root(cache_root, require_full=False)
     fit = [record for record in records if record["partition"] == "fit"]
     if not fit:
         raise CampaignError("Training smoke cache contains no fit row")
@@ -581,7 +583,7 @@ def run_train_smoke(args: argparse.Namespace) -> int:
         optimizer,
         lambda step: cosine_lambda(step, total_steps=20, warmup_steps=1),
     )
-    output = args.output_root
+    output = args.output_root.resolve() if args.output_root.is_absolute() else (REPO_ROOT / args.output_root).resolve()
     output.mkdir(parents=True, exist_ok=True)
     # One exact optimizer step, checkpoint, reload, and verify state restoration.
     one = run_epoch(
@@ -1144,7 +1146,9 @@ def run_quality(args: argparse.Namespace) -> int:
         raise CampaignError(f"Selected SAQR196 checkpoint is missing: {checkpoint}")
     suffix = "_no_query" if args.no_query else ""
     run_name = args.run_name or f"{args.split}_saqr196{suffix}_attempt1"
-    run_dir = (args.output_root or QUALITY_ROOT) / run_name
+    output_root = args.output_root or QUALITY_ROOT
+    output_root = output_root.resolve() if output_root.is_absolute() else (REPO_ROOT / output_root).resolve()
+    run_dir = output_root / run_name
     predictions_path = run_dir / "predictions.jsonl"
     existing = read_jsonl(predictions_path) if predictions_path.exists() and args.resume else []
     if predictions_path.exists() and not args.resume:
