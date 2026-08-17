@@ -1,5 +1,16 @@
 """LLaVA forward-path hooks for Phase 2B pruning pilots."""
 
+from .early_compression import (
+    ContiguousCacheState,
+    ContiguousPoolForwarder,
+    EarlyCompressionError,
+    SpatialPoolEvidence,
+    area_weighted_spatial_pool,
+    cache_layer_lengths,
+    nearest_cell_anchors,
+    prepare_pooled_inputs,
+)
+
 from .mid_layer_pruning import (
     CacheLengthProxy,
     FROZEN_UG_GAP58_NAME,
@@ -50,6 +61,14 @@ from .runtime_repairs import (
 )
 
 __all__ = [
+    "ContiguousCacheState",
+    "ContiguousPoolForwarder",
+    "EarlyCompressionError",
+    "SpatialPoolEvidence",
+    "area_weighted_spatial_pool",
+    "cache_layer_lengths",
+    "nearest_cell_anchors",
+    "prepare_pooled_inputs",
     "CacheLengthProxy",
     "FROZEN_UG_GAP58_NAME",
     "LayerAwareCacheState",
