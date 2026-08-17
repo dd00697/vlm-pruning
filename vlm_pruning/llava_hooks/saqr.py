@@ -263,6 +263,10 @@ class SpatiallyAnchoredQueryResampler(nn.Module):
         raw_gate = self.base_gate_logit + self.gate_projection(query_vector.float()).squeeze(-1)
         gate = self.deterministic_floor + (1.0 - self.deterministic_floor) * torch.sigmoid(raw_gate)
         assignment = gate[:, None, None] * deterministic + (1.0 - gate[:, None, None]) * learned
+        # Autocast may form the mixture in BF16.  The architecture contract is
+        # unit column mass, so restore that invariant explicitly in FP32.
+        assignment = assignment.float()
+        assignment = assignment / assignment.sum(dim=1, keepdim=True).clamp_min(1e-12)
         column_mass = assignment.sum(dim=1)
         if not torch.allclose(column_mass, torch.ones_like(column_mass), atol=2e-5, rtol=0.0):
             raise SAQRError("Mixed assignment failed the unit patch-mass invariant")
