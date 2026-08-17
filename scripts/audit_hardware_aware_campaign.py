@@ -269,7 +269,12 @@ def validate_independent_evidence() -> dict[str, Any]:
     for method in ("Z_K12_0", "Z_M448_0"):
         validation = zero["independent_validation"][method]
         require(validation.get("status") == "pass", f"Zero-tail validation failed: {method}")
-        require(all(validation.get("checks", {}).values()), f"Zero-tail check failed: {method}")
+        checks = validation.get("checks", {})
+        require(checks.get("oracle_indices_only") is False, f"Zero-tail run is incorrectly oracle-only: {method}")
+        require(
+            all(value is True for key, value in checks.items() if key != "oracle_indices_only"),
+            f"Zero-tail check failed: {method}",
+        )
     natural = read_json(CAMPAIGN_ROOT / "matched_timing/analysis/NATURAL_RESULTS.json")
     fixed = read_json(CAMPAIGN_ROOT / "matched_timing/analysis/FIXED32_RESULTS.json")
     require(len(natural.get("trials", [])) == 20, "Natural timing does not have 20 trials")
@@ -514,6 +519,8 @@ def run() -> int:
     }
     registry["status"] = "complete"
     registry["terminal_state"] = TERMINAL_STATE
+    registry["source_commit"] = runtime["git_commit"]
+    registry.setdefault("source_epochs", {})["final_audit"] = runtime["git_commit"]
     registry["updated_at_utc"] = terminal_time
     controller["current_phase"] = "complete"
     controller["state"] = TERMINAL_STATE

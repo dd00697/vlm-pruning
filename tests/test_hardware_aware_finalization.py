@@ -7,6 +7,7 @@ from scripts.audit_hardware_aware_campaign import (
     FinalAuditError,
     PRE_AUDIT_STATE,
     PRIMARY_OUTCOME,
+    validate_independent_evidence,
     validate_scope_and_leakage,
     validate_terminal_inputs,
 )
@@ -100,6 +101,11 @@ class HardwareAwareFinalizationTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(FinalAuditError, "LoRA attempt"):
             validate_scope_and_leakage(registry)
+
+    def test_accepted_zero_tail_is_live_not_oracle_only(self):
+        evidence = validate_independent_evidence()
+        self.assertTrue(evidence["all_independently_validated"])
+        self.assertEqual(evidence["zero_tail_quality_runs"], 2)
 
 
 if __name__ == "__main__":
