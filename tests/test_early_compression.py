@@ -12,6 +12,8 @@ from vlm_pruning.llava_hooks.early_compression import (
     prepare_pooled_inputs,
 )
 
+from scripts.analyse_early_compression_quality import paired_interval
+
 
 class _Processor:
     def __call__(self, *, images, text, return_tensors):
@@ -172,6 +174,15 @@ class EarlyCompressionTests(unittest.TestCase):
         self.assertEqual(diagnostics["decode_step_count"], 3)
         self.assertEqual(diagnostics["cache/final_per_layer_lengths"], [6, 6])
         self.assertEqual(model.position_history, [[0, 1, 5], [6], [7], [8]])
+
+    def test_quality_bootstrap_is_paired_and_deterministic(self):
+        candidate = torch.tensor([1.0, 0.0, 1.0, 0.0]).numpy()
+        reference = torch.tensor([1.0, 1.0, 0.0, 0.0]).numpy()
+        first = paired_interval(candidate, reference, seed=19)
+        second = paired_interval(candidate, reference, seed=19)
+        self.assertEqual(first, second)
+        self.assertEqual(first["point_delta"], 0.0)
+        self.assertEqual(first["paired_rows"], 4)
 
 
 if __name__ == "__main__":
