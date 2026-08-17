@@ -183,7 +183,15 @@ def moved_processor_inputs(torch: Any, processor: Any, model: Any, device: Any, 
     }
 
 
-def teacher_cache_row(torch: Any, processor: Any, model: Any, device: Any, row: dict[str, Any]) -> dict[str, Any]:
+def teacher_cache_row(
+    torch: Any,
+    processor: Any,
+    model: Any,
+    device: Any,
+    row: dict[str, Any],
+    *,
+    manifest_index: int,
+) -> dict[str, Any]:
     image = Image.open(row["image_path"]).convert("RGB")
     prompt = REGISTERED_PROMPT.format(query=row["query"])
     text_prompt = apply_chat_template(processor, prompt, 1)
@@ -265,7 +273,7 @@ def teacher_cache_row(torch: Any, processor: Any, model: Any, device: Any, row: 
         "sample_id": str(row["sample_id"]),
         "partition": str(row["training_partition"]),
         "query": str(row["query"]),
-        "manifest_index": int(row["manifest_index"]),
+        "manifest_index": int(manifest_index),
         "clip_features": clip_features[0].to(dtype=torch.bfloat16).cpu(),
         "prompt_input_ids": input_ids[0].to(dtype=torch.int32).cpu(),
         "query_positions": torch.tensor(resolution.token_positions, dtype=torch.int32),
@@ -354,7 +362,9 @@ def run_cache(args: argparse.Namespace) -> int:
                 payload = torch.load(path, map_location="cpu", weights_only=False)
                 validate_cache_payload(torch, payload, row)
                 continue
-            payload = teacher_cache_row(torch, processor, model, device, row)
+            payload = teacher_cache_row(
+                torch, processor, model, device, row, manifest_index=index
+            )
             validate_cache_payload(torch, payload, row)
             atomic_torch_save(torch, path, payload)
             record = {
