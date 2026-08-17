@@ -1019,6 +1019,77 @@ def inference_modules(torch: Any, model: Any, device: Any, checkpoint: Path) -> 
     return conditioner, resampler
 
 
+def run_forward_smoke(args: argparse.Namespace) -> int:
+    """Exercise untrained SAQR256/196 generation without creating a result cell."""
+
+    import torch
+
+    rows = frozen_manifest(TRAIN_MANIFEST, TRAIN_SHA256, 3000)[:2]
+    set_determinism(torch)
+    torch_module, processor, model, device, environment = load_frozen_model()
+    freeze_base_and_install_lora(model)
+    conditioner, resampler, box_head, registry = build_modules(torch, model, device)
+    del box_head
+    conditioner.eval()
+    resampler.eval()
+    merge_projector_lora(model.model.multi_modal_projector)
+    forwarder = ContiguousPoolForwarder(torch, model)
+    eos_ids = eos_token_ids(model, processor)
+    results: list[dict[str, Any]] = []
+    for grid in (16, 14):
+        for row in rows:
+            image = Image.open(row["image_path"]).convert("RGB")
+            prompt = REGISTERED_PROMPT.format(query=row["query"])
+            text_prompt = apply_chat_template(processor, prompt, 1)
+            with torch.inference_mode():
+                compacted, diagnostics, assignment = prepare_saqr_inputs(
+                    processor,
+                    model,
+                    device,
+                    image,
+                    text_prompt,
+                    str(row["query"]),
+                    conditioner,
+                    resampler,
+                    output_grid=grid,
+                    sample_id=str(row["sample_id"]),
+                )
+                generated, generation = forwarder.generate_natural(
+                    compacted, max_new_tokens=MAX_NEW_TOKENS, eos_ids=eos_ids
+                )
+            expected_prompt_length = int(compacted["input_ids"].shape[1])
+            if generation["cache/prompt_per_layer_lengths"] != [expected_prompt_length] * 32:
+                raise CampaignError("Forward smoke prompt cache is not one contiguous dense cache")
+            expected_final = expected_prompt_length + max(int(generated.numel()) - 1, 0)
+            if generation["cache/final_per_layer_lengths"] != [expected_final] * 32:
+                raise CampaignError("Forward smoke cache growth is inconsistent")
+            if diagnostics["resampler"]["input_mass"] != [576.0] or diagnostics["resampler"]["output_mass"] != [576.0]:
+                raise CampaignError("Forward smoke violated SAQR mass conservation")
+            results.append({
+                "sample_id": str(row["sample_id"]),
+                "grid": grid,
+                "visual_tokens": grid * grid,
+                "generated_token_count": int(generated.numel()),
+                "raw_output": processor.decode(generated, skip_special_tokens=True).strip(),
+                "diagnostics": diagnostics,
+                "cache": generation,
+            })
+            image.close()
+    atomic_json(
+        args.output_root / "FORWARD_SMOKE.json",
+        {
+            "status": "PASS",
+            "scope": "untrained_architecture_only_not_a_quality_result",
+            "rows_per_grid": 2,
+            "grids": [16, 14],
+            "trainable_parameters": registry,
+            "environment": environment,
+            "results": results,
+        },
+    )
+    return 0
+
+
 def quality_rows(split: str) -> tuple[list[dict[str, Any]], Path, str]:
     if split == "calibration":
         rows = frozen_manifest(TRAIN_MANIFEST, TRAIN_SHA256, 3000)
@@ -1181,6 +1252,8 @@ def parse_args() -> argparse.Namespace:
     smoke = sub.add_parser("train-smoke")
     smoke.add_argument("--cache-root", type=Path, required=True)
     smoke.add_argument("--output-root", type=Path, required=True)
+    forward_smoke = sub.add_parser("forward-smoke")
+    forward_smoke.add_argument("--output-root", type=Path, required=True)
     quality = sub.add_parser("quality")
     quality.add_argument("--split", choices=["calibration", "discovery"], required=True)
     quality.add_argument("--no-query", action="store_true")
@@ -1201,6 +1274,8 @@ def main() -> int:
         return run_train(args)
     if args.command == "train-smoke":
         return run_train_smoke(args)
+    if args.command == "forward-smoke":
+        return run_forward_smoke(args)
     if args.command == "quality":
         return run_quality(args)
     if args.command == "validate-cache":
