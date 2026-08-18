@@ -207,11 +207,19 @@ def semantic_signature(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def compare_semantics(left: Path, right: Path, *, expected_rows: int) -> None:
+def compare_semantics(
+    left: Path,
+    right: Path,
+    *,
+    expected_rows: int,
+    right_prefix: bool = False,
+) -> None:
     left_rows = read_jsonl(left)
     right_rows = read_jsonl(right)
-    if len(left_rows) != expected_rows or len(right_rows) != expected_rows:
+    right_count_ok = len(right_rows) >= expected_rows if right_prefix else len(right_rows) == expected_rows
+    if len(left_rows) != expected_rows or not right_count_ok:
         raise ControllerError("Semantic parity inputs have the wrong row count")
+    right_rows = right_rows[:expected_rows]
     for index, (left_row, right_row) in enumerate(zip(left_rows, right_rows, strict=True)):
         if semantic_signature(left_row) != semantic_signature(right_row):
             raise ControllerError(f"Semantic parity mismatch at row {index}")
@@ -272,7 +280,12 @@ def run_historical_parity(limit: int = 20) -> dict[str, Any]:
             full_validation=False,
         )
         historical = REPO_ROOT / historical_relative / "predictions.jsonl"
-        compare_semantics(output_root / run_name / "predictions.jsonl", historical, expected_rows=limit)
+        compare_semantics(
+            output_root / run_name / "predictions.jsonl",
+            historical,
+            expected_rows=limit,
+            right_prefix=True,
+        )
         reports[cell_id] = report
     registry["phase_status"]["historical_parity"] = "pass"
     registry["historical_parity_smoke"] = {

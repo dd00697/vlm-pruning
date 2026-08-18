@@ -5,7 +5,11 @@ from types import SimpleNamespace
 
 from scripts.init_recent_methods_full_val_campaign import CELLS, MANIFEST_SHA256, ROWS
 from scripts.run_progressive_oracle_refcoco import ProgressiveRunError, validate_cli
-from scripts.run_recent_methods_full_val_campaign import runner_command, semantic_signature
+from scripts.run_recent_methods_full_val_campaign import (
+    compare_semantics,
+    runner_command,
+    semantic_signature,
+)
 from vlm_pruning.llava_hooks import average_visual_tokens, realized_visual_trace, validate_schedule
 
 
@@ -99,6 +103,32 @@ class RecentMethodsProtocolTests(unittest.TestCase):
         self.assertEqual(semantic_signature(base), semantic_signature(changed))
         changed["raw_model_output"] = "different"
         self.assertNotEqual(semantic_signature(base), semantic_signature(changed))
+
+    def test_historical_parity_accepts_an_aligned_reference_prefix(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+
+        row = {
+            "sample_id": "id",
+            "raw_model_output": "[0,0,1,1]",
+            "predicted_box": [0, 0, 1, 1],
+            "box_iou": 1.0,
+            "success_iou_0_5": True,
+            "generated_token_count": 2,
+            "final_retained_indices": [],
+            "realized_visual_tokens_by_layer": [0] * 32,
+            "stage_traces": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            left = root / "left.jsonl"
+            right = root / "right.jsonl"
+            left.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            right.write_text(json.dumps(row) + "\n" + json.dumps({**row, "sample_id": "later"}) + "\n", encoding="utf-8")
+            compare_semantics(left, right, expected_rows=1, right_prefix=True)
+            with self.assertRaisesRegex(Exception, "wrong row count"):
+                compare_semantics(left, right, expected_rows=1, right_prefix=False)
 
 
 if __name__ == "__main__":
