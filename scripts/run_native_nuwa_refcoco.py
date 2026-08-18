@@ -106,6 +106,19 @@ def git_clean(path: Path) -> bool:
     ).strip()
 
 
+def checked_wrapper_source() -> dict[str, str]:
+    relative = Path("scripts/run_native_nuwa_refcoco.py")
+    status = subprocess.check_output(
+        ["git", "status", "--porcelain", "--", str(relative)], cwd=REPO_ROOT, text=True
+    ).strip()
+    if status:
+        raise NativeNuwaError("Native Nüwa wrapper requires clean committed executable source")
+    return {
+        "git_commit": git_commit(REPO_ROOT),
+        "runner_sha256": sha256_file(REPO_ROOT / relative),
+    }
+
+
 def tree_hash(path: Path) -> str:
     """Hash Git's exact tracked blob inventory without rereading every worktree file."""
     inventory = subprocess.check_output(["git", "ls-files", "-s", "-z"], cwd=path)
@@ -456,6 +469,7 @@ class NativeTrial:
             raise NativeNuwaError("Fixed32 Nüwa diagnostic did not execute exactly 32 tokens")
         return {
             "sample_id": str(sample["sample_id"]),
+            "image_path": str(sample["image_path"]),
             "query": str(sample["query"]),
             "width": int(sample["width"]),
             "height": int(sample["height"]),
@@ -525,6 +539,7 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 def run(args: argparse.Namespace) -> int:
     manifest_sha, expected_rows = validate_args(args)
+    wrapper_source = checked_wrapper_source()
     if git_commit(NUWA_ROOT) != NUWA_COMMIT or not git_clean(NUWA_ROOT):
         raise NativeNuwaError("Pinned Nüwa checkout is not at its clean registered revision")
     if not git_clean(LLAVA_ROOT):
@@ -566,6 +581,8 @@ def run(args: argparse.Namespace) -> int:
         "llava_tree_sha256": tree_hash(LLAVA_ROOT),
         "checkpoint": str(MODEL_PATH),
         "checkpoint_config_sha256": sha256_file(MODEL_PATH / "config.json"),
+        "wrapper_git_commit": wrapper_source["git_commit"],
+        "wrapper_source_sha256": wrapper_source["runner_sha256"],
         "repetition": args.repetition,
         "order_position": args.order_position,
         "warmup_examples": args.warmup_examples,
