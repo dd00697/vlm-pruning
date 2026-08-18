@@ -129,15 +129,14 @@ def manifest_record(path: Path, expected_sha: str, expected_rows: int) -> dict[s
 
 
 def recursive_source_hash(path: Path) -> tuple[str, int]:
-    digest = hashlib.sha256()
-    count = 0
-    for item in sorted(candidate for candidate in path.rglob("*") if candidate.is_file() and ".git" not in candidate.parts):
-        relative = item.relative_to(path).as_posix().encode()
-        digest.update(len(relative).to_bytes(8, "big"))
-        digest.update(relative)
-        digest.update(bytes.fromhex(sha256(item)))
-        count += 1
-    return digest.hexdigest(), count
+    # A clean Git index is an exact recursive content inventory.  Hashing its
+    # NUL-delimited mode/blob/path records avoids rereading multi-gigabyte
+    # vendored test fixtures while retaining a deterministic SHA-256 lock.
+    inventory = subprocess.check_output(["git", "-C", str(path), "ls-files", "-s", "-z"])
+    files = inventory.count(b"\0")
+    if files == 0:
+        raise InitError(f"Official checkout has no tracked files: {path}")
+    return hashlib.sha256(inventory).hexdigest(), files
 
 
 def official_record(name: str, spec: dict[str, Any]) -> dict[str, Any]:
