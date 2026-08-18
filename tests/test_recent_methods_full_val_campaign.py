@@ -5,11 +5,14 @@ from types import SimpleNamespace
 
 from scripts.init_recent_methods_full_val_campaign import CELLS, MANIFEST_SHA256, ROWS
 from scripts.run_progressive_oracle_refcoco import ProgressiveRunError, validate_cli
+from scripts.run_baseline import parse_box as runner_parse_box
 from scripts.run_recent_methods_full_val_campaign import (
+    completed_attempt_present,
     compare_semantics,
     runner_command,
     semantic_signature,
 )
+from scripts.validate_progressive_oracle_run import parse_box as validator_parse_box
 from vlm_pruning.llava_hooks import average_visual_tokens, realized_visual_trace, validate_schedule
 
 
@@ -70,6 +73,31 @@ class RecentMethodsProtocolTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ProgressiveRunError, "cannot use --limit"):
             validate_cli(args)
+
+    def test_independent_validator_matches_frozen_runner_parser(self) -> None:
+        cases = (
+            "[0.1, 0.2, 0.8, 0.9]",
+            "[0.8, 0.2, 0.1, 0.9]",
+            "[-0.1, 0.2, 1.1, 0.9]",
+            "",
+            "not a box",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                raw, predicted, reason = runner_parse_box(text, 640, 480, "normalized_0_1")
+                self.assertEqual(validator_parse_box(text, 640, 480), (predicted, raw, reason))
+
+    def test_full_resume_reuses_only_atomically_completed_attempt(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            (run_dir / "config.json").write_text("{}\n", encoding="utf-8")
+            (run_dir / "predictions.jsonl").write_text("{}\n", encoding="utf-8")
+            self.assertFalse(completed_attempt_present(run_dir))
+            (run_dir / "COMPLETED.json").write_text("{}\n", encoding="utf-8")
+            self.assertTrue(completed_attempt_present(run_dir))
 
     def test_semantic_signature_ignores_only_runtime_measurements(self) -> None:
         base = {

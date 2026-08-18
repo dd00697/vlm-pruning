@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import subprocess
 import tempfile
 from datetime import datetime, timezone
@@ -21,7 +22,7 @@ import sys
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.init_progressive_oracle_campaign import box_iou, parse_box  # noqa: E402
+from scripts.init_progressive_oracle_campaign import box_iou  # noqa: E402
 from vlm_pruning.artifacts import sha256_file  # noqa: E402
 from vlm_pruning.llava_hooks import (  # noqa: E402
     OracleIndexArtifact,
@@ -69,6 +70,42 @@ def atomic_write(path: Path, payload: bytes) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, path)
+
+
+def parse_box(text: str, width: int, height: int) -> tuple[list[float] | None, list[float] | None, str | None]:
+    """Independent copy of the frozen runner's normalized-0-1 parser.
+
+    The runner returns ``(raw, predicted, reason)``.  This validator keeps its
+    historical ``(predicted, raw, reason)`` interface while reproducing the
+    runner's candidate extraction, coordinate-order check and image clipping.
+    """
+    if not text or not text.strip():
+        return None, None, "empty_response"
+    candidates: list[str] = []
+    for pattern in (r"<box>\s*([^<]+?)\s*</box>", r"\[([^\]]+)\]", r"\(([^\)]+)\)"):
+        candidates.extend(re.findall(pattern, text, flags=re.IGNORECASE | re.DOTALL))
+    if not candidates:
+        candidates = [text]
+    for candidate in candidates:
+        numbers = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", candidate)
+        if len(numbers) < 4:
+            continue
+        raw = [float(numbers[index]) for index in range(4)]
+        if raw[2] <= raw[0] or raw[3] <= raw[1]:
+            return None, raw, "invalid_coordinate_order"
+        pixels = [raw[0] * width, raw[1] * height, raw[2] * width, raw[3] * height]
+        if pixels[2] <= 0 or pixels[3] <= 0 or pixels[0] >= width or pixels[1] >= height:
+            return None, raw, "box_outside_image"
+        clipped = [
+            max(0.0, min(float(width), pixels[0])),
+            max(0.0, min(float(height), pixels[1])),
+            max(0.0, min(float(width), pixels[2])),
+            max(0.0, min(float(height), pixels[3])),
+        ]
+        if clipped[2] <= clipped[0] or clipped[3] <= clipped[1]:
+            return None, raw, "empty_box_after_clipping"
+        return clipped, raw, None
+    return None, None, "no_parseable_box"
 
 
 def read_jsonl_strict(path: Path, expected_rows: int) -> list[dict[str, Any]]:

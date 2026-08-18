@@ -118,6 +118,11 @@ def update_state(phase: str, next_action: str, *, workers: list[dict[str, Any]] 
     atomic_json(STATE_PATH, state)
 
 
+def completed_attempt_present(run_dir: Path) -> bool:
+    """Return true only for an attempt that reached atomic terminal finalization."""
+    return all((run_dir / name).is_file() for name in ("config.json", "predictions.jsonl", "COMPLETED.json"))
+
+
 def runner_command(
     cell_id: str,
     *,
@@ -413,12 +418,19 @@ def run_full(max_workers: int) -> dict[str, Any]:
         processes: dict[str, subprocess.Popen[Any]] = {}
         handles = []
         paths: dict[str, Path] = {}
+        existing_reports: dict[str, dict[str, Any]] = {}
         try:
             storage_guard()
             for cell_id in batch:
                 run_name = f"{cell_id.lower()}_attempt1"
                 run_dir = output_root / run_name
                 run_dir.mkdir(parents=True, exist_ok=True)
+                paths[cell_id] = run_dir
+                if completed_attempt_present(run_dir):
+                    existing_reports[cell_id] = validate_run(
+                        run_dir, MANIFEST, expected_rows=ROWS, finalize=False
+                    )
+                    continue
                 log_handle = (run_dir / "worker.log").open("a", encoding="utf-8")
                 handles.append(log_handle)
                 command = runner_command(
@@ -432,7 +444,6 @@ def run_full(max_workers: int) -> dict[str, Any]:
                 processes[cell_id] = subprocess.Popen(
                     command, cwd=REPO_ROOT, stdout=log_handle, stderr=subprocess.STDOUT, text=True
                 )
-                paths[cell_id] = run_dir
             update_state(
                 "full_validation",
                 "running_full_validation",
@@ -444,7 +455,9 @@ def run_full(max_workers: int) -> dict[str, Any]:
                 handle.close()
         registry = load_registry()
         for cell_id in batch:
-            report = validate_run(paths[cell_id], MANIFEST, expected_rows=ROWS)
+            report = existing_reports.get(cell_id) or validate_run(
+                paths[cell_id], MANIFEST, expected_rows=ROWS
+            )
             registry["cells"][cell_id]["status"] = "accepted"
             registry["cells"][cell_id]["accepted_attempt"] = str(paths[cell_id].relative_to(CAMPAIGN_ROOT))
             registry["cells"][cell_id]["validation"] = report
