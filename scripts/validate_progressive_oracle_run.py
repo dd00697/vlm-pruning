@@ -178,7 +178,7 @@ def validate_config(config: dict[str, Any], manifest_path: Path, manifest_rows: 
     for key, expected in checks.items():
         _equal(config.get(key), expected, f"config {key}")
     implementation = config.get("runtime_implementation", "original")
-    if implementation not in {"original", "fused_native"}:
+    if implementation not in {"original", "fused_native", "feather_adapter"}:
         raise ProgressiveValidationError(
             f"Unsupported runtime implementation {implementation}"
         )
@@ -207,6 +207,23 @@ def validate_config(config: dict[str, Any], manifest_path: Path, manifest_rows: 
     if "testa" in manifest_text or "testb" in manifest_text:
         raise ProgressiveValidationError("Forbidden RefCOCO test manifest in config")
     config_events(config)
+    method = config.get("method/name", "progressive")
+    if method == "feather_llava_main":
+        feather_checks = {
+            "runtime_implementation": "feather_adapter",
+            "feather/official_repository": "https://github.com/markendo/FEATHER",
+            "feather/official_commit": "c2a09b2765967601054c7b1fd513ac3e94ee4fc9",
+            "feather/boundaries": [8, 16],
+            "feather/fastv_ratio_upstream": 0.7,
+            "feather/keep_ratio": 0.3,
+            "feather/predefined_mask": "no_rope_s=3",
+            "feather/adaptive_union": True,
+            "schedule": [],
+        }
+        for key, expected in feather_checks.items():
+            _equal(config.get(key), expected, f"config {key}")
+    elif method != "progressive":
+        raise ProgressiveValidationError(f"Unsupported method {method}")
     pre_selector = config.get("pre_llm_selector")
     pre_budget = config.get("pre_llm_budget")
     teacher = config.get("oracle_teacher_layer")
@@ -223,12 +240,33 @@ def validate_config(config: dict[str, Any], manifest_path: Path, manifest_rows: 
     verify_source(config)
 
 
-def expected_visual_trace(config: dict[str, Any]) -> list[int]:
+def expected_visual_trace(config: dict[str, Any], row: dict[str, Any] | None = None) -> list[int]:
+    if config.get("method/name") == "feather_llava_main":
+        if row is None or not isinstance(row.get("stage_traces"), list) or len(row["stage_traces"]) != 2:
+            raise ProgressiveValidationError("FEATHER row has no two-stage adaptive trace")
+        first = int(row["stage_traces"][0].get("realized_budget", -1))
+        second = int(row["stage_traces"][1].get("realized_budget", -1))
+        return [576] * 8 + [first] * 8 + [second] * 16
     initial = int(config["pre_llm_budget"]) if config["pre_llm_selector"] != "none" else 576
     return realized_visual_trace(config_events(config), initial_visual_tokens=initial)
 
 
-def expected_stage_specs(config: dict[str, Any]) -> list[dict[str, Any]]:
+def expected_stage_specs(config: dict[str, Any], row: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    if config.get("method/name") == "feather_llava_main":
+        if row is None or not isinstance(row.get("stage_traces"), list) or len(row["stage_traces"]) != 2:
+            raise ProgressiveValidationError("FEATHER row has no two adaptive stages")
+        return [
+            {
+                "boundary": 8,
+                "budget": int(row["stage_traces"][0].get("realized_budget", -1)),
+                "selector": "feather_no_rope_topk_union_stride3",
+            },
+            {
+                "boundary": 16,
+                "budget": int(row["stage_traces"][1].get("realized_budget", -1)),
+                "selector": "feather_no_rope_squared_keep_ratio",
+            },
+        ]
     specs: list[dict[str, Any]] = []
     if config["pre_llm_selector"] != "none":
         selector = config["pre_llm_selector"]
@@ -243,7 +281,7 @@ def validate_stage_traces(row: dict[str, Any], config: dict[str, Any], row_index
     traces = row.get("stage_traces")
     if not isinstance(traces, list):
         raise ProgressiveValidationError(f"row {row_index} stage_traces missing")
-    specs = expected_stage_specs(config)
+    specs = expected_stage_specs(config, row)
     _equal(len(traces), len(specs), f"row {row_index} stage count")
     previous = list(range(576))
     original_visual_positions = row.get("progressive/original_visual_positions")
@@ -286,7 +324,10 @@ def validate_stage_traces(row: dict[str, Any], config: dict[str, Any], row_index
         _equal(trace.get("position_id_checksum"), json_checksum(expected_positions), f"{label} position checksum")
         _equal(int(trace.get("incoming_sequence_length", -1)), previous_sequence_length, f"{label} incoming sequence")
         _equal(int(trace.get("outgoing_sequence_length", -1)), len(expected_positions), f"{label} outgoing sequence")
-        if spec["selector"] in {"query_topk", "query_topk_merge", "k12_original"}:
+        if spec["selector"] in {
+            "query_topk", "query_topk_merge", "k12_original",
+            "feather_no_rope_topk_union_stride3", "feather_no_rope_squared_keep_ratio",
+        }:
             _equal(trace.get("score_map_recomputed"), True, f"{label} score recomputation")
             if not isinstance(trace.get("score_map_checksum"), str) or len(trace["score_map_checksum"]) != 64:
                 raise ProgressiveValidationError(f"{label} score checksum missing")
@@ -361,10 +402,41 @@ def validate_stage_traces(row: dict[str, Any], config: dict[str, Any], row_index
         previous_sequence_length = len(expected_positions)
     _equal(row.get("final_retained_indices"), previous, f"row {row_index} final retained indices")
     _equal(row.get("final_retained_indices_checksum"), json_checksum(previous), f"row {row_index} final checksum")
+    if config.get("method/name") == "feather_llava_main":
+        metadata = row.get("feather/stage_metadata")
+        if not isinstance(metadata, list) or len(metadata) != 2:
+            raise ProgressiveValidationError(f"row {row_index} FEATHER metadata malformed")
+        first, second = metadata
+        _equal(int(first.get("stage_index", -1)), 0, f"row {row_index} FEATHER first stage")
+        _equal(int(first.get("boundary", -1)), 8, f"row {row_index} FEATHER first boundary")
+        _equal(int(first.get("incoming_tokens", -1)), 576, f"row {row_index} FEATHER first incoming")
+        _equal(int(first.get("attention_topk_count", -1)), 172, f"row {row_index} FEATHER first top-k")
+        _equal(int(first.get("uniform_stride_count", -1)), 64, f"row {row_index} FEATHER stride count")
+        _equal(int(first.get("realized_tokens", -1)), len(traces[0]["outgoing_original_indices"]), f"row {row_index} FEATHER first realized")
+        _equal(first.get("selected_local_indices"), traces[0]["outgoing_original_indices"], f"row {row_index} FEATHER first local order")
+        first_count = len(traces[0]["outgoing_original_indices"])
+        if not 172 <= first_count <= 236:
+            raise ProgressiveValidationError(f"row {row_index} FEATHER union count outside exact bounds")
+        _equal(int(second.get("stage_index", -1)), 1, f"row {row_index} FEATHER second stage")
+        _equal(int(second.get("boundary", -1)), 16, f"row {row_index} FEATHER second boundary")
+        _equal(int(second.get("incoming_tokens", -1)), first_count, f"row {row_index} FEATHER second incoming")
+        _equal(int(second.get("attention_topk_count", -1)), int(first_count * 0.09), f"row {row_index} FEATHER squared top-k")
+        _equal(int(second.get("uniform_stride_count", -1)), 0, f"row {row_index} FEATHER second uniform")
+        second_local = second.get("selected_local_indices")
+        if not isinstance(second_local, list):
+            raise ProgressiveValidationError(f"row {row_index} FEATHER second local indices missing")
+        _equal(
+            [traces[0]["outgoing_original_indices"][int(local)] for local in second_local],
+            traces[1]["outgoing_original_indices"],
+            f"row {row_index} FEATHER second original mapping",
+        )
+        _equal(second.get("squared_ratio_at_second_stage"), True, f"row {row_index} FEATHER squared-ratio flag")
+        for stage, trace_row in zip(metadata, traces, strict=True):
+            _equal(stage.get("score_sha256"), trace_row.get("score_map_checksum"), f"row {row_index} FEATHER score hash")
 
 
 def validate_cache_and_tokens(row: dict[str, Any], config: dict[str, Any], row_index: int) -> None:
-    trace = expected_visual_trace(config)
+    trace = expected_visual_trace(config, row)
     _equal(row.get("realized_visual_tokens_by_layer"), trace, f"row {row_index} visual trace")
     _equal(row.get("progressive/realized_visual_tokens_by_layer"), trace, f"row {row_index} diagnostic trace")
     expected_average = average_visual_tokens(trace)

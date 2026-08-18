@@ -41,6 +41,7 @@ from run_official_baseline import load_manifest, load_model, load_sample_images,
 from vlm_pruning.artifacts import sha256_file, source_provenance  # noqa: E402
 from vlm_pruning.features import resolve_query_token_positions  # noqa: E402
 from vlm_pruning.llava_hooks import (  # noqa: E402
+    FeatherLlavaForwarder,
     FusedNativeProgressiveForwarder,
     OracleIndexArtifact,
     ProgressivePruneForwarder,
@@ -132,6 +133,11 @@ def schedule_string(events: tuple[PruningEvent, ...]) -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cell-id", required=True)
+    parser.add_argument(
+        "--method",
+        choices=["progressive", "feather_llava_main"],
+        default="progressive",
+    )
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--run-name")
@@ -168,6 +174,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_cli(args: argparse.Namespace) -> None:
+    method = getattr(args, "method", "progressive")
+    if method == "feather_llava_main":
+        if args.schedule or args.runtime_implementation != "original":
+            raise ProgressiveRunError("FEATHER owns its adaptive schedule and requires the original runtime flag")
+        if args.pre_llm_selector != "none" or args.pre_llm_budget is not None:
+            raise ProgressiveRunError("FEATHER forbids pre-LLM selection")
     if args.pre_llm_selector == "none":
         if args.pre_llm_budget is not None or args.oracle_teacher_layer is not None:
             raise ProgressiveRunError("No pre-LLM selector cannot have a budget or oracle teacher")
@@ -212,6 +224,7 @@ def source_contract() -> dict[str, Any]:
         Path("vlm_pruning/features/query_tokens.py"),
         Path("vlm_pruning/llava_hooks/mid_layer_pruning.py"),
         Path("vlm_pruning/llava_hooks/progressive_pruning.py"),
+        Path("vlm_pruning/llava_hooks/feather_pruning.py"),
         Path("vlm_pruning/llava_hooks/runtime_repairs.py"),
     ]
     provenance = source_provenance(REPO_ROOT, paths)
@@ -256,6 +269,7 @@ def build_config(args: argparse.Namespace, rows: list[dict[str, Any]], run_dir: 
     return {
         "schema_version": 1,
         "cell_id": str(args.cell_id),
+        "method/name": str(args.method),
         "run_name": run_dir.name,
         "created_at_utc": utc_now(),
         "source/git_commit": provenance["git_commit"],
@@ -277,7 +291,9 @@ def build_config(args: argparse.Namespace, rows: list[dict[str, Any]], run_dir: 
         "grid": GRID,
         "schedule": [event.as_dict() for event in args.schedule],
         "schedule_string": schedule_string(args.schedule),
-        "runtime_implementation": str(args.runtime_implementation),
+        "runtime_implementation": (
+            "feather_adapter" if args.method == "feather_llava_main" else str(args.runtime_implementation)
+        ),
         "position_mode": "gap_preserving",
         "query_map": "current_boundary_hidden_query_patch_cosine_query_max",
         "query_tie_break": "descending_relevance_then_lower_surviving_original_raster_index",
@@ -293,11 +309,23 @@ def build_config(args: argparse.Namespace, rows: list[dict[str, Any]], run_dir: 
         "scope": scope,
         "registered_scope": str(args.registered_scope),
         "run/output_dir": str(run_dir.relative_to(REPO_ROOT)),
+        "feather/official_repository": (
+            "https://github.com/markendo/FEATHER" if args.method == "feather_llava_main" else None
+        ),
+        "feather/official_commit": (
+            "c2a09b2765967601054c7b1fd513ac3e94ee4fc9"
+            if args.method == "feather_llava_main" else None
+        ),
+        "feather/boundaries": [8, 16] if args.method == "feather_llava_main" else None,
+        "feather/fastv_ratio_upstream": 0.7 if args.method == "feather_llava_main" else None,
+        "feather/keep_ratio": 0.3 if args.method == "feather_llava_main" else None,
+        "feather/predefined_mask": "no_rope_s=3" if args.method == "feather_llava_main" else None,
+        "feather/adaptive_union": args.method == "feather_llava_main",
     }
 
 
 IMMUTABLE_CONFIG_KEYS = {
-    "cell_id", "source/git_commit", "source/git_dirty", "source/sha256",
+    "cell_id", "method/name", "source/git_commit", "source/git_dirty", "source/sha256",
     "model/name", "model/precision", "model/decoding", "model/max_new_tokens",
     "dataset/name", "dataset/split", "dataset/manifest", "dataset/manifest_checksum",
     "dataset/num_samples", "prompt/template", "original_visual_tokens", "grid",
@@ -305,6 +333,9 @@ IMMUTABLE_CONFIG_KEYS = {
     "pre_llm_budget", "oracle_teacher_layer", "limit", "scope",
     "registered_scope",
     "oracle_index_input", "oracle_index_input_sha256",
+    "feather/official_repository", "feather/official_commit", "feather/boundaries",
+    "feather/fastv_ratio_upstream", "feather/keep_ratio", "feather/predefined_mask",
+    "feather/adaptive_union",
 }
 
 
@@ -496,20 +527,30 @@ def run(args: argparse.Namespace) -> int:
     torch, processor, model, device, model_env = load_model(args.model_path, args.precision)
     model_load_latency = time.perf_counter() - model_load_start
     image_token_id = int(getattr(model.config, "image_token_index", 32000))
-    forwarder_class = (
-        FusedNativeProgressiveForwarder
-        if args.runtime_implementation == "fused_native"
-        else ProgressivePruneForwarder
-    )
-    forwarder = forwarder_class(
-        torch,
-        model,
-        image_token_id=image_token_id,
-        schedule=args.schedule,
-        grid=GRID,
-        initial_visual_tokens=ORIGINAL_VISUAL_TOKENS,
-        diagnostics_mode="benchmark",
-    )
+    if args.method == "feather_llava_main":
+        forwarder = FeatherLlavaForwarder(
+            torch,
+            model,
+            image_token_id=image_token_id,
+            grid=GRID,
+            initial_visual_tokens=ORIGINAL_VISUAL_TOKENS,
+            diagnostics_mode="benchmark",
+        )
+    else:
+        forwarder_class = (
+            FusedNativeProgressiveForwarder
+            if args.runtime_implementation == "fused_native"
+            else ProgressivePruneForwarder
+        )
+        forwarder = forwarder_class(
+            torch,
+            model,
+            image_token_id=image_token_id,
+            schedule=args.schedule,
+            grid=GRID,
+            initial_visual_tokens=ORIGINAL_VISUAL_TOKENS,
+            diagnostics_mode="benchmark",
+        )
     environment = {
         "created_at_utc": utc_now(),
         "python": sys.version,

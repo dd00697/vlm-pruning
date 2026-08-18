@@ -59,6 +59,13 @@ from .runtime_repairs import (
     FusedNativeProgressiveForwarder,
     NativeCacheProgressiveForwarder,
 )
+from .feather_pruning import (
+    FEATHER_BOUNDARIES,
+    FEATHER_KEEP_RATIO,
+    FEATHER_STRIDE,
+    FeatherLlavaForwarder,
+    feather_select_original_indices,
+)
 
 __all__ = [
     "ContiguousCacheState",
@@ -109,4 +116,9 @@ __all__ = [
     "RuntimeProfiler",
     "StageReplay",
     "load_stage_replay",
+    "FEATHER_BOUNDARIES",
+    "FEATHER_KEEP_RATIO",
+    "FEATHER_STRIDE",
+    "FeatherLlavaForwarder",
+    "feather_select_original_indices",
 ]
