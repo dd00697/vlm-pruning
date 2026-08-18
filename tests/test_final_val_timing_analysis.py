@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import unittest
 
-from scripts.analyse_final_val_timing import TimingAnalysisError, normalize, validate_trace
+from scripts.analyse_final_val_timing import (
+    TimingAnalysisError,
+    analysis_stacks,
+    contrasts,
+    normalize,
+    validate_trace,
+)
 
 
 class FinalValTimingAnalysisTests(unittest.TestCase):
@@ -22,6 +28,28 @@ class FinalValTimingAnalysisTests(unittest.TestCase):
         validate_trace("FEATHER_LLAVA_MAIN", [576] * 8 + [217] * 8 + [19] * 16)
         with self.assertRaises(TimingAnalysisError):
             validate_trace("NUWA_NATIVE_192", [336] * 15 + [48] * 17)
+
+    def test_contrasts_skip_unavailable_stack_and_metric(self) -> None:
+        sample = {
+            "end_to_end_latency_s": 1.0,
+            "prefill_including_pruning_latency_s": None,
+            "time_to_first_token_s": None,
+            "decode_latency_s": None,
+            "generated_token_count": None,
+        }
+        stacks = {
+            "fastv": {
+                "FASTV_MATCHED_199": [[dict(sample)]],
+                "FASTV_STACK_FULL": [[dict(sample)]],
+            }
+        }
+        rows = contrasts(stacks)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["stack"], "fastv")
+        self.assertEqual(rows[0]["metric"], "end_to_end_latency_s")
+
+    def test_natural_analysis_always_requires_all_stacks(self) -> None:
+        self.assertEqual(analysis_stacks("natural"), ("canonical", "fastv", "nuwa"))
 
 
 if __name__ == "__main__":

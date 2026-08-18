@@ -168,7 +168,11 @@ def validate_ledger(stack: str, mode: str, expected_jobs: int) -> dict[str, Any]
         raise TimingAnalysisError(f"Timing ledger is incomplete: {path}")
     intervals = []
     for index, row in enumerate(ledger["jobs"]):
-        if row.get("status") not in {"complete", "complete_after_resume_validation"}:
+        if row.get("status") not in {
+            "complete",
+            "complete_after_resume_validation",
+            "validated_preexisting_complete",
+        }:
             raise TimingAnalysisError(f"Timing ledger contains a non-executed job at {index}")
         if row.get("gpu_compute_pids_before") or row.get("gpu_compute_pids_after"):
             raise TimingAnalysisError(f"Competing/remaining GPU process recorded at timing job {index}")
@@ -312,6 +316,8 @@ def contrasts(
     }
     output = []
     for stack, stack_pairs in pairs.items():
+        if stack not in stacks:
+            continue
         for left, right in stack_pairs:
             for field in (
                 "end_to_end_latency_s",
@@ -320,16 +326,22 @@ def contrasts(
                 "decode_latency_s",
                 "generated_token_count",
             ):
+                left_rows = stacks[stack][left]
+                right_rows = stacks[stack][right]
+                if any(
+                    sample[field] is None
+                    for repetition in (*left_rows, *right_rows)
+                    for sample in repetition
+                ):
+                    continue
                 left_values = [
-                    [float(sample[field]) for sample in repetition]
-                    for repetition in stacks[stack][left]
+                    [float(sample[field]) for sample in repetition]  # type: ignore[arg-type]
+                    for repetition in left_rows
                 ]
                 right_values = [
-                    [float(sample[field]) for sample in repetition]
-                    for repetition in stacks[stack][right]
+                    [float(sample[field]) for sample in repetition]  # type: ignore[arg-type]
+                    for repetition in right_rows
                 ]
-                if any(value is None for repetition in stacks[stack][left] for value in [repetition[0][field]]):
-                    continue
                 interval = hierarchical_paired_bootstrap_interval(
                     left_values,
                     right_values,
@@ -406,6 +418,30 @@ def fixed32_trigger(
     }
 
 
+def analysis_stacks(mode: str) -> tuple[str, ...]:
+    """Return exactly the software stacks registered for this analysis mode."""
+
+    if mode == "natural":
+        return STACKS
+    trigger_path = ANALYSIS / "FIXED32_TRIGGER.json"
+    if not trigger_path.is_file():
+        raise TimingAnalysisError("Fixed32 analysis requires FIXED32_TRIGGER.json")
+    trigger = json.loads(trigger_path.read_text(encoding="utf-8"))
+    if trigger.get("status") != "complete":
+        raise TimingAnalysisError("Fixed32 trigger artifact is incomplete")
+    unknown = set(trigger.get("stacks", {})) - set(STACKS)
+    if unknown:
+        raise TimingAnalysisError(f"Fixed32 trigger contains unknown stacks: {sorted(unknown)}")
+    required = tuple(
+        stack
+        for stack in STACKS
+        if trigger.get("stacks", {}).get(stack, {}).get("required") is True
+    )
+    if not required:
+        raise TimingAnalysisError("Fixed32 analysis was requested but no stack was triggered")
+    return required
+
+
 def main() -> int:
     args = parse_args()
     if sha256_file(MANIFEST) != MANIFEST_SHA256:
@@ -418,7 +454,7 @@ def main() -> int:
     inventory = []
     ledgers = {}
     summaries = []
-    for stack in STACKS:
+    for stack in analysis_stacks(args.mode):
         stack_data[stack], stack_inventory, ledgers[stack] = load_stack(
             stack, args.mode, manifest_ids
         )
