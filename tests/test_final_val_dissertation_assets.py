@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from scripts.build_final_val_dissertation_assets import table, tex
+from scripts.build_final_val_dissertation_assets import DISPLAY, table, tex
 
 
 class FinalValDissertationAssetTests(unittest.TestCase):
@@ -16,6 +16,9 @@ class FinalValDissertationAssetTests(unittest.TestCase):
         self.assertIn("\\toprule", output)
         self.assertIn("\\label{tab:test}", output)
         self.assertIn("x & 1\\\\", output)
+
+    def test_nuwa_display_uses_latex_umlaut(self) -> None:
+        self.assertEqual(DISPLAY["NUWA_STACK_FULL"], 'N\\"uwa-stack Full')
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -28,8 +29,8 @@ DISPLAY = {
     "FEATHER_LLAVA_MAIN": "FEATHER (LLaVA adapter)",
     "FASTV_MATCHED_199": "FastV (official fork)",
     "FASTV_STACK_FULL": "FastV-stack Full",
-    "NUWA_STACK_FULL": "N\"uwa-stack Full",
-    "NUWA_NATIVE_192": "N\"uwa NT192/DIST280",
+    "NUWA_STACK_FULL": "N\\\"uwa-stack Full",
+    "NUWA_NATIVE_192": "N\\\"uwa NT192/DIST280",
 }
 
 
@@ -41,6 +42,14 @@ def read(path: Path) -> Any:
     if not path.is_file():
         raise DissertationAssetError(f"Missing prerequisite: {path}")
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def atomic_write(path: Path, text: str) -> None:
@@ -384,11 +393,17 @@ def main() -> int:
     )
     for filename in sources:
         shutil.copy2(ANALYSIS / filename, DERIVED / filename)
+    generated_files = sorted(GENERATED.glob("*.tex"))
+    figure_files = sorted(FIGURES.glob("*.pdf"))
+    derived_files = sorted(
+        path for path in DERIVED.glob("*.json") if path.name != "ASSET_MANIFEST.json"
+    )
     manifest = {
         "status": "complete",
         "source_campaign": str(CAMPAIGN),
-        "generated_tex": sorted(path.name for path in GENERATED.glob("*.tex")),
-        "figures": sorted(path.name for path in FIGURES.glob("*.pdf")),
+        "generated_tex": {path.name: sha256_file(path) for path in generated_files},
+        "figures": {path.name: sha256_file(path) for path in figure_files},
+        "derived_json": {path.name: sha256_file(path) for path in derived_files},
         "testA_testB_included": False,
     }
     atomic_write(DERIVED / "ASSET_MANIFEST.json", json.dumps(manifest, indent=2, sort_keys=True) + "\n")
