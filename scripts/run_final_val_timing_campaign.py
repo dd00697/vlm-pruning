@@ -40,7 +40,6 @@ PAIRED_ORDER = {
     5: ("FULL", "PRUNED"),
 }
 CUDA_LIBRARY_PATHS = (
-    CAMPAIGN / "envs/nuwa/lib/python3.11/site-packages/nvidia/cusparselt/lib",
     Path("/usr/local/lib/python3.11/dist-packages/nvidia/cublas/lib"),
     Path("/usr/local/lib/python3.11/dist-packages/nvidia/cuda_cupti/lib"),
     Path("/usr/local/lib/python3.11/dist-packages/nvidia/cuda_nvrtc/lib"),
