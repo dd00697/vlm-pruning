@@ -54,6 +54,8 @@ from vlm_pruning.llava_hooks import (  # noqa: E402
 CAMPAIGN_ROOT = REPO_ROOT / "experiments/progressive_oracle_refcoco_val_20260814"
 DEFAULT_MANIFEST = CAMPAIGN_ROOT / "manifests/refcoco_val_discovery1000.jsonl"
 DEFAULT_OUTPUT_ROOT = CAMPAIGN_ROOT / "runs"
+FULL_VALIDATION_MANIFEST_SHA256 = "f26d7b954189e86f55b50f9506bb670d3a0cf847d3152779af6c08dbf094e3d7"
+FULL_VALIDATION_ROWS = 8811
 REGISTERED_PROMPT = (
     'Identify the target described by this referring expression: "{query}".\n'
     "Return exactly one bounding box in normalized 0-1 image coordinates as "
@@ -151,6 +153,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--precision", choices=["bf16"], default="bf16")
     parser.add_argument("--model-path", default=DEFAULT_MODEL)
     parser.add_argument("--limit", type=int)
+    parser.add_argument(
+        "--registered-scope",
+        choices=["auto", "full_validation"],
+        default="auto",
+        help=(
+            "Use full_validation only for the frozen 8,811-row RefCOCO-val manifest. "
+            "The default preserves the historical smoke/discovery contract."
+        ),
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
     return parser.parse_args()
@@ -184,6 +195,8 @@ def validate_cli(args: argparse.Namespace) -> None:
             )
     if args.limit is not None and args.limit <= 0:
         raise ProgressiveRunError("--limit must be positive")
+    if args.registered_scope == "full_validation" and args.limit is not None:
+        raise ProgressiveRunError("full_validation scope cannot use --limit")
 
 
 def make_prompt(sample: dict[str, Any]) -> str:
@@ -224,6 +237,22 @@ def build_config(args: argparse.Namespace, rows: list[dict[str, Any]], run_dir: 
         manifest_display = str(manifest_path.relative_to(REPO_ROOT))
     except ValueError:
         manifest_display = str(manifest_path)
+    scope = (
+        "smoke"
+        if args.limit is not None
+        else "full_validation"
+        if args.registered_scope == "full_validation"
+        else "discovery"
+    )
+    if scope == "full_validation":
+        if len(rows) != FULL_VALIDATION_ROWS:
+            raise ProgressiveRunError(
+                f"full_validation requires {FULL_VALIDATION_ROWS} rows, found {len(rows)}"
+            )
+        if manifest_checksum(args.manifest) != FULL_VALIDATION_MANIFEST_SHA256:
+            raise ProgressiveRunError("full_validation manifest hash mismatch")
+        if args.pre_llm_selector != "none":
+            raise ProgressiveRunError("full_validation scope forbids pre-LLM/oracle selectors")
     return {
         "schema_version": 1,
         "cell_id": str(args.cell_id),
@@ -261,7 +290,8 @@ def build_config(args: argparse.Namespace, rows: list[dict[str, Any]], run_dir: 
         "oracle_index_input": str(args.oracle_index_input.resolve()) if args.oracle_index_input else None,
         "oracle_index_input_sha256": sha256_file(args.oracle_index_input) if args.oracle_index_input else None,
         "limit": args.limit,
-        "scope": "smoke" if args.limit is not None else "discovery",
+        "scope": scope,
+        "registered_scope": str(args.registered_scope),
         "run/output_dir": str(run_dir.relative_to(REPO_ROOT)),
     }
 
@@ -273,6 +303,7 @@ IMMUTABLE_CONFIG_KEYS = {
     "dataset/num_samples", "prompt/template", "original_visual_tokens", "grid",
     "schedule", "runtime_implementation", "position_mode", "query_map", "seed", "pre_llm_selector",
     "pre_llm_budget", "oracle_teacher_layer", "limit", "scope",
+    "registered_scope",
     "oracle_index_input", "oracle_index_input_sha256",
 }
 

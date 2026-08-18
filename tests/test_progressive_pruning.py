@@ -24,6 +24,25 @@ from scripts.run_progressive_oracle_refcoco import ProgressiveRunError, validate
 
 
 class ProgressiveScheduleTests(unittest.TestCase):
+    def test_registered_full_validation_schedule_accounting(self) -> None:
+        expected = {
+            ((12, 48, "k12_original"), (20, 6, "query_topk")): (7368, 230.25, 6),
+            ((12, 48, "k12_original"), (20, 0, "none")): (7296, 228.0, 0),
+            ((4, 448, "query_topk"), (12, 48, "query_topk")): (6848, 214.0, 48),
+            ((4, 448, "query_topk_merge"), (12, 48, "query_topk")): (6848, 214.0, 48),
+            (
+                (4, 448, "query_topk_merge"),
+                (12, 48, "query_topk"),
+                (20, 0, "none"),
+            ): (6272, 196.0, 0),
+        }
+        for raw, (work, average, final_budget) in expected.items():
+            with self.subTest(schedule=raw):
+                trace = realized_visual_trace(validate_schedule(raw))
+                self.assertEqual(sum(trace), work)
+                self.assertEqual(average_visual_tokens(trace), average)
+                self.assertEqual(trace[-1], final_budget)
+
     def test_fused_native_runner_is_restricted_to_m448_prefix(self) -> None:
         base = {
             "pre_llm_selector": "none",
@@ -32,6 +51,7 @@ class ProgressiveScheduleTests(unittest.TestCase):
             "oracle_index_input": None,
             "runtime_implementation": "fused_native",
             "limit": 2,
+            "registered_scope": "auto",
         }
         validate_cli(
             SimpleNamespace(

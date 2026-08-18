@@ -34,6 +34,9 @@ from vlm_pruning.llava_hooks import (  # noqa: E402
 
 
 EXPECTED_DISCOVERY_SHA256 = "98577029365776a76bd5ec798da4ef06c546e298fd1e950bd238d6b9d127f1cd"
+EXPECTED_DISCOVERY_ROWS = 1000
+EXPECTED_FULL_VALIDATION_SHA256 = "f26d7b954189e86f55b50f9506bb670d3a0cf847d3152779af6c08dbf094e3d7"
+EXPECTED_FULL_VALIDATION_ROWS = 8811
 REGISTERED_PROMPT = (
     'Identify the target described by this referring expression: "{query}".\n'
     "Return exactly one bounding box in normalized 0-1 image coordinates as "
@@ -143,10 +146,22 @@ def validate_config(config: dict[str, Any], manifest_path: Path, manifest_rows: 
             f"Unsupported runtime implementation {implementation}"
         )
     if config.get("scope") == "discovery":
-        _equal(len(manifest_rows), 1000, "discovery row count")
+        _equal(len(manifest_rows), EXPECTED_DISCOVERY_ROWS, "discovery row count")
         _equal(sha256_file(manifest_path), EXPECTED_DISCOVERY_SHA256, "discovery manifest hash")
         if config.get("limit") is not None:
             raise ProgressiveValidationError("Discovery config unexpectedly has a limit")
+        _equal(config.get("registered_scope", "auto"), "auto", "discovery registered scope")
+    elif config.get("scope") == "full_validation":
+        _equal(len(manifest_rows), EXPECTED_FULL_VALIDATION_ROWS, "full-validation row count")
+        _equal(
+            sha256_file(manifest_path),
+            EXPECTED_FULL_VALIDATION_SHA256,
+            "full-validation manifest hash",
+        )
+        if config.get("limit") is not None:
+            raise ProgressiveValidationError("Full-validation config unexpectedly has a limit")
+        _equal(config.get("registered_scope"), "full_validation", "full-validation registered scope")
+        _equal(config.get("pre_llm_selector"), "none", "full-validation pre-LLM selector")
     elif config.get("scope") != "smoke":
         raise ProgressiveValidationError(f"Unsupported run scope {config.get('scope')}")
     if any(str(row.get("dataset") or "").lower() != "refcoco" or str(row.get("split") or "").lower() != "val" for row in manifest_rows):
@@ -407,7 +422,16 @@ def validate_run(
     if not config_path.is_file():
         raise ProgressiveValidationError(f"Missing config: {config_path}")
     config = json.loads(config_path.read_text(encoding="utf-8"))
-    manifest_physical_rows = 1000 if config.get("scope") == "smoke" else expected_rows
+    manifest_hash = sha256_file(manifest_path)
+    if config.get("scope") == "smoke":
+        if manifest_hash == EXPECTED_DISCOVERY_SHA256:
+            manifest_physical_rows = EXPECTED_DISCOVERY_ROWS
+        elif manifest_hash == EXPECTED_FULL_VALIDATION_SHA256:
+            manifest_physical_rows = EXPECTED_FULL_VALIDATION_ROWS
+        else:
+            raise ProgressiveValidationError("Smoke manifest is not a registered RefCOCO-val manifest")
+    else:
+        manifest_physical_rows = expected_rows
     manifest_rows = read_jsonl_strict(manifest_path, manifest_physical_rows)
     if config.get("scope") == "smoke":
         _equal(config.get("limit"), expected_rows, "smoke limit")
