@@ -17,6 +17,15 @@ class FinalValDissertationAssetTests(unittest.TestCase):
         self.assertIn("\\label{tab:test}", output)
         self.assertIn("x & 1\\\\", output)
 
+    def test_wide_table_is_bounded_to_text_width(self) -> None:
+        output = table(
+            caption="Wide", label="tab:wide", columns="lrrrrrrr",
+            header="A & B & C & D & E & F & G & H",
+            rows=["x & 1 & 2 & 3 & 4 & 5 & 6 & 7"], resize=True,
+        )
+        self.assertIn("\\resizebox{\\textwidth}{!}{%", output)
+        self.assertIn("\\end{tabular}\n}%\n\\end{table}", output)
+
     def test_nuwa_display_uses_latex_umlaut(self) -> None:
         self.assertEqual(DISPLAY["NUWA_STACK_FULL"], 'N\\"uwa-stack Full')
 
