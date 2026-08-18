@@ -3,7 +3,10 @@ from __future__ import annotations
 import unittest
 
 from scripts.run_native_nuwa_refcoco import (
+    FIXED32_ORDER_PLAN,
+    FIXED_CONTINUATION_TOKEN_IDS,
     FULL_TRACE,
+    NATURAL_ORDER_PLAN,
     NUWA_TRACE,
     NativeNuwaError,
     expected_trace,
@@ -18,6 +21,17 @@ class NativeNuwaContractTests(unittest.TestCase):
         self.assertEqual(expected_trace("NUWA_NATIVE_192"), [336] * 16 + [48] * 16)
         self.assertEqual(sum(NUWA_TRACE), 6144)
         self.assertEqual(sum(FULL_TRACE), 18432)
+
+    def test_registered_timing_orders_and_fixed_continuation(self) -> None:
+        self.assertEqual(FIXED_CONTINUATION_TOKEN_IDS, tuple(range(1000, 1032)))
+        self.assertEqual(len(NATURAL_ORDER_PLAN), 5)
+        self.assertEqual(len(FIXED32_ORDER_PLAN), 3)
+        self.assertEqual(
+            NATURAL_ORDER_PLAN[2], ("NUWA_NATIVE_192", "NUWA_STACK_FULL")
+        )
+        self.assertEqual(
+            FIXED32_ORDER_PLAN[3], ("NUWA_STACK_FULL", "NUWA_NATIVE_192")
+        )
 
     def test_trace_validator_fails_closed(self) -> None:
         with self.assertRaises(NativeNuwaError):

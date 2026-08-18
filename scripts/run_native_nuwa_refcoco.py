@@ -59,6 +59,19 @@ REGISTERED_PROMPT = (
 METHODS = ("NUWA_STACK_FULL", "NUWA_NATIVE_192")
 NUWA_TRACE = [336] * 16 + [48] * 16
 FULL_TRACE = [576] * 32
+FIXED_CONTINUATION_TOKEN_IDS = tuple(range(1000, 1032))
+NATURAL_ORDER_PLAN = {
+    1: METHODS,
+    2: tuple(reversed(METHODS)),
+    3: METHODS,
+    4: tuple(reversed(METHODS)),
+    5: METHODS,
+}
+FIXED32_ORDER_PLAN = {
+    1: METHODS,
+    2: tuple(reversed(METHODS)),
+    3: METHODS,
+}
 
 
 class NativeNuwaError(RuntimeError):
@@ -127,6 +140,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--mode", choices=("quality", "smoke", "timing"), required=True)
+    parser.add_argument("--generation-mode", choices=("natural", "fixed32"), default="natural")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--max-new-tokens", type=int, default=48)
     parser.add_argument("--warmup-examples", type=int, default=0)
@@ -145,6 +159,8 @@ def validate_args(args: argparse.Namespace) -> tuple[str, int]:
         if args.limit is not None:
             raise NativeNuwaError("Full quality does not permit a row limit")
         expected_rows = 8811
+        if args.generation_mode != "natural":
+            raise NativeNuwaError("Full quality permits natural generation only")
     else:
         if manifest != TIMING_MANIFEST.resolve() or digest != TIMING_MANIFEST_SHA256:
             raise NativeNuwaError("Smoke/timing requires the exact frozen 1,000-row RefCOCO-val manifest")
@@ -155,6 +171,12 @@ def validate_args(args: argparse.Namespace) -> tuple[str, int]:
         if args.mode == "smoke" and (args.limit is None or not 1 <= args.limit <= 20):
             raise NativeNuwaError("Smoke limit must be in [1, 20]")
         expected_rows = int(args.limit or 1000)
+    if args.mode == "timing":
+        plan = NATURAL_ORDER_PLAN if args.generation_mode == "natural" else FIXED32_ORDER_PLAN
+        if args.repetition not in plan:
+            raise NativeNuwaError("Repetition is outside the registered Nüwa timing plan")
+        if args.order_position != plan[args.repetition].index(args.method) + 1:
+            raise NativeNuwaError("Order position differs from the registered Nüwa counterbalance")
     if args.max_new_tokens != 48:
         raise NativeNuwaError("Natural Nüwa runs require the frozen 48-token output cap")
     return digest, expected_rows
@@ -325,7 +347,7 @@ class NativeTrial:
                 hooks.append(layer.register_forward_hook(post_hook))
         return hooks
 
-    def infer(self, sample: dict[str, Any]) -> dict[str, Any]:
+    def infer(self, sample: dict[str, Any], *, generation_mode: str = "natural") -> dict[str, Any]:
         from llava.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
         from llava.conversation import conv_templates
         from llava.mm_utils import process_images, tokenizer_image_token
@@ -351,15 +373,65 @@ class NativeTrial:
         self.torch.cuda.reset_peak_memory_stats()
         started = time.perf_counter()
         with self.torch.inference_mode():
-            output_ids = self.model.generate(
-                input_ids,
-                images=image_tensor,
-                image_sizes=[image_size],
-                do_sample=False,
-                num_beams=1,
-                max_new_tokens=48,
-                use_cache=True,
-            )
+            if generation_mode == "natural":
+                output_ids = self.model.generate(
+                    input_ids,
+                    images=image_tensor,
+                    image_sizes=[image_size],
+                    do_sample=False,
+                    num_beams=1,
+                    max_new_tokens=48,
+                    use_cache=True,
+                )
+            elif generation_mode == "fixed32":
+                (
+                    _,
+                    position_ids,
+                    attention_mask,
+                    _,
+                    inputs_embeds,
+                    _,
+                ) = self.model.prepare_inputs_labels_for_multimodal(
+                    input_ids,
+                    None,
+                    None,
+                    None,
+                    None,
+                    image_tensor,
+                    image_sizes=[image_size],
+                )
+                output = self.model(
+                    inputs_embeds=inputs_embeds,
+                    position_ids=position_ids,
+                    attention_mask=attention_mask,
+                    use_cache=True,
+                    return_dict=True,
+                )
+                cache = output.past_key_values
+                if attention_mask is None:
+                    attention_mask = self.torch.ones(
+                        inputs_embeds.shape[:2], dtype=self.torch.bool, device=inputs_embeds.device
+                    )
+                fixed = []
+                for token_id in FIXED_CONTINUATION_TOKEN_IDS:
+                    token = self.torch.tensor(
+                        [[token_id]], dtype=input_ids.dtype, device=input_ids.device
+                    )
+                    attention_mask = self.torch.cat(
+                        [attention_mask, self.torch.ones_like(token, dtype=attention_mask.dtype)], dim=1
+                    )
+                    output = self.model(
+                        input_ids=token,
+                        attention_mask=attention_mask,
+                        past_key_values=cache,
+                        use_cache=True,
+                        return_dict=True,
+                    )
+                    cache = output.past_key_values
+                    fixed.append(token)
+                output_ids = self.torch.cat(fixed, dim=1)
+            else:
+                raise NativeNuwaError(f"Unregistered generation mode: {generation_mode}")
         self._sync()
         end_to_end = time.perf_counter() - started
         for hook in hooks:
@@ -380,6 +452,8 @@ class NativeTrial:
             self.method, self.outer_vision_latency_s, self.raw_vision_latency_s
         )
         generated = int(output_ids.numel())
+        if generation_mode == "fixed32" and generated != len(FIXED_CONTINUATION_TOKEN_IDS):
+            raise NativeNuwaError("Fixed32 Nüwa diagnostic did not execute exactly 32 tokens")
         return {
             "sample_id": str(sample["sample_id"]),
             "query": str(sample["query"]),
@@ -387,6 +461,10 @@ class NativeTrial:
             "height": int(sample["height"]),
             "gt_box": list(sample["gt_box"]),
             "method": self.method,
+            "generation_mode": generation_mode,
+            "fixed_continuation_token_ids": (
+                list(FIXED_CONTINUATION_TOKEN_IDS) if generation_mode == "fixed32" else None
+            ),
             "raw_model_output": raw_output,
             "raw_parsed_box": raw_box,
             "predicted_box": predicted_box,
@@ -464,10 +542,14 @@ def run(args: argparse.Namespace) -> int:
         "created_at_utc": utc_now(),
         "method": args.method,
         "mode": args.mode,
+        "generation_mode": args.generation_mode,
         "manifest": str(args.manifest.resolve()),
         "manifest_sha256": manifest_sha,
         "expected_rows": expected_rows,
         "max_new_tokens": 48,
+        "fixed_continuation_token_ids": (
+            list(FIXED_CONTINUATION_TOKEN_IDS) if args.generation_mode == "fixed32" else None
+        ),
         "precision": "fp16_native",
         "batch_size": 1,
         "seed": 0,
@@ -520,10 +602,10 @@ def run(args: argparse.Namespace) -> int:
     }
     atomic_write(run_dir / "environment.json", canonical_bytes(environment))
     for sample in rows[:args.warmup_examples]:
-        trial.infer(sample)
+        trial.infer(sample, generation_mode=args.generation_mode)
     with partial.open("a" if measured else "w", encoding="utf-8") as handle:
         for index in range(len(measured), len(rows)):
-            result = trial.infer(rows[index])
+            result = trial.infer(rows[index], generation_mode=args.generation_mode)
             result["manifest_index"] = index
             result["config_sha256"] = config_sha
             result["repetition"] = args.repetition
