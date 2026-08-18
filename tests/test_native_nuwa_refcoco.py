@@ -7,6 +7,7 @@ from scripts.run_native_nuwa_refcoco import (
     NUWA_TRACE,
     NativeNuwaError,
     expected_trace,
+    stage1_selector_latency,
     validate_visual_trace,
 )
 
@@ -23,6 +24,13 @@ class NativeNuwaContractTests(unittest.TestCase):
             validate_visual_trace("NUWA_NATIVE_192", [336] * 15 + [48] * 17)
         with self.assertRaises(NativeNuwaError):
             expected_trace("unregistered")
+
+    def test_stage1_selector_is_only_attributed_to_native_nuwa(self) -> None:
+        self.assertEqual(stage1_selector_latency("NUWA_STACK_FULL", 0.3, 0.2), 0.0)
+        self.assertAlmostEqual(stage1_selector_latency("NUWA_NATIVE_192", 0.3, 0.2), 0.1)
+        self.assertEqual(stage1_selector_latency("NUWA_NATIVE_192", 0.1, 0.2), 0.0)
+        with self.assertRaises(NativeNuwaError):
+            stage1_selector_latency("unregistered", 0.3, 0.2)
 
 
 if __name__ == "__main__":

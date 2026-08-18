@@ -94,16 +94,18 @@ def git_clean(path: Path) -> bool:
 
 
 def tree_hash(path: Path) -> str:
-    """Hash the tracked-file inventory and contents without traversing generated environments."""
-    names = subprocess.check_output(["git", "ls-files", "-z"], cwd=path)
-    digest = hashlib.sha256()
-    for raw in names.split(b"\0"):
-        if not raw:
-            continue
-        relative = raw.decode()
-        digest.update(relative.encode() + b"\0")
-        digest.update(hashlib.sha256((path / relative).read_bytes()).digest())
-    return digest.hexdigest()
+    """Hash Git's exact tracked blob inventory without rereading every worktree file."""
+    inventory = subprocess.check_output(["git", "ls-files", "-s", "-z"], cwd=path)
+    return hashlib.sha256(inventory).hexdigest()
+
+
+def stage1_selector_latency(method: str, outer_latency_s: float, raw_latency_s: float) -> float:
+    """Attribute Nüwa's vision-wrapper excess only when its stage-1 selector is active."""
+    if method == "NUWA_STACK_FULL":
+        return 0.0
+    if method == "NUWA_NATIVE_192":
+        return max(0.0, outer_latency_s - raw_latency_s)
+    raise NativeNuwaError(f"Unregistered Nüwa method: {method}")
 
 
 def expected_trace(method: str) -> list[int]:
@@ -374,7 +376,9 @@ class NativeTrial:
             raw_output, int(sample["width"]), int(sample["height"]), "normalized_0_1"
         )
         iou = box_iou(predicted_box, sample["gt_box"]) if predicted_box is not None else 0.0
-        stage1_selector = max(0.0, self.outer_vision_latency_s - self.raw_vision_latency_s)
+        stage1_selector = stage1_selector_latency(
+            self.method, self.outer_vision_latency_s, self.raw_vision_latency_s
+        )
         generated = int(output_ids.numel())
         return {
             "sample_id": str(sample["sample_id"]),
