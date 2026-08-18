@@ -411,16 +411,49 @@ def build_report(
         ],
     )
     timing_table = markdown_table(
-        ["Method", "E2E s", "Prefill s", "TTFT s", "Peak alloc GiB", "Analytical prompt KV MiB"],
+        [
+            "Method", "E2E s", "Prefill s", "TTFT s", "Select s", "Gather/merge s",
+            "Decode s", "Output tok.", "Example/s", "Peak alloc GiB", "Prompt KV MiB",
+        ],
         [
             [
                 DISPLAY[method], f"{by[method]['natural_end_to_end_s']:.4f}",
                 f"{by[method]['prefill_including_overhead_s']:.4f}",
                 f"{by[method]['time_to_first_token_s']:.4f}",
+                f"{mean(source['timing'][('canonical', method)], 'selector_latency_s'):.4f}",
+                f"{mean(source['timing'][('canonical', method)], 'gather_latency_s') + mean(source['timing'][('canonical', method)], 'merge_latency_s'):.4f}",
+                f"{mean(source['timing'][('canonical', method)], 'decode_latency_s'):.4f}",
+                f"{mean(source['timing'][('canonical', method)], 'generated_token_count'):.2f}",
+                f"{mean(source['timing'][('canonical', method)], 'throughput_examples_per_s'):.3f}",
                 f"{by[method]['peak_allocated_gpu_bytes'] / 2**30:.3f}",
                 f"{by[method]['prompt_kv_bytes'] / 2**20:.2f}",
             ]
             for method in timing_methods
+        ],
+    )
+    quality_effects = read_json(ANALYSIS / "QUALITY_PAIRED_CONTRASTS.json")
+    quality_effect_table = markdown_table(
+        ["Contrast", "Metric", "Difference", "Paired 95% interval"],
+        [
+            [
+                str(row["contrast"]), str(row["metric"]), f"{float(row['point_delta']):+.4f}",
+                f"[{float(row['lower_95']):+.4f}, {float(row['upper_95']):+.4f}]",
+            ]
+            for row in quality_effects
+        ],
+    )
+    timing_effects = [
+        row for row in read_json(TIMING_CONTRASTS_PATH)
+        if row["metric"] == "end_to_end_latency_s"
+    ]
+    timing_effect_table = markdown_table(
+        ["Stack", "Contrast", "Difference s", "Hierarchical paired 95% interval"],
+        [
+            [
+                str(row["stack"]), str(row["contrast"]), f"{float(row['point_delta']):+.4f}",
+                f"[{float(row['lower_95']):+.4f}, {float(row['upper_95']):+.4f}]",
+            ]
+            for row in timing_effects
         ],
     )
     accounting_order = ["Full", "K12", "M448_OPT", "Z_M448_0", "FASTV_MATCHED_199", "FEATHER_LLAVA_MAIN", "NUWA_NATIVE_192"]
@@ -472,6 +505,19 @@ def build_report(
             ],
         )
     selected = decision["selected_method"] or "none"
+    decision_table = markdown_table(
+        ["Method", "Quality gate", "Acceleration gate", "Token work", "Outcome"],
+        [
+            [
+                DISPLAY[method],
+                "pass" if decision["method_decisions"][method]["quality_gate_pass"] else "fail",
+                "pass" if decision["method_decisions"][method]["acceleration_gate_pass"] else "fail",
+                str(decision["method_decisions"][method]["visual_token_layer_work"]),
+                "selected" if decision["selected_method"] == method else "--",
+            ]
+            for method in ("K12", "M448_OPT", "Z_M448_0")
+        ],
+    )
     lines = [
         "# Final RefCOCO-validation efficiency and external-baseline campaign",
         "",
@@ -487,11 +533,21 @@ def build_report(
         "",
         "FastV is an absolute, fork-labelled result because disabled-path output parity with canonical Full failed. Nüwa also failed exact canonical preprocessing/output parity and is therefore evaluated only against its native Full control below. FEATHER passed exact upstream selection fixtures at both pruning boundaries.",
         "",
+        "### Paired full-validation effects",
+        "",
+        *quality_effect_table,
+        "",
+        "Intervals containing zero are inconclusive and are not interpreted as evidence of equivalence. FastV is excluded from canonical pairing; Nüwa is paired only with Nüwa-stack Full.",
+        "",
         "## Canonical repeated timing and memory",
         "",
         *timing_table,
         "",
         "Natural-output end-to-end latency is primary. Prefill includes selection, merging, gathering and segmented-cache overhead; the component figure also exposes the LLM-only and dispatch residual. Lower token work is not relabelled as measured speed.",
+        "",
+        "### Primary repeated-timing effects",
+        "",
+        *timing_effect_table,
         "",
         "## FLOPs and pruning arithmetic",
         "",
@@ -508,6 +564,8 @@ def build_report(
         "## Registered decision",
         "",
         f"The frozen rule first required parse rate >=99.5%, Acc@0.5 loss <=3.0 percentage points and mIoU loss <=0.015 relative to Full. It then required a lower five-repetition natural E2E mean and a hierarchical paired 95% interval whose upper endpoint is below zero. Among methods passing both, minimum visual token-layer work wins. The resulting status is `{decision['status']}` and the selected method is `{selected}`.",
+        "",
+        *decision_table,
         "",
         "K12 remains the latency-first operating point if its measured latency is lowest; M448 transfers early information through mass-preserving merging; Z-M448-0 minimizes internal work and late KV by removing all visual tokens after K20. The decision file preserves every gate outcome rather than forcing a winner.",
         "",
