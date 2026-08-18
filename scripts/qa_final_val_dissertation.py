@@ -92,9 +92,15 @@ def prepare() -> dict[str, Any]:
         for page in range(1, pages + 1)
     }
     complete_text = "\n\f\n".join(page_text.values())
+    markers = list(MARKERS)
+    trigger_path = DERIVED / "FIXED32_TRIGGER.json"
+    if trigger_path.is_file():
+        trigger = read_json(trigger_path)
+        if any(value["required"] for value in trigger.get("stacks", {}).values()):
+            markers.append("Three-repetition fixed-32 diagnostic")
     marker_pages = {
         marker: [page for page, text in page_text.items() if marker in text]
-        for marker in MARKERS
+        for marker in markers
     }
     missing = [marker for marker, locations in marker_pages.items() if not locations]
     if missing:

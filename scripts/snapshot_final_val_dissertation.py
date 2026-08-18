@@ -60,8 +60,14 @@ DERIVED_NAMES = (
     "PARETO_FRONTIERS.json",
     "FROZEN_FINAL_CANDIDATE.json",
     "CLAIM_EVIDENCE_LEDGER.json",
+    "FIXED32_TRIGGER.json",
     "ASSET_MANIFEST.json",
     "PDF_QA.json",
+)
+OPTIONAL_DERIVED_NAMES = (
+    "TIMING_FIXED32_SUMMARY.json",
+    "TIMING_FIXED32_CONTRASTS.json",
+    "TIMING_FIXED32_INVENTORY.json",
 )
 
 
@@ -113,6 +119,7 @@ def final_files() -> tuple[Path, ...]:
         *(generated / name for name in GENERATED_NAMES),
         *(figures / name for name in FIGURE_NAMES),
         *(derived / name for name in DERIVED_NAMES),
+        *(derived / name for name in OPTIONAL_DERIVED_NAMES if (derived / name).is_file()),
     )
 
 

@@ -453,6 +453,24 @@ def build_report(
             ],
         ],
     )
+    trigger = read_json(ANALYSIS / "FIXED32_TRIGGER.json")
+    required = [stack for stack, value in trigger["stacks"].items() if value["required"]]
+    fixed_table: list[str] = []
+    if required:
+        fixed_rows = read_json(ANALYSIS / "TIMING_FIXED32_SUMMARY.json")
+        fixed_table = markdown_table(
+            ["Stack", "Method", "E2E s", "Prefill s", "Decode s", "Output tokens"],
+            [
+                [
+                    str(row["stack"]), DISPLAY[str(row["method"])],
+                    f"{mean(row, 'end_to_end_latency_s'):.4f}",
+                    f"{mean(row, 'prefill_including_pruning_latency_s'):.4f}",
+                    f"{mean(row, 'decode_latency_s'):.4f}",
+                    f"{mean(row, 'generated_token_count'):.1f}",
+                ]
+                for row in fixed_rows
+            ],
+        )
     selected = decision["selected_method"] or "none"
     lines = [
         "# Final RefCOCO-validation efficiency and external-baseline campaign",
@@ -511,14 +529,14 @@ def build_report(
         "- `analysis/FLOP_KV_ACCOUNTING.json`, `analysis/PARETO_FRONTIERS.json`, and `analysis/FROZEN_FINAL_CANDIDATE.json`",
         "",
     ]
-    trigger = read_json(ANALYSIS / "FIXED32_TRIGGER.json")
-    required = [stack for stack, value in trigger["stacks"].items() if value["required"]]
     if required:
         lines.extend(
             [
                 "## Fixed-32 diagnostic",
                 "",
                 f"The preregistered natural-output trigger required the three-repetition fixed-32 diagnostic for: {', '.join(required)}. These results diagnose output-length dependence and do not replace the natural-output primary endpoint.",
+                "",
+                *fixed_table,
                 "",
             ]
         )
@@ -567,6 +585,14 @@ def evidence_ledger(figure_paths: list[Path]) -> None:
         "parity_and_stack_separation": [ANALYSIS / "PARITY_AUDIT.json"],
         "figures": figure_paths,
     }
+    trigger = read_json(ANALYSIS / "FIXED32_TRIGGER.json")
+    claims["fixed32_trigger"] = [ANALYSIS / "FIXED32_TRIGGER.json"]
+    if any(value["required"] for value in trigger["stacks"].values()):
+        claims["fixed32_diagnostic"] = [
+            ANALYSIS / "TIMING_FIXED32_SUMMARY.json",
+            ANALYSIS / "TIMING_FIXED32_CONTRASTS.json",
+            ANALYSIS / "TIMING_FIXED32_INVENTORY.json",
+        ]
     atomic_json(
         ANALYSIS / "CLAIM_EVIDENCE_LEDGER.json",
         {

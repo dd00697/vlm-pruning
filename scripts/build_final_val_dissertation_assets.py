@@ -150,6 +150,7 @@ def quality_tables(records: dict[str, dict[str, Any]]) -> str:
 def timing_tables(
     timing: dict[tuple[str, str], dict[str, Any]],
     accounting: dict[str, dict[str, Any]],
+    fixed_timing: dict[tuple[str, str], dict[str, Any]] | None = None,
 ) -> str:
     methods = ["Full", "K12", "M448_OPT", "Z_M448_0", "FEATHER_LLAVA_MAIN"]
     rows = []
@@ -219,7 +220,27 @@ def timing_tables(
         header="Stack & Method & E2E s & Prefill s & Output tok. & Avg. visual",
         rows=native_rows,
     )
-    return primary + resources + native
+    fixed = ""
+    if fixed_timing:
+        fixed_rows = []
+        for (stack, method), row in fixed_timing.items():
+            fixed_rows.append(
+                f"{tex(stack)} & {DISPLAY[method]} & {mean(row, 'end_to_end_latency_s'):.4f} & "
+                f"{mean(row, 'prefill_including_pruning_latency_s'):.4f} & "
+                f"{mean(row, 'decode_latency_s'):.4f} & {mean(row, 'generated_token_count'):.1f}"
+            )
+        fixed = table(
+            caption=(
+                "Three-repetition fixed-32 diagnostic for software stacks that met the registered "
+                "natural-output trigger. It diagnoses output-length effects and does not replace "
+                "the natural-output endpoint."
+            ),
+            label="tab:final-val-fixed32-timing",
+            columns="llrrrr",
+            header="Stack & Method & E2E s & Prefill s & Decode s & Output tok.",
+            rows=fixed_rows,
+        )
+    return primary + resources + native + fixed
 
 
 def flop_table(accounting: dict[str, dict[str, Any]]) -> str:
@@ -366,6 +387,11 @@ def main() -> int:
     records = {row["method"]: row for row in joined_list}
     timing_list = read(ANALYSIS / "TIMING_NATURAL_SUMMARY.json")
     timing = {(row["stack"], row["method"]): row for row in timing_list}
+    fixed_path = ANALYSIS / "TIMING_FIXED32_SUMMARY.json"
+    fixed_timing = None
+    if fixed_path.is_file():
+        fixed_list = read(fixed_path)
+        fixed_timing = {(row["stack"], row["method"]): row for row in fixed_list}
     accounting_list = read(ANALYSIS / "FLOP_KV_ACCOUNTING.json")["methods"]
     accounting = {row["method"]: row for row in accounting_list}
     quality_contrasts = read(ANALYSIS / "QUALITY_PAIRED_CONTRASTS.json")
@@ -373,7 +399,10 @@ def main() -> int:
     decision = read(ANALYSIS / "FROZEN_FINAL_CANDIDATE.json")
     GENERATED.mkdir(parents=True, exist_ok=True)
     atomic_write(GENERATED / "quality_work.tex", quality_tables(records))
-    atomic_write(GENERATED / "timing_resources.tex", timing_tables(timing, accounting))
+    atomic_write(
+        GENERATED / "timing_resources.tex",
+        timing_tables(timing, accounting, fixed_timing),
+    )
     atomic_write(GENERATED / "flops.tex", flop_table(accounting))
     atomic_write(
         GENERATED / "uncertainty_decision.tex",
@@ -385,12 +414,17 @@ def main() -> int:
     for source in sorted((ANALYSIS / "figures").glob("*.pdf")):
         shutil.copy2(source, FIGURES / source.name)
     DERIVED.mkdir(parents=True, exist_ok=True)
-    sources = (
+    sources = [
         "QUALITY_METHOD_METRICS.json", "QUALITY_PAIRED_CONTRASTS.json",
         "TIMING_NATURAL_SUMMARY.json", "TIMING_NATURAL_CONTRASTS.json",
         "FLOP_KV_ACCOUNTING.json", "PARETO_FRONTIERS.json",
         "FROZEN_FINAL_CANDIDATE.json", "CLAIM_EVIDENCE_LEDGER.json",
-    )
+        "FIXED32_TRIGGER.json",
+    ]
+    if fixed_path.is_file():
+        sources.extend(
+            ["TIMING_FIXED32_SUMMARY.json", "TIMING_FIXED32_CONTRASTS.json", "TIMING_FIXED32_INVENTORY.json"]
+        )
     for filename in sources:
         shutil.copy2(ANALYSIS / filename, DERIVED / filename)
     generated_files = sorted(GENERATED.glob("*.tex"))
