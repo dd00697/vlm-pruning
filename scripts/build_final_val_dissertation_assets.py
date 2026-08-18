@@ -76,8 +76,11 @@ def table(
     header: str,
     rows: list[str],
     small: bool = True,
+    resize: bool = False,
 ) -> str:
     size = "\\small\n" if small else ""
+    open_resize = "\\resizebox{\\textwidth}{!}{%" if resize else ""
+    close_resize = "}%" if resize else ""
     return "\n".join(
         [
             "\\begin{table}[H]",
@@ -85,6 +88,7 @@ def table(
             size.rstrip(),
             f"\\caption{{{caption}}}",
             f"\\label{{{label}}}",
+            open_resize,
             f"\\begin{{tabular}}{{{columns}}}",
             "\\toprule",
             header + "\\\\",
@@ -92,6 +96,7 @@ def table(
             *(row + "\\\\" for row in rows),
             "\\bottomrule",
             "\\end{tabular}",
+            close_resize,
             "\\end{table}",
             "",
         ]
@@ -126,6 +131,7 @@ def quality_tables(records: dict[str, dict[str, Any]]) -> str:
         columns="llrrrr",
         header="Method & Stack & Acc.@0.5 (\\%) & mIoU & Avg. visual & Token work",
         rows=rows,
+        resize=True,
     )
     native_rows = []
     for method in ("NUWA_STACK_FULL", "NUWA_NATIVE_192"):
@@ -175,6 +181,7 @@ def timing_tables(
         columns="lrrrrrrr",
         header="Method & E2E s & Prefill s & TTFT s & Select s & Gather/merge s & Decode s & Output tok.",
         rows=rows,
+        resize=True,
     )
     resource_rows = []
     for method in methods:
@@ -196,6 +203,7 @@ def timing_tables(
         columns="lrrrrr",
         header="Method & Example/s & Prompt KV MiB & Final KV MiB & Peak alloc. GiB & Peak reserv. GiB",
         rows=resource_rows,
+        resize=True,
     )
     native_rows = []
     for stack, full, pruned in (
@@ -219,6 +227,7 @@ def timing_tables(
         columns="llrrrr",
         header="Stack & Method & E2E s & Prefill s & Output tok. & Avg. visual",
         rows=native_rows,
+        resize=True,
     )
     fixed = ""
     if fixed_timing:
@@ -239,6 +248,7 @@ def timing_tables(
             columns="llrrrr",
             header="Stack & Method & E2E s & Prefill s & Decode s & Output tok.",
             rows=fixed_rows,
+            resize=True,
         )
     return primary + resources + native + fixed
 
@@ -267,6 +277,7 @@ def flop_table(accounting: dict[str, dict[str, Any]]) -> str:
         columns="lrrrrr",
         header="Method & LLM TFLOPs & Score GFLOPs & Distance GFLOPs & Merge GFLOPs & Total TFLOPs",
         rows=rows,
+        resize=True,
     )
 
 
@@ -311,6 +322,7 @@ def uncertainty_and_decision(
         columns="llrr",
         header="Contrast & Metric & Difference & 95\\% interval",
         rows=rows,
+        resize=True,
     )
     decision_rows = []
     for method in ("K12", "M448_OPT", "Z_M448_0"):
