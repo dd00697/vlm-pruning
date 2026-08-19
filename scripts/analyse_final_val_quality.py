@@ -94,7 +94,7 @@ METHODS = {
         "historical_key": None,
     },
     "NUWA_NATIVE_192": {
-        "path": CAMPAIGN / "quality/nuwa/nuwa_native_192_attempt1/predictions.jsonl",
+        "path": CAMPAIGN / "quality/nuwa/nuwa_native_192_attempt2/predictions.jsonl",
         "parser": "strict",
         "trace": [336] * 16 + [48] * 16,
         "stack": "nuwa_native",
