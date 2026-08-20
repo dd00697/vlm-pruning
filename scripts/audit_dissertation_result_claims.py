@@ -17,7 +17,7 @@ for value in (SCRIPT_DIR, SCRIPT_DIR.parent):
         sys.path.insert(0, str(value))
 
 from scripts.frozen_z_error_analysis_common import (  # noqa: E402
-    CAMPAIGN, DISSERTATION, INPUT_CAMPAIGN, REPO, ErrorAnalysisFailure, atomic_json, atomic_text, now,
+    CAMPAIGN, DISSERTATION, INPUT_CAMPAIGN, REPO, ErrorAnalysisFailure, atomic_bytes, atomic_json, atomic_text, now,
     read_json, record_file, require, sha256,
 )
 
@@ -110,6 +110,21 @@ def active_graph() -> tuple[list[Path], list[Path]]:
                         break
             require(candidate.is_file(), f"Active figure is missing: {raw}")
             figures.add(candidate.resolve())
+    fls = DISSERTATION / "Dissertation_Template.fls"
+    if fls.is_file():
+        for line in fls.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.startswith("INPUT "):
+                continue
+            path = Path(line[6:])
+            if not path.is_absolute():
+                path = DISSERTATION / path
+            try:
+                path = path.resolve()
+                path.relative_to(DISSERTATION.resolve())
+            except ValueError:
+                continue
+            if path.is_file() and path.suffix.lower() in {".pdf", ".png", ".jpg", ".jpeg"}:
+                figures.add(path)
     return sorted(tex), sorted(figures)
 
 
@@ -232,7 +247,7 @@ def main() -> int:
     for name in ("RESULT_CLAIM_AUDIT.json", "RESULT_CLAIM_AUDIT.csv", "CLAIM_EVIDENCE_LEDGER.json"):
         source = ANALYSIS / name
         target = DERIVED / name
-        target.write_bytes(source.read_bytes())
+        atomic_bytes(target, source.read_bytes())
     print(json.dumps({"status": "pass", "claims": len(claims), "tex": len(tex_paths), "figures": len(figures)}, indent=2))
     return 0
 
