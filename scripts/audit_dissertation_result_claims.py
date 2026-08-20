@@ -57,6 +57,8 @@ EVIDENCE_GROUPS = {
         INPUT_CAMPAIGN / "analysis/PAIRED_CONTRASTS.json",
         INPUT_CAMPAIGN / "analysis/HELDOUT_DECISION.json",
         INPUT_CAMPAIGN / "analysis/SPLIT_HETEROGENEITY.json",
+        DISSERTATION / "analysis/derived/frozen_z_token_visualization/TOKEN_VISUALIZATION_DATA.json",
+        DISSERTATION / "analysis/derived/frozen_z_token_visualization/ASSET_MANIFEST.json",
     ],
     "error_analysis": [
         ANALYSIS / "INPUT_AUDIT.json", ANALYSIS / "ERROR_ANALYSIS.json",
