@@ -111,13 +111,13 @@ def require_allowed_output_inventory(paths: Iterable[str]) -> None:
 
 
 def verify_v2_lock() -> dict[str, Any]:
-    lock = read_json(CAMPAIGN / "PRE_ANALYSIS_LOCK_V2.json")
+    lock = read_json(CAMPAIGN / "PRE_ANALYSIS_LOCK_V3.json")
     require(lock.get("status") == "locked" and lock.get("candidate_analysis_outputs_present") is False,
             "V2 pre-analysis lock differs")
     require((CAMPAIGN / "LOCK_SUPERSESSION.json").is_file(), "Lock supersession record is missing")
     for name, expected in lock.get("locks", {}).items():
         verify_ledger_file(CAMPAIGN / name, expected, f"pre-analysis-lock/{name}")
-    source_lock = read_json(CAMPAIGN / "SOURCE_LOCK_V2.json")
+    source_lock = read_json(CAMPAIGN / "SOURCE_LOCK_V3.json")
     for name, expected in source_lock.get("sources", {}).items():
         verify_ledger_file(REPO / name, expected, f"source-lock/{name}")
     return lock
@@ -377,7 +377,8 @@ This analysis was specified after the held-out outcome was known and is therefor
         ANALYSIS / "ERROR_ANALYSIS_SUMMARIES.csv", figure, CAMPAIGN / "RESEARCH_REPORT.md",
     ]
     require_allowed_output_inventory(
-        str(path.relative_to(ANALYSIS)) for path in inventory_files if path != CAMPAIGN / "RESEARCH_REPORT.md"
+        [str(path.relative_to(ANALYSIS)) for path in inventory_files if path != CAMPAIGN / "RESEARCH_REPORT.md"]
+        + ["ANALYSIS_INVENTORY.json"]
     )
     atomic_json(ANALYSIS / "ANALYSIS_INVENTORY.json", {
         "schema_version": 1, "status": "complete", "completed_at_utc": now(),
