@@ -49,6 +49,15 @@ CELL_PATHS = {
     "Full_testB": "quality/full_testb_attempt1",
     "Z_M448_0_testB": "quality/z_m448_0_testb_attempt1",
 }
+ALLOWED_ANALYSIS_FILES = {
+    "INPUT_AUDIT.json",
+    "ERROR_ANALYSIS.json",
+    "ERROR_ANALYSIS_TRANSITIONS.csv",
+    "ERROR_ANALYSIS_THRESHOLD_CURVE.csv",
+    "ERROR_ANALYSIS_SUMMARIES.csv",
+    "ANALYSIS_INVENTORY.json",
+    "figures/paired_localization_threshold_crossing.pdf",
+}
 MANIFESTS = {
     "testA": (REPO / "data/manifests/final_evaluation/refcoco_testA_unique.jsonl", 5657,
               "01332dfc67c59c9077f14325dc11cb301b9a01a55eccdcc815f92f3fe587fe23"),
@@ -80,6 +89,38 @@ def verify_ledger_file(path: Path, expected: dict[str, Any], label: str) -> None
     require(set(expected) == {"bytes", "sha256"}, f"Ledger schema differs: {label}")
     require(path.stat().st_size == int(expected["bytes"]), f"Ledger bytes differ: {label}")
     require(sha256(path) == expected["sha256"], f"Ledger hash differs: {label}")
+
+
+def require_exact_pairing(full_ids: list[str], z_ids: list[str], expected_ids: list[str], split: str) -> None:
+    """Fail closed unless both methods have the exact frozen manifest identity and order."""
+    require(full_ids == expected_ids, f"Full pairing differs: {split}")
+    require(z_ids == expected_ids, f"Z pairing differs: {split}")
+    require(len(expected_ids) == len(set(expected_ids)), f"Manifest IDs are not unique: {split}")
+
+
+def require_expected_transitions(actual: dict[str, int], expected: dict[str, int], split: str) -> None:
+    require(actual == expected, f"Frozen transition counts differ: {split}/{actual}")
+
+
+def require_allowed_output_inventory(paths: Iterable[str]) -> None:
+    observed = set(paths)
+    require(observed == ALLOWED_ANALYSIS_FILES, f"Analysis output inventory differs: {sorted(observed)}")
+    forbidden = ("subgroup", "qualitative", "example", "category", "object_size", "expression_length")
+    require(not any(token in path.lower() for path in observed for token in forbidden),
+            "Forbidden exploratory analysis output is present")
+
+
+def verify_v2_lock() -> dict[str, Any]:
+    lock = read_json(CAMPAIGN / "PRE_ANALYSIS_LOCK_V2.json")
+    require(lock.get("status") == "locked" and lock.get("candidate_analysis_outputs_present") is False,
+            "V2 pre-analysis lock differs")
+    require((CAMPAIGN / "LOCK_SUPERSESSION.json").is_file(), "Lock supersession record is missing")
+    for name, expected in lock.get("locks", {}).items():
+        verify_ledger_file(CAMPAIGN / name, expected, f"pre-analysis-lock/{name}")
+    source_lock = read_json(CAMPAIGN / "SOURCE_LOCK_V2.json")
+    for name, expected in source_lock.get("sources", {}).items():
+        verify_ledger_file(REPO / name, expected, f"source-lock/{name}")
+    return lock
 
 
 def validate_cell(cell_id: str, ledger_cell: dict[str, Any]) -> tuple[np.ndarray, list[str], dict[str, Any]]:
@@ -238,9 +279,7 @@ def build_figure(results: dict[str, Any], thresholds: list[float]) -> Path:
 
 def main() -> int:
     require(CAMPAIGN.is_dir(), "Campaign is not initialized")
-    lock = read_json(CAMPAIGN / "PRE_ANALYSIS_LOCK.json")
-    require(lock.get("status") == "locked" and lock.get("candidate_analysis_outputs_present") is False,
-            "Pre-analysis lock differs")
+    verify_v2_lock()
     protocol = read_json(CAMPAIGN / "FROZEN_PROTOCOL.json")
     require(sha256(INPUT_CAMPAIGN / "QUALITY_ARTIFACT_LEDGER.json") == QUALITY_LEDGER_SHA256,
             "Quality artifact ledger changed")
@@ -254,8 +293,9 @@ def main() -> int:
     input_cells: dict[str, Any] = {}
     for cell_id in ("Full_testA", "Z_M448_0_testA", "Full_testB", "Z_M448_0_testB"):
         arrays[cell_id], ids[cell_id], input_cells[cell_id] = validate_cell(cell_id, ledger_cells[cell_id])
-    require(ids["Full_testA"] == ids["Z_M448_0_testA"], "testA pairing differs")
-    require(ids["Full_testB"] == ids["Z_M448_0_testB"], "testB pairing differs")
+    for split in ("testA", "testB"):
+        manifest_ids = [str(row["sample_id"]) for row in iter_jsonl(MANIFESTS[split][0])]
+        require_exact_pairing(ids[f"Full_{split}"], ids[f"Z_M448_0_{split}"], manifest_ids, split)
     atomic_json(ANALYSIS / "INPUT_AUDIT.json", {
         "schema_version": 1, "status": "pass", "completed_at_utc": now(),
         "quality_artifact_ledger_sha256": QUALITY_LEDGER_SHA256, "cells": input_cells,
@@ -269,7 +309,7 @@ def main() -> int:
     for split in ("testA", "testB"):
         full, z = arrays[f"Full_{split}"], arrays[f"Z_M448_0_{split}"]
         counts = transition_counts(full, z)
-        require(counts == protocol["expected_transitions"][split], f"Frozen transition counts differ: {split}/{counts}")
+        require_expected_transitions(counts, protocol["expected_transitions"][split], split)
         curve, transition_intervals = paired_bootstrap(
             full, z, thresholds, int(protocol["bootstrap"]["child_seeds"][split]),
             int(protocol["bootstrap"]["resamples"]),
@@ -336,6 +376,9 @@ This analysis was specified after the held-out outcome was known and is therefor
         ANALYSIS / "ERROR_ANALYSIS_TRANSITIONS.csv", ANALYSIS / "ERROR_ANALYSIS_THRESHOLD_CURVE.csv",
         ANALYSIS / "ERROR_ANALYSIS_SUMMARIES.csv", figure, CAMPAIGN / "RESEARCH_REPORT.md",
     ]
+    require_allowed_output_inventory(
+        str(path.relative_to(ANALYSIS)) for path in inventory_files if path != CAMPAIGN / "RESEARCH_REPORT.md"
+    )
     atomic_json(ANALYSIS / "ANALYSIS_INVENTORY.json", {
         "schema_version": 1, "status": "complete", "completed_at_utc": now(),
         "files": {str(path.relative_to(CAMPAIGN)): record_file(path) for path in inventory_files},

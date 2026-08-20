@@ -4,7 +4,19 @@ import unittest
 
 import numpy as np
 
-from scripts.analyse_frozen_z_error_analysis import iou_summaries, paired_bootstrap, transition_counts
+import tempfile
+from pathlib import Path
+
+from scripts.analyse_frozen_z_error_analysis import (
+    ALLOWED_ANALYSIS_FILES,
+    iou_summaries,
+    paired_bootstrap,
+    require_allowed_output_inventory,
+    require_exact_pairing,
+    require_expected_transitions,
+    transition_counts,
+    verify_ledger_file,
+)
 from scripts.frozen_z_error_analysis_common import ErrorAnalysisFailure
 
 
@@ -71,6 +83,45 @@ class FrozenZErrorAnalysisTests(unittest.TestCase):
     def test_threshold_grid_has_exact_frozen_values(self) -> None:
         grid = [round(0.30 + 0.05 * index, 2) for index in range(9)]
         self.assertEqual(grid, [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70])
+
+    def test_pairing_rejects_reordered_or_duplicate_ids(self) -> None:
+        expected = ["a", "b", "c"]
+        require_exact_pairing(expected, expected.copy(), expected, "fixture")
+        with self.assertRaises(ErrorAnalysisFailure):
+            require_exact_pairing(expected, ["a", "c", "b"], expected, "fixture")
+        with self.assertRaises(ErrorAnalysisFailure):
+            require_exact_pairing(["a", "a", "c"], expected, expected, "fixture")
+
+    def test_pairing_rejects_missing_or_wrong_id(self) -> None:
+        expected = ["a", "b", "c"]
+        with self.assertRaises(ErrorAnalysisFailure):
+            require_exact_pairing(["a", "b"], expected, expected, "fixture")
+        with self.assertRaises(ErrorAnalysisFailure):
+            require_exact_pairing(expected, ["a", "b", "x"], expected, "fixture")
+
+    def test_hash_binding_rejects_tamper_and_size_change(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "input.jsonl"
+            path.write_bytes(b"one\n")
+            expected = {"bytes": 4, "sha256": "2c8b08da5ce60398e1f19af0e5dccc744df274b826abe585eaba68c525434806"}
+            verify_ledger_file(path, expected, "fixture")
+            path.write_bytes(b"two\n")
+            with self.assertRaises(ErrorAnalysisFailure):
+                verify_ledger_file(path, expected, "fixture")
+
+    def test_frozen_transition_mismatch_is_rejected(self) -> None:
+        actual = {"both_correct": 2, "full_only": 1, "z_only": 2, "both_incorrect": 1}
+        require_expected_transitions(actual, actual.copy(), "fixture")
+        wrong = {**actual, "full_only": 2}
+        with self.assertRaises(ErrorAnalysisFailure):
+            require_expected_transitions(wrong, actual, "fixture")
+
+    def test_output_inventory_rejects_extra_or_forbidden_analysis(self) -> None:
+        require_allowed_output_inventory(ALLOWED_ANALYSIS_FILES)
+        with self.assertRaises(ErrorAnalysisFailure):
+            require_allowed_output_inventory(ALLOWED_ANALYSIS_FILES | {"semantic_subgroup.csv"})
+        with self.assertRaises(ErrorAnalysisFailure):
+            require_allowed_output_inventory(ALLOWED_ANALYSIS_FILES - {"ERROR_ANALYSIS_SUMMARIES.csv"})
 
 
 if __name__ == "__main__":
