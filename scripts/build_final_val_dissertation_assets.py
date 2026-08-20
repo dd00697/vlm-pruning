@@ -441,9 +441,10 @@ def main() -> int:
         shutil.copy2(ANALYSIS / filename, DERIVED / filename)
     generated_files = sorted(GENERATED.glob("*.tex"))
     figure_files = sorted(FIGURES.glob("*.pdf"))
-    derived_files = sorted(
-        path for path in DERIVED.glob("*.json") if path.name != "ASSET_MANIFEST.json"
-    )
+    # QA records are written into the same derived directory after the PDF is
+    # built.  They are downstream outputs, not analysis assets, so including
+    # every JSON file here makes the manifest stale as soon as QA is rerun.
+    derived_files = sorted(DERIVED / filename for filename in sources)
     manifest = {
         "status": "complete",
         "source_campaign": str(CAMPAIGN),

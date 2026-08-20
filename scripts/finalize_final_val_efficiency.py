@@ -300,6 +300,10 @@ def plots(records: list[dict[str, Any]], pareto: dict[str, Any]) -> list[Path]:
     paths = []
     fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.1), constrained_layout=True)
     for axis, metric, label in zip(axes, ("acc_at_0_5", "mean_iou"), ("Acc@0.5", "Mean IoU")):
+        annotation_offsets = {
+            "M448_OPT": (4, -12),
+            "Z_M448_0": (4, 8),
+        }
         for row in canonical + fastv:
             hollow = row["stack"] != "canonical"
             axis.scatter(
@@ -309,7 +313,8 @@ def plots(records: list[dict[str, Any]], pareto: dict[str, Any]) -> list[Path]:
             )
             axis.annotate(
                 DISPLAY[row["method"]],
-                (row["visual_token_layer_work"], row[metric]), xytext=(4, 5),
+                (row["visual_token_layer_work"], row[metric]),
+                xytext=annotation_offsets.get(row["method"], (4, 5)),
                 textcoords="offset points", fontsize=7.5,
             )
         frontier_methods = pareto["axes"][f"{metric}_vs_visual_token_layer_work"]["frontier"]

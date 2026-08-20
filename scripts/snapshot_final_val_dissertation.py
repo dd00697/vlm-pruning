@@ -163,7 +163,7 @@ def finalize() -> dict[str, Any]:
     if not RECORD.is_file():
         raise SnapshotError("Dissertation baseline has not been captured")
     record = json.loads(RECORD.read_text(encoding="utf-8"))
-    if record.get("status") != "baseline_captured":
+    if record.get("status") not in {"baseline_captured", "complete"}:
         raise SnapshotError("Dissertation change record is not ready to finalize")
     backup = Path(record["backup_directory"])
     if not backup.is_dir():
