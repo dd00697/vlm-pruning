@@ -57,6 +57,33 @@ DEFAULT_MANIFEST = CAMPAIGN_ROOT / "manifests/refcoco_val_discovery1000.jsonl"
 DEFAULT_OUTPUT_ROOT = CAMPAIGN_ROOT / "runs"
 FULL_VALIDATION_MANIFEST_SHA256 = "f26d7b954189e86f55b50f9506bb670d3a0cf847d3152779af6c08dbf094e3d7"
 FULL_VALIDATION_ROWS = 8811
+HELDOUT_MODEL_REVISION = "b234b804b114d9e37bb655e11cbbb5f5e971b7a9"
+HELDOUT_MODEL_SNAPSHOT = (
+    Path("/workspace/cache/huggingface/hub/models--llava-hf--llava-1.5-7b-hf/snapshots")
+    / HELDOUT_MODEL_REVISION
+)
+HELDOUT_MODEL_SHARD_SHA256 = {
+    "model-00001-of-00003.safetensors": "c11dbf016ee7d35ee130c19b67e20eb04873996006f424b7bcbd453b6517ee66",
+    "model-00002-of-00003.safetensors": "46df6c6e5fad297fe7fbca4963dcf180cb1d0528cabc884d1f603311fed01328",
+    "model-00003-of-00003.safetensors": "4f06177c37ca13944e73b57dd6d051767b950dffc12400c700dfa2509c24c697",
+}
+HELDOUT_Z_SCHEDULE = (
+    PruningEvent(4, 448, "query_topk_merge"),
+    PruningEvent(12, 48, "query_topk"),
+    PruningEvent(20, 0, "none"),
+)
+HELDOUT_CONTRACTS = {
+    "heldout_testA": {
+        "split": "testA",
+        "rows": 5657,
+        "sha256": "01332dfc67c59c9077f14325dc11cb301b9a01a55eccdcc815f92f3fe587fe23",
+    },
+    "heldout_testB": {
+        "split": "testB",
+        "rows": 5095,
+        "sha256": "0f0fd8ff86faf8ac48446c27e71c350b14aed2a8d86d6a59b4f7599def2d40c9",
+    },
+}
 REGISTERED_PROMPT = (
     'Identify the target described by this referring expression: "{query}".\n'
     "Return exactly one bounding box in normalized 0-1 image coordinates as "
@@ -161,15 +188,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int)
     parser.add_argument(
         "--registered-scope",
-        choices=["auto", "full_validation"],
+        choices=["auto", "full_validation", "heldout_testA", "heldout_testB"],
         default="auto",
         help=(
-            "Use full_validation only for the frozen 8,811-row RefCOCO-val manifest. "
-            "The default preserves the historical smoke/discovery contract."
+            "Use a named scope only for its exact frozen manifest. The default "
+            "preserves the historical smoke/discovery contract."
         ),
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument(
+        "--outcome-embargo",
+        action="store_true",
+        help="Seal raw held-out candidate generations without parsing or quality metrics.",
+    )
     return parser.parse_args()
 
 
@@ -209,6 +241,29 @@ def validate_cli(args: argparse.Namespace) -> None:
         raise ProgressiveRunError("--limit must be positive")
     if args.registered_scope == "full_validation" and args.limit is not None:
         raise ProgressiveRunError("full_validation scope cannot use --limit")
+    if args.registered_scope in HELDOUT_CONTRACTS:
+        if args.seed != 0 or args.pre_llm_selector != "none":
+            raise ProgressiveRunError("Held-out scope requires seed 0 and no pre-LLM selector")
+        if args.method != "progressive":
+            raise ProgressiveRunError("Held-out scope permits only the registered progressive method")
+        split = str(HELDOUT_CONTRACTS[args.registered_scope]["split"])
+        full_id, z_id = f"Full_{split}", f"Z_M448_0_{split}"
+        if args.cell_id == full_id:
+            if tuple(args.schedule):
+                raise ProgressiveRunError("Held-out Full requires the empty schedule")
+            if getattr(args, "outcome_embargo", False):
+                raise ProgressiveRunError("Outcome embargo is reserved for the frozen Z candidate")
+        elif args.cell_id == z_id:
+            if tuple(args.schedule) != HELDOUT_Z_SCHEDULE:
+                raise ProgressiveRunError("Held-out Z requires the exact frozen Z_M448_0 schedule")
+            if args.limit is None and not getattr(args, "outcome_embargo", False):
+                raise ProgressiveRunError("Complete held-out Z runs require outcome embargo")
+        else:
+            raise ProgressiveRunError("Held-out cell ID is not registered for this split")
+        if args.model_path != DEFAULT_MODEL or args.runtime_implementation != "original":
+            raise ProgressiveRunError("Held-out scope requires the canonical model ID and original runtime")
+    elif getattr(args, "outcome_embargo", False):
+        raise ProgressiveRunError("Outcome embargo is valid only for the registered held-out Z cells")
 
 
 def make_prompt(sample: dict[str, Any]) -> str:
@@ -241,6 +296,32 @@ def source_contract() -> dict[str, Any]:
     return provenance
 
 
+def heldout_checkpoint_contract() -> dict[str, Any]:
+    reference = HELDOUT_MODEL_SNAPSHOT.parent.parent / "refs/main"
+    index_path = HELDOUT_MODEL_SNAPSHOT / "model.safetensors.index.json"
+    config_path = HELDOUT_MODEL_SNAPSHOT / "config.json"
+    if not reference.is_file() or reference.read_text(encoding="utf-8").strip() != HELDOUT_MODEL_REVISION:
+        raise ProgressiveRunError("Held-out checkpoint refs/main differs from the frozen revision")
+    if not index_path.is_file() or not config_path.is_file():
+        raise ProgressiveRunError("Held-out checkpoint index/config is missing")
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    shards = sorted(set(index["weight_map"].values()))
+    for shard in shards:
+        path = HELDOUT_MODEL_SNAPSHOT / shard
+        if not path.is_file():
+            raise ProgressiveRunError(f"Held-out checkpoint shard is missing: {shard}")
+        if sha256_file(path) != HELDOUT_MODEL_SHARD_SHA256.get(shard):
+            raise ProgressiveRunError(f"Held-out checkpoint shard hash differs: {shard}")
+    return {
+        "revision": HELDOUT_MODEL_REVISION,
+        "config_sha256": sha256_file(config_path),
+        "index_sha256": sha256_file(index_path),
+        "shard_names": shards,
+        "shard_sizes": {shard: (HELDOUT_MODEL_SNAPSHOT / shard).stat().st_size for shard in shards},
+        "shard_sha256": HELDOUT_MODEL_SHARD_SHA256,
+    }
+
+
 def build_config(args: argparse.Namespace, rows: list[dict[str, Any]], run_dir: Path) -> dict[str, Any]:
     provenance = source_contract()
     if provenance["git_dirty"]:
@@ -250,13 +331,10 @@ def build_config(args: argparse.Namespace, rows: list[dict[str, Any]], run_dir: 
         manifest_display = str(manifest_path.relative_to(REPO_ROOT))
     except ValueError:
         manifest_display = str(manifest_path)
-    scope = (
-        "smoke"
-        if args.limit is not None
-        else "full_validation"
-        if args.registered_scope == "full_validation"
-        else "discovery"
+    scope = "smoke" if args.limit is not None else (
+        args.registered_scope if args.registered_scope != "auto" else "discovery"
     )
+    dataset_split = "val"
     if scope == "full_validation":
         if len(rows) != FULL_VALIDATION_ROWS:
             raise ProgressiveRunError(
@@ -266,6 +344,16 @@ def build_config(args: argparse.Namespace, rows: list[dict[str, Any]], run_dir: 
             raise ProgressiveRunError("full_validation manifest hash mismatch")
         if args.pre_llm_selector != "none":
             raise ProgressiveRunError("full_validation scope forbids pre-LLM/oracle selectors")
+    elif args.registered_scope in HELDOUT_CONTRACTS:
+        contract = HELDOUT_CONTRACTS[args.registered_scope]
+        dataset_split = str(contract["split"])
+        if manifest_checksum(args.manifest) != contract["sha256"]:
+            raise ProgressiveRunError(f"{args.registered_scope} manifest hash mismatch")
+        if args.limit is None and len(rows) != contract["rows"]:
+            raise ProgressiveRunError(
+                f"{args.registered_scope} requires {contract['rows']} rows, found {len(rows)}"
+            )
+    checkpoint = heldout_checkpoint_contract() if args.registered_scope in HELDOUT_CONTRACTS else None
     return {
         "schema_version": 1,
         "cell_id": str(args.cell_id),
@@ -279,8 +367,14 @@ def build_config(args: argparse.Namespace, rows: list[dict[str, Any]], run_dir: 
         "model/precision": "bf16",
         "model/decoding": "deterministic_greedy",
         "model/max_new_tokens": MAX_NEW_TOKENS,
+        "model/revision": checkpoint["revision"] if checkpoint else None,
+        "model/config_sha256": checkpoint["config_sha256"] if checkpoint else None,
+        "model/index_sha256": checkpoint["index_sha256"] if checkpoint else None,
+        "model/shard_names": checkpoint["shard_names"] if checkpoint else None,
+        "model/shard_sizes": checkpoint["shard_sizes"] if checkpoint else None,
+        "model/shard_sha256": checkpoint["shard_sha256"] if checkpoint else None,
         "dataset/name": "refcoco",
-        "dataset/split": "val",
+        "dataset/split": dataset_split,
         "dataset/manifest": manifest_display,
         "dataset/manifest_checksum": manifest_checksum(args.manifest),
         "dataset/num_samples": len(rows),
@@ -308,6 +402,7 @@ def build_config(args: argparse.Namespace, rows: list[dict[str, Any]], run_dir: 
         "limit": args.limit,
         "scope": scope,
         "registered_scope": str(args.registered_scope),
+        "outcome_embargo": bool(args.outcome_embargo),
         "run/output_dir": str(run_dir.relative_to(REPO_ROOT)),
         "feather/official_repository": (
             "https://github.com/markendo/FEATHER" if args.method == "feather_llava_main" else None
@@ -327,11 +422,12 @@ def build_config(args: argparse.Namespace, rows: list[dict[str, Any]], run_dir: 
 IMMUTABLE_CONFIG_KEYS = {
     "cell_id", "method/name", "source/git_commit", "source/git_dirty", "source/sha256",
     "model/name", "model/precision", "model/decoding", "model/max_new_tokens",
+    "model/revision", "model/config_sha256", "model/index_sha256", "model/shard_names", "model/shard_sizes", "model/shard_sha256",
     "dataset/name", "dataset/split", "dataset/manifest", "dataset/manifest_checksum",
     "dataset/num_samples", "prompt/template", "original_visual_tokens", "grid",
     "schedule", "runtime_implementation", "position_mode", "query_map", "seed", "pre_llm_selector",
     "pre_llm_budget", "oracle_teacher_layer", "limit", "scope",
-    "registered_scope",
+    "registered_scope", "outcome_embargo",
     "oracle_index_input", "oracle_index_input_sha256",
     "feather/official_repository", "feather/official_commit", "feather/boundaries",
     "feather/fastv_ratio_upstream", "feather/keep_ratio", "feather/predefined_mask",
@@ -422,17 +518,30 @@ def build_result(
     wall_latency_s: float,
     peak_allocated_mb: float | None,
     peak_reserved_mb: float | None,
+    manifest_index: int,
+    cell_id: str,
+    checkpoint_revision: str | None,
+    checkpoint_config_sha256: str | None,
+    checkpoint_tensor_inventory_sha256: str | None,
+    environment_sha256: str,
+    outcome_embargo: bool,
 ) -> dict[str, Any]:
-    raw_box, predicted_box, parse_failure = parse_box(raw_output, width, height, "normalized_0_1")
-    iou = box_iou(predicted_box, sample["gt_box"]) if predicted_box is not None else 0.0
-    success = predicted_box is not None and iou >= 0.5
+    if outcome_embargo:
+        raw_box = predicted_box = parse_failure = iou = success = None
+        valid = invalid = None
+    else:
+        raw_box, predicted_box, parse_failure = parse_box(raw_output, width, height, "normalized_0_1")
+        iou = box_iou(predicted_box, sample["gt_box"]) if predicted_box is not None else 0.0
+        success = predicted_box is not None and iou >= 0.5
+        valid, invalid = predicted_box is not None, predicted_box is None
     diagnostics = jsonable(generation.diagnostics)
     result = {
         "sample_id": str(sample["sample_id"]),
+        "manifest_index": int(manifest_index),
         "original_sample_id": (sample.get("metadata") or {}).get("original_sample_id"),
         "source_row": (sample.get("metadata") or {}).get("source_row"),
         "dataset": "refcoco",
-        "split": "val",
+        "split": sample["split"],
         "query": sample["query"],
         "image_id": sample["image_id"],
         "image_path": sample["image_path"],
@@ -443,14 +552,20 @@ def build_result(
         "raw_parsed_box": raw_box,
         "predicted_box": predicted_box,
         "parse_failure_reason": parse_failure,
-        "valid": predicted_box is not None,
-        "invalid": predicted_box is None,
+        "valid": valid,
+        "invalid": invalid,
         "box_iou": iou,
         "score": iou,
         "success_iou_0_5": success,
         "generated_token_count": generated_count,
         "config_sha256": config_sha,
         "source_git_commit": source_commit,
+        "method": cell_id.rsplit("_", 1)[0],
+        "checkpoint_revision": checkpoint_revision,
+        "checkpoint_config_sha256": checkpoint_config_sha256,
+        "checkpoint_tensor_inventory_sha256": checkpoint_tensor_inventory_sha256,
+        "environment_sha256": environment_sha256,
+        "outcome_embargoed": outcome_embargo,
         "original_visual_tokens": ORIGINAL_VISUAL_TOKENS,
         "final_retained_indices": generation.final_retained_indices,
         "final_retained_indices_checksum": json_checksum(generation.final_retained_indices),
@@ -473,6 +588,13 @@ def build_result(
         "peak_reserved_mb": peak_reserved_mb,
         **diagnostics,
     }
+    result["invariant_results"] = {
+        "text_tokens_preserved": True,
+        "gap_positions_preserved": True,
+        "exact_trace_recorded": True,
+        "physical_segment_cache": True,
+        "zero_tail_no_score": bool(cell_id.startswith("Z_M448_0")),
+    }
     return result
 
 
@@ -480,11 +602,20 @@ def run(args: argparse.Namespace) -> int:
     validate_cli(args)
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
     rows = load_manifest(args.manifest, args.limit)
-    if any(str(row.get("dataset") or "").lower() != "refcoco" or str(row.get("split") or "").lower() != "val" for row in rows):
-        raise ProgressiveRunError("Runner accepts RefCOCO validation rows only")
+    expected_split = (
+        str(HELDOUT_CONTRACTS[args.registered_scope]["split"])
+        if args.registered_scope in HELDOUT_CONTRACTS
+        else "val"
+    )
+    if any(
+        str(row.get("dataset") or "").lower() != "refcoco"
+        or str(row.get("split") or "").lower() != expected_split.lower()
+        for row in rows
+    ):
+        raise ProgressiveRunError(f"Runner expected only RefCOCO {expected_split} rows")
     run_name = args.run_name or f"{args.cell_id.lower()}_attempt1"
     run_dir = (args.output_root / run_name).resolve()
-    completed_path = run_dir / "COMPLETED.json"
+    completed_path = run_dir / ("SEALED_RAW.json" if args.outcome_embargo else "COMPLETED.json")
     if args.skip_existing and completed_path.is_file():
         from validate_progressive_oracle_run import validate_run
 
@@ -507,7 +638,7 @@ def run(args: argparse.Namespace) -> int:
         atomic_write(config_path, canonical_json_bytes(config))
     config_sha = sha256_file(config_path)
     partial_path = run_dir / "predictions.partial.jsonl"
-    predictions_path = run_dir / "predictions.jsonl"
+    predictions_path = run_dir / ("predictions.raw.jsonl" if args.outcome_embargo else "predictions.jsonl")
     existing = load_partial_rows(partial_path, rows, config_sha) if args.resume else []
     if predictions_path.exists() and not completed_path.exists():
         raise ProgressiveRunError("Unvalidated final predictions already exist; use a fresh attempt directory")
@@ -559,7 +690,14 @@ def run(args: argparse.Namespace) -> int:
         "model_load_latency_s": model_load_latency,
         **model_env,
     }
-    atomic_write(run_dir / "environment.json", canonical_json_bytes(jsonable(environment)))
+    existing_environment_paths = sorted(run_dir.glob("environment*.json"))
+    environment_path = (
+        run_dir / f"environment_resume_{len(existing_environment_paths):03d}.json"
+        if existing and existing_environment_paths
+        else run_dir / "environment.json"
+    )
+    atomic_write(environment_path, canonical_json_bytes(jsonable(environment)))
+    environment_sha = sha256_file(environment_path)
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     mode = "a" if args.resume and partial_path.exists() else "w"
@@ -567,6 +705,7 @@ def run(args: argparse.Namespace) -> int:
     oracle_handle = oracle_partial.open(oracle_mode, encoding="utf-8") if args.pre_llm_selector == "oracle" else None
     try:
         with partial_path.open(mode, encoding="utf-8") as prediction_handle:
+            manifest_index_by_id = {str(row["sample_id"]): index for index, row in enumerate(rows)}
             for pending_index, sample in enumerate(pending, 1):
                 sample_id = str(sample["sample_id"])
                 image_paths, images = load_sample_images(sample)
@@ -683,6 +822,16 @@ def run(args: argparse.Namespace) -> int:
                     wall_latency_s=wall_latency,
                     peak_allocated_mb=peak_allocated,
                     peak_reserved_mb=peak_reserved,
+                    manifest_index=manifest_index_by_id[sample_id],
+                    cell_id=str(args.cell_id),
+                    checkpoint_revision=config.get("model/revision"),
+                    checkpoint_config_sha256=config.get("model/config_sha256"),
+                    checkpoint_tensor_inventory_sha256=(
+                        json_checksum(config.get("model/shard_sha256"))
+                        if config.get("model/shard_sha256") is not None else None
+                    ),
+                    environment_sha256=environment_sha,
+                    outcome_embargo=bool(args.outcome_embargo),
                 )
                 prediction_handle.write(json.dumps(jsonable(result), ensure_ascii=True, sort_keys=True) + "\n")
                 prediction_handle.flush()
@@ -699,12 +848,19 @@ def run(args: argparse.Namespace) -> int:
     os.replace(partial_path, predictions_path)
     if args.pre_llm_selector == "oracle":
         os.replace(oracle_partial, oracle_final)
-    from validate_progressive_oracle_run import validate_and_finalize_run
+    from validate_progressive_oracle_run import validate_and_finalize_run, validate_and_seal_raw_run
 
-    validation = validate_and_finalize_run(run_dir, args.manifest, expected_rows=len(rows))
+    validation = (
+        validate_and_seal_raw_run(run_dir, args.manifest, expected_rows=len(rows))
+        if args.outcome_embargo
+        else validate_and_finalize_run(run_dir, args.manifest, expected_rows=len(rows))
+    )
     if validation["status"] != "pass":
         raise ProgressiveRunError("Independent final validation failed")
-    print(json.dumps({"status": "complete", "run_dir": str(run_dir), "metrics": validation["metrics"]}, indent=2))
+    message = {"status": "raw_sealed" if args.outcome_embargo else "complete", "run_dir": str(run_dir)}
+    if not args.outcome_embargo:
+        message["metrics"] = validation["metrics"]
+    print(json.dumps(message, indent=2))
     return 0
 
 

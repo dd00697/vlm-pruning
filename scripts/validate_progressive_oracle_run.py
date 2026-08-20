@@ -38,6 +38,23 @@ EXPECTED_DISCOVERY_SHA256 = "98577029365776a76bd5ec798da4ef06c546e298fd1e950bd23
 EXPECTED_DISCOVERY_ROWS = 1000
 EXPECTED_FULL_VALIDATION_SHA256 = "f26d7b954189e86f55b50f9506bb670d3a0cf847d3152779af6c08dbf094e3d7"
 EXPECTED_FULL_VALIDATION_ROWS = 8811
+HELDOUT_CONTRACTS = {
+    "heldout_testA": {
+        "split": "testA",
+        "rows": 5657,
+        "sha256": "01332dfc67c59c9077f14325dc11cb301b9a01a55eccdcc815f92f3fe587fe23",
+    },
+    "heldout_testB": {
+        "split": "testB",
+        "rows": 5095,
+        "sha256": "0f0fd8ff86faf8ac48446c27e71c350b14aed2a8d86d6a59b4f7599def2d40c9",
+    },
+}
+HELDOUT_MODEL_SHARD_SHA256 = {
+    "model-00001-of-00003.safetensors": "c11dbf016ee7d35ee130c19b67e20eb04873996006f424b7bcbd453b6517ee66",
+    "model-00002-of-00003.safetensors": "46df6c6e5fad297fe7fbca4963dcf180cb1d0528cabc884d1f603311fed01328",
+    "model-00003-of-00003.safetensors": "4f06177c37ca13944e73b57dd6d051767b950dffc12400c700dfa2509c24c697",
+}
 REGISTERED_PROMPT = (
     'Identify the target described by this referring expression: "{query}".\n'
     "Return exactly one bounding box in normalized 0-1 image coordinates as "
@@ -161,13 +178,19 @@ def config_events(config: dict[str, Any]) -> tuple[PruningEvent, ...]:
 
 
 def validate_config(config: dict[str, Any], manifest_path: Path, manifest_rows: list[dict[str, Any]]) -> None:
+    registered_scope = str(config.get("registered_scope") or "auto")
+    expected_split = (
+        str(HELDOUT_CONTRACTS[registered_scope]["split"])
+        if registered_scope in HELDOUT_CONTRACTS
+        else "val"
+    )
     checks = {
         "model/name": "llava-hf/llava-1.5-7b-hf",
         "model/precision": "bf16",
         "model/decoding": "deterministic_greedy",
         "model/max_new_tokens": 48,
         "dataset/name": "refcoco",
-        "dataset/split": "val",
+        "dataset/split": expected_split,
         "dataset/manifest_checksum": sha256_file(manifest_path),
         "dataset/num_samples": len(manifest_rows),
         "prompt/template": REGISTERED_PROMPT,
@@ -199,13 +222,31 @@ def validate_config(config: dict[str, Any], manifest_path: Path, manifest_rows: 
             raise ProgressiveValidationError("Full-validation config unexpectedly has a limit")
         _equal(config.get("registered_scope"), "full_validation", "full-validation registered scope")
         _equal(config.get("pre_llm_selector"), "none", "full-validation pre-LLM selector")
+    elif config.get("scope") in HELDOUT_CONTRACTS:
+        contract = HELDOUT_CONTRACTS[str(config.get("scope"))]
+        _equal(registered_scope, config.get("scope"), "held-out registered scope")
+        _equal(len(manifest_rows), contract["rows"], "held-out row count")
+        _equal(sha256_file(manifest_path), contract["sha256"], "held-out manifest hash")
+        _equal(config.get("limit"), None, "held-out limit")
+        _equal(config.get("seed"), 0, "held-out seed")
+        _equal(config.get("pre_llm_selector"), "none", "held-out pre-LLM selector")
+        _equal(config.get("model/revision"), "b234b804b114d9e37bb655e11cbbb5f5e971b7a9", "held-out model revision")
+        snapshot = Path("/workspace/cache/huggingface/hub/models--llava-hf--llava-1.5-7b-hf/snapshots") / config["model/revision"]
+        _equal(config.get("model/config_sha256"), sha256_file(snapshot / "config.json"), "held-out model config hash")
+        _equal(config.get("model/index_sha256"), sha256_file(snapshot / "model.safetensors.index.json"), "held-out model index hash")
+        _equal(config.get("model/shard_sha256"), HELDOUT_MODEL_SHARD_SHA256, "held-out shard hashes")
+        for shard, expected_sha in HELDOUT_MODEL_SHARD_SHA256.items():
+            _equal(sha256_file(snapshot / shard), expected_sha, f"held-out physical shard {shard}")
+        expected_cell = ("Z_M448_0_" if config.get("outcome_embargo") else "Full_") + contract["split"]
+        _equal(config.get("cell_id"), expected_cell, "held-out cell ID")
     elif config.get("scope") != "smoke":
         raise ProgressiveValidationError(f"Unsupported run scope {config.get('scope')}")
-    if any(str(row.get("dataset") or "").lower() != "refcoco" or str(row.get("split") or "").lower() != "val" for row in manifest_rows):
-        raise ProgressiveValidationError("Manifest contains a forbidden dataset or split")
-    manifest_text = str(config.get("dataset/manifest") or "").lower()
-    if "testa" in manifest_text or "testb" in manifest_text:
-        raise ProgressiveValidationError("Forbidden RefCOCO test manifest in config")
+    if any(
+        str(row.get("dataset") or "").lower() != "refcoco"
+        or str(row.get("split") or "").lower() != expected_split.lower()
+        for row in manifest_rows
+    ):
+        raise ProgressiveValidationError(f"Manifest contains rows outside RefCOCO {expected_split}")
     config_events(config)
     method = config.get("method/name", "progressive")
     if method == "feather_llava_main":
@@ -527,18 +568,23 @@ def validate_run(
 ) -> dict[str, Any]:
     del finalize
     config_path = run_dir / "config.json"
-    predictions_path = run_dir / "predictions.jsonl"
     if not config_path.is_file():
         raise ProgressiveValidationError(f"Missing config: {config_path}")
     config = json.loads(config_path.read_text(encoding="utf-8"))
+    outcome_embargo = bool(config.get("outcome_embargo"))
+    predictions_path = run_dir / ("predictions.raw.jsonl" if outcome_embargo else "predictions.jsonl")
     manifest_hash = sha256_file(manifest_path)
     if config.get("scope") == "smoke":
         if manifest_hash == EXPECTED_DISCOVERY_SHA256:
             manifest_physical_rows = EXPECTED_DISCOVERY_ROWS
         elif manifest_hash == EXPECTED_FULL_VALIDATION_SHA256:
             manifest_physical_rows = EXPECTED_FULL_VALIDATION_ROWS
+        elif manifest_hash == HELDOUT_CONTRACTS["heldout_testA"]["sha256"]:
+            manifest_physical_rows = HELDOUT_CONTRACTS["heldout_testA"]["rows"]
+        elif manifest_hash == HELDOUT_CONTRACTS["heldout_testB"]["sha256"]:
+            manifest_physical_rows = HELDOUT_CONTRACTS["heldout_testB"]["rows"]
         else:
-            raise ProgressiveValidationError("Smoke manifest is not a registered RefCOCO-val manifest")
+            raise ProgressiveValidationError("Smoke manifest is not a registered frozen RefCOCO manifest")
     else:
         manifest_physical_rows = expected_rows
     manifest_rows = read_jsonl_strict(manifest_path, manifest_physical_rows)
@@ -553,6 +599,10 @@ def validate_run(
     if len(set(prediction_ids)) != expected_rows:
         raise ProgressiveValidationError("Prediction IDs are not unique")
     config_sha = sha256_file(config_path)
+    environment_paths = sorted(run_dir.glob("environment*.json"))
+    if not environment_paths or not (run_dir / "environment.json").is_file():
+        raise ProgressiveValidationError("Run environment is missing")
+    environment_hashes = {sha256_file(path) for path in environment_paths}
     artifacts: dict[str, OracleIndexArtifact] = {}
     oracle_path = run_dir / "oracle_indices.jsonl"
     if config["pre_llm_selector"] == "oracle":
@@ -567,31 +617,46 @@ def validate_run(
             _equal(row.get(key), manifest.get(key), f"row {index} {key}")
         _equal(row.get("config_sha256"), config_sha, f"row {index} config hash")
         _equal(row.get("source_git_commit"), config["source/git_commit"], f"row {index} source revision")
+        _equal(row.get("manifest_index"), index, f"row {index} manifest index")
+        _equal(row.get("method"), str(config["cell_id"]).rsplit("_", 1)[0], f"row {index} method")
+        _equal(row.get("checkpoint_revision"), config.get("model/revision"), f"row {index} checkpoint revision")
+        _equal(row.get("checkpoint_config_sha256"), config.get("model/config_sha256"), f"row {index} checkpoint config")
+        _equal(row.get("checkpoint_tensor_inventory_sha256"), json_checksum(config.get("model/shard_sha256")), f"row {index} checkpoint tensors")
+        if row.get("environment_sha256") not in environment_hashes:
+            raise ProgressiveValidationError(f"row {index} environment hash is not a recorded epoch")
+        invariants = row.get("invariant_results")
+        if not isinstance(invariants, dict) or not all(invariants.get(key) is True for key in ("text_tokens_preserved", "gap_positions_preserved", "exact_trace_recorded", "physical_segment_cache")):
+            raise ProgressiveValidationError(f"row {index} invariant results are incomplete")
         validate_stage_traces(row, config, index)
         validate_cache_and_tokens(row, config, index)
         validate_oracle(row, config, artifacts, index)
-        predicted_box, raw_box, parse_reason = parse_box(
-            str(row.get("raw_model_output") or ""), int(manifest["width"]), int(manifest["height"])
-        )
-        iou = box_iou(predicted_box, list(manifest["gt_box"])) if predicted_box is not None else 0.0
-        success = bool(iou >= 0.5)
-        _equal(row.get("parse_failure_reason"), parse_reason, f"row {index} parse reason")
-        _equal(bool(row.get("valid")), predicted_box is not None, f"row {index} validity")
-        _equal(bool(row.get("invalid")), predicted_box is None, f"row {index} invalidity")
-        _equal(bool(row.get("success_iou_0_5")), success, f"row {index} Acc@0.5")
-        _close(float(row.get("box_iou", -1)), iou, f"row {index} IoU")
-        if raw_box is not None:
-            if not isinstance(row.get("raw_parsed_box"), list) or len(row["raw_parsed_box"]) != 4:
-                raise ProgressiveValidationError(f"row {index} raw parsed box malformed")
-            for actual, expected in zip(row["raw_parsed_box"], raw_box, strict=True):
-                _close(float(actual), float(expected), f"row {index} raw box component")
-        if predicted_box is not None:
-            if not isinstance(row.get("predicted_box"), list) or len(row["predicted_box"]) != 4:
-                raise ProgressiveValidationError(f"row {index} predicted box malformed")
-            for actual, expected in zip(row["predicted_box"], predicted_box, strict=True):
-                _close(float(actual), float(expected), f"row {index} predicted box component")
+        if outcome_embargo:
+            _equal(row.get("outcome_embargoed"), True, f"row {index} embargo flag")
+            for key in ("raw_parsed_box", "predicted_box", "parse_failure_reason", "valid", "invalid", "box_iou", "score", "success_iou_0_5"):
+                _equal(row.get(key), None, f"row {index} embargoed {key}")
+        else:
+            predicted_box, raw_box, parse_reason = parse_box(
+                str(row.get("raw_model_output") or ""), int(manifest["width"]), int(manifest["height"])
+            )
+            iou = box_iou(predicted_box, list(manifest["gt_box"])) if predicted_box is not None else 0.0
+            success = bool(iou >= 0.5)
+            _equal(row.get("parse_failure_reason"), parse_reason, f"row {index} parse reason")
+            _equal(bool(row.get("valid")), predicted_box is not None, f"row {index} validity")
+            _equal(bool(row.get("invalid")), predicted_box is None, f"row {index} invalidity")
+            _equal(bool(row.get("success_iou_0_5")), success, f"row {index} Acc@0.5")
+            _close(float(row.get("box_iou", -1)), iou, f"row {index} IoU")
+            if raw_box is not None:
+                if not isinstance(row.get("raw_parsed_box"), list) or len(row["raw_parsed_box"]) != 4:
+                    raise ProgressiveValidationError(f"row {index} raw parsed box malformed")
+                for actual, expected in zip(row["raw_parsed_box"], raw_box, strict=True):
+                    _close(float(actual), float(expected), f"row {index} raw box component")
+            if predicted_box is not None:
+                if not isinstance(row.get("predicted_box"), list) or len(row["predicted_box"]) != 4:
+                    raise ProgressiveValidationError(f"row {index} predicted box malformed")
+                for actual, expected in zip(row["predicted_box"], predicted_box, strict=True):
+                    _close(float(actual), float(expected), f"row {index} predicted box component")
         recomputed_rows.append(row)
-    metrics = aggregate_metrics(recomputed_rows)
+    metrics = None if outcome_embargo else aggregate_metrics(recomputed_rows)
     return {
         "status": "pass",
         "validated_at_utc": utc_now(),
@@ -613,6 +678,7 @@ def validate_run(
             "registered_merge_mass_and_assignment_contract": True,
             "per_layer_segment_caches": True,
             "raw_outputs_rescored": True,
+            "outcome_embargoed": outcome_embargo,
             "oracle_indices_only": config["pre_llm_selector"] == "oracle",
             "oracle_teacher_work_separate": True,
         },
@@ -642,6 +708,33 @@ def validate_and_finalize_run(run_dir: Path, manifest_path: Path, *, expected_ro
     atomic_write(completed_path, canonical_json_bytes(completion))
     # Prove that the just-finalized physical artifacts remain valid; the
     # completion sentinel itself is metadata and is not an input to validation.
+    validate_run(run_dir, manifest_path, expected_rows=expected_rows)
+    return report
+
+
+def validate_and_seal_raw_run(run_dir: Path, manifest_path: Path, *, expected_rows: int) -> dict[str, Any]:
+    report = validate_run(run_dir, manifest_path, expected_rows=expected_rows)
+    if report["metrics"] is not None:
+        raise ProgressiveValidationError("Raw held-out seal unexpectedly contains outcome metrics")
+    integrity_path = run_dir / "integrity_raw.json"
+    sealed_path = run_dir / "SEALED_RAW.json"
+    atomic_write(integrity_path, canonical_json_bytes(report))
+    seal = {
+        "status": "raw_sealed_outcome_embargoed",
+        "sealed_at_utc": utc_now(),
+        "rows": expected_rows,
+        "manifest_sha256": sha256_file(manifest_path),
+        "source_git_commit": report["source_git_commit"],
+        "config_sha256": sha256_file(run_dir / "config.json"),
+        "environment_sha256": sha256_file(run_dir / "environment.json"),
+        "environment_epoch_sha256": {
+            path.name: sha256_file(path) for path in sorted(run_dir.glob("environment*.json"))
+        },
+        "raw_predictions_sha256": sha256_file(run_dir / "predictions.raw.jsonl"),
+        "integrity_raw_sha256": sha256_file(integrity_path),
+        "quality_metrics_present": False,
+    }
+    atomic_write(sealed_path, canonical_json_bytes(seal))
     validate_run(run_dir, manifest_path, expected_rows=expected_rows)
     return report
 
