@@ -151,22 +151,23 @@ def build() -> dict[str, object]:
     lines = [
         r"% Generated from sealed frozen-Z held-out artifacts. Do not edit.",
         r"The candidate was frozen from validation before either held-out split was executed. Under the",
-        rf"preregistered descriptive rule, the outcome is \emph{{{tex(wording)}}}. No split pooling,",
+        rf"frozen descriptive rule, the outcome is \emph{{{tex(wording.replace(' under the preregistered descriptive rule', ''))}}}. No split pooling,",
         r"candidate reselection or held-out timing measurement is part of this result.",
         tex(gate_sentence),
         "",
         r"\begin{table}[htbp]", r"\centering", r"\small",
         r"\caption{One-shot held-out quality and visual-token work.}", r"\label{tab:frozen-z-heldout-quality}",
         r"\begin{tabular}{llrrrrrr}", r"\toprule",
-        r"Split & Method & $N$ & Parsed & Acc@0.5 & mIoU & Avg. tokens & Work \\", r"\midrule",
+        r"Split & Method & $N$ & Parsed (\%) & Acc@0.5 (\%) & mIoU & Avg. tokens & Work \\", r"\midrule",
     ]
     for split in ("testA", "testB"):
         for method in ("Full", "Z_M448_0"):
             row = metrics[split][method]
+            display = "Z-M448-0" if method == "Z_M448_0" else method
             lines.append(
-                f"{split} & {tex(method)} & {row['samples']} & {num(row['parsed_box_rate'])} & "
-                f"{num(row['acc_at_0_5'])} & {num(row['mean_iou'])} & "
-                f"{row['average_visual_tokens']:.0f} & {row['token_layer_work']:.0f} \\\\"
+                f"{split} & {display} & {row['samples']:,} & {100*row['parsed_box_rate']:.2f} & "
+                f"{100*row['acc_at_0_5']:.2f} & {num(row['mean_iou'])} & "
+                f"{row['average_visual_tokens']:.0f} & {row['token_layer_work']:,.0f} \\\\"
             )
     lines.extend([r"\bottomrule", r"\end{tabular}", r"\end{table}", "",
         r"\begin{table}[htbp]", r"\centering", r"\small",

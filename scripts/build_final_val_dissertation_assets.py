@@ -129,7 +129,7 @@ def quality_tables(records: dict[str, dict[str, Any]]) -> str:
         ),
         label="tab:final-val-quality-work",
         columns="llrrrr",
-        header="Method & Stack & Acc.@0.5 (\\%) & mIoU & Avg. visual & Token work",
+        header="Method & Stack & Acc@0.5 (\\%) & mIoU & Avg. visual & Token work",
         rows=rows,
         resize=True,
     )
@@ -147,7 +147,7 @@ def quality_tables(records: dict[str, dict[str, Any]]) -> str:
         ),
         label="tab:final-val-nuwa-quality",
         columns="lrrrr",
-        header="Method & Acc.@0.5 (\\%) & mIoU & Avg. visual & Token work",
+        header="Method & Acc@0.5 (\\%) & mIoU & Avg. visual & Token work",
         rows=native_rows,
     )
     return main + native
@@ -269,8 +269,8 @@ def flop_table(accounting: dict[str, dict[str, Any]]) -> str:
         )
     return table(
         caption=(
-            "Trace-driven modeled FLOPs (two FLOPs per multiply--accumulate). Total includes the "
-            "constant vision encoder, realized projector, decoder and explicit pruning arithmetic; "
+            "Trace-driven modelled FLOPs (two FLOPs per multiply--accumulate). Total includes the "
+            "constant vision encoder, realised projector, decoder and explicit pruning arithmetic; "
             "ranking and gather memory movement are reported separately in the machine-readable audit."
         ),
         label="tab:final-val-flops",
@@ -294,11 +294,20 @@ def uncertainty_and_decision(
         ("Z_M448_0-minus-K12", "mean_iou"),
         ("NUWA_NATIVE_192-minus-NUWA_STACK_FULL", "acc_at_0_5_pp"),
     }
+    contrast_labels = {
+        "K12-minus-Full": "K12 minus Full",
+        "M448_OPT-minus-Full": "M448 minus Full",
+        "Z_M448_0-minus-Full": "Z-M448-0 minus Full",
+        "Z_M448_0-minus-K12": "Z-M448-0 minus K12",
+        "FEATHER_LLAVA_MAIN-minus-Full": "FEATHER minus Full",
+        "NUWA_NATIVE_192-minus-NUWA_STACK_FULL": r'N\"uwa 192 minus native Full',
+    }
+    metric_labels = {"acc_at_0_5_pp": "Acc@0.5 (percentage points)", "mean_iou": "mIoU"}
     rows = []
     for row in quality_contrasts:
         if (row["contrast"], row["metric"]) in wanted_quality:
             rows.append(
-                f"{tex(row['contrast'])} & {tex(row['metric'])} & {row['point_delta']:+.4f} & "
+                f"{contrast_labels[row['contrast']]} & {metric_labels[row['metric']]} & {row['point_delta']:+.4f} & "
                 f"[{row['lower_95']:+.4f}, {row['upper_95']:+.4f}]"
             )
     for row in timing_contrasts:
@@ -309,7 +318,7 @@ def uncertainty_and_decision(
             and row["metric"] == "end_to_end_latency_s"
         ):
             rows.append(
-                f"{tex(row['contrast'])} & E2E seconds & {row['point_delta']:+.4f} & "
+                f"{contrast_labels[row['contrast']]} & E2E seconds & {row['point_delta']:+.4f} & "
                 f"[{row['lower_95']:+.4f}, {row['upper_95']:+.4f}]"
             )
     effects = table(
@@ -356,7 +365,7 @@ def main_tex() -> str:
 \\begin{figure}[H]
   \\centering
   \\includegraphics[width=0.98\\textwidth]{final_evaluation/final_val_efficiency/quality_vs_token_work.pdf}
-  \\caption{Complete validation Acc.@0.5 and mIoU against visual token-layer work. Dashed lines show the canonical-stack non-dominated frontier. The hollow FastV marker denotes its separate official fork.}
+  \\caption{Complete validation Acc@0.5 and mIoU against visual token-layer work. Dashed lines show the canonical-stack non-dominated frontier. The hollow FastV marker denotes its separate official fork.}
   \\label{fig:final-val-quality-work}
 \\end{figure}
 
@@ -388,7 +397,8 @@ def macros(decision: dict[str, Any], records: dict[str, dict[str, Any]]) -> str:
             f"\\newcommand{{\\FinalValSelectedIoU}}{{{row['mean_iou']:.4f}}}",
             f"\\newcommand{{\\FinalValSelectedAverageTokens}}{{{row['average_visual_tokens']:.1f}}}",
             f"\\newcommand{{\\FinalValSelectedWork}}{{{row['visual_token_layer_work']:,.0f}}}",
-            f"\\newcommand{{\\FinalValDecisionStatus}}{{{tex(decision['status'])}}}",
+            f"\\newcommand{{\\FinalValDecisionStatusRaw}}{{{tex(decision['status'])}}}",
+            "\\newcommand{\\FinalValDecisionStatus}{candidate selected from validation under the registered quality-and-acceleration rule}",
             "",
         ]
     )
