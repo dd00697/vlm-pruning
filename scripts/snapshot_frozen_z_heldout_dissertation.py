@@ -33,6 +33,9 @@ BASELINE_FILES = [
 FINAL_FILES = BASELINE_FILES[1:] + [
     Path("chapters/generated_frozen_z_heldout/macros.tex"),
     Path("chapters/generated_frozen_z_heldout/main.tex"),
+    Path("images/heldout_visual_repairs/final_evaluation/final_val_efficiency/quality_vs_token_work.pdf"),
+    Path("images/heldout_visual_repairs/final_evaluation/final_val_efficiency/quality_vs_natural_latency.pdf"),
+    Path("images/heldout_visual_repairs/final_evaluation/final_val_efficiency/canonical_timing_decomposition.pdf"),
     Path("analysis/derived/frozen_z_m448_0_refcoco_testab/HELDOUT_RESULTS.json"),
     Path("analysis/derived/frozen_z_m448_0_refcoco_testab/PAIRED_CONTRASTS.json"),
     Path("analysis/derived/frozen_z_m448_0_refcoco_testab/HELDOUT_DECISION.json"),

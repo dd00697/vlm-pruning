@@ -20,6 +20,7 @@ from frozen_z_heldout_common import CAMPAIGN, HeldoutError, atomic_json, now, re
 DRAFT = Path("/workspace/Dissertation_Draft")
 GENERATED = DRAFT / "chapters/generated_frozen_z_heldout"
 DERIVED = DRAFT / "analysis/derived/frozen_z_m448_0_refcoco_testab"
+VISUAL_REPAIRS = DRAFT / "images/heldout_visual_repairs/final_evaluation/final_val_efficiency"
 SOURCE_NAMES = ["HELDOUT_RESULTS.json", "PAIRED_CONTRASTS.json", "HELDOUT_DECISION.json", "SPLIT_HETEROGENEITY.json"]
 
 
@@ -54,6 +55,37 @@ def atomic_copy(source: Path, target: Path) -> None:
     temporary = target.with_name(f".{target.name}.tmp")
     shutil.copy2(source, temporary)
     os.replace(temporary, target)
+
+
+def build_visual_repairs() -> dict[str, dict[str, str]]:
+    """Regenerate prior audited plots with the right-edge Full labels moved inward.
+
+    The original final-validation assets remain byte-for-byte untouched.  The dissertation uses
+    these campaign-specific display copies so its exhaustive visual QA can pass without changing
+    the completed validation evidence.
+    """
+    import matplotlib.axes
+    import finalize_final_val_efficiency as finalizer
+
+    analysis = CAMPAIGN.parents[0] / "final_val_efficiency_baselines_20260818/analysis"
+    records = json.loads((analysis / "JOINED_METHOD_RECORDS.json").read_text(encoding="utf-8"))
+    pareto = read_json(analysis / "PARETO_FRONTIERS.json")
+    original_annotate = matplotlib.axes.Axes.annotate
+
+    def inward_full(axis, text, *args, **kwargs):
+        if text == "Full":
+            kwargs["xytext"] = (-23, 5)
+        return original_annotate(axis, text, *args, **kwargs)
+
+    matplotlib.axes.Axes.annotate = inward_full
+    original_figures = finalizer.FIGURES
+    try:
+        finalizer.FIGURES = VISUAL_REPAIRS
+        paths = finalizer.plots(records, pareto)
+    finally:
+        finalizer.FIGURES = original_figures
+        matplotlib.axes.Axes.annotate = original_annotate
+    return {path.name: {"path": str(path), "sha256": sha256(path)} for path in paths}
 
 
 def build() -> dict[str, object]:
@@ -187,6 +219,7 @@ def build() -> dict[str, object]:
     }
     claim_path = DERIVED / "CLAIM_EVIDENCE_LEDGER.json"
     atomic_json(claim_path, claim_evidence)
+    visual_repairs = build_visual_repairs()
     manifest = {
         "schema_version": 1, "status": "complete", "created_at_utc": now(),
         "heldout_status": status, "sources": copied,
@@ -195,6 +228,7 @@ def build() -> dict[str, object]:
             "main.tex": {"path": str(main_path), "sha256": sha256(main_path)},
             "CLAIM_EVIDENCE_LEDGER.json": {"path": str(claim_path), "sha256": sha256(claim_path)},
         },
+        "visual_repairs": visual_repairs,
     }
     atomic_json(DERIVED / "ASSET_MANIFEST.json", manifest)
     return manifest
