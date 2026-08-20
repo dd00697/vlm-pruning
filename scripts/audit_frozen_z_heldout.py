@@ -28,6 +28,8 @@ import numpy as np
 
 
 REPO = Path(__file__).resolve().parents[1]
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
 CAMPAIGN = REPO / "experiments/frozen_z_m448_0_refcoco_testab_20260820"
 DISSERTATION = Path("/workspace/Dissertation_Draft")
 DERIVED = DISSERTATION / "analysis/derived/frozen_z_m448_0_refcoco_testab"
