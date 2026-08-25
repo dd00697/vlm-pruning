@@ -1,0 +1,12 @@
+diff --git a/transformers/src/transformers/models/llava/modeling_llava.py b/transformers/src/transformers/models/llava/modeling_llava.py
+index 0fb149f..b980a6e 100644
+--- a/transformers/src/transformers/models/llava/modeling_llava.py
++++ b/transformers/src/transformers/models/llava/modeling_llava.py
+@@ -429,7 +429,6 @@ class LlavaForConditionalGeneration(LlavaPreTrainedModel, GenerationMixin):
+             inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
+ 
+         if self.config.ivcp_config is not None:
+-            print("!!!!!!!!!! IVCP")
+             outputs = self.language_model.ivcp_forward(
+                 attention_mask=attention_mask,
+                 position_ids=position_ids,

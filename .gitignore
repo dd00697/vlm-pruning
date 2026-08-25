@@ -14,6 +14,11 @@ GOAL.md
 AGENTS.md
 EXPERIMENT_STATUS.md
 virtual_environment.md
+!runpod_handoff/
+!runpod_handoff/ivc_prune/
+!runpod_handoff/ivc_prune/GOAL.md
+!runpod_handoff/ivc_prune/AGENTS.md
+!runpod_handoff/ivc_prune/README.md
 
 # Python caches and build artifacts
 __pycache__/
