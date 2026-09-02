@@ -1,8 +1,0 @@
-{
-  "accepted_source_epoch": "91d949a",
-  "artifact_status": "SUPERSEDED_PRE_ACCEPTED_SOURCE_EPOCH",
-  "created_at_utc": "2026-08-18T14:42:24Z",
-  "model_outputs_affected": false,
-  "reason": "The native result was generated before the accepted shared runner source epoch; the epoch changes only component attribution for the Full control and source-inventory hashing, but all Nüwa methods are rerun to keep timing evidence source-identical.",
-  "rerun_required": true
-}
