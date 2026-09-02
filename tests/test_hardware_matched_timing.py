@@ -3,6 +3,10 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
+import pytest
+
+pytest.importorskip("torch")
+
 from scripts import analyse_hardware_matched_timing as analysis
 from scripts.run_hardware_matched_timing_trial import (
     FIXED32_ORDER_PLAN,

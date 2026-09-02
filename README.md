@@ -1,171 +1,73 @@
-# UG-Prune: fixed mid-layer visual-token pruning for LLaVA
+# K12-QueryTopK-Z0: training-free visual-token pruning for LLaVA
 
-This repository contains the implementation, experiment runners and raw
-artefacts for an MSc dissertation on training-free visual-token pruning in
-decoder-only vision-language models.
+This is the cleaned research repository for an MSc dissertation on reducing the number of image
+tokens processed by decoder-only vision-language models. It contains the final inference code,
+the experiment and verification entrypoints that support the reported results, focused tests, and
+a compact machine-readable result bundle.
 
-The central question is simple: can a model keep grounding quality while
-processing fewer image tokens? Full LLaVA-1.5-7B passes 576 visual tokens
-through every language-model layer. UG-Prune scores those tokens against the
-query, keeps an exact budget at a fixed decoder layer, and continues inference
-with the shorter sequence. The retained tokens have three roles:
+The final method is **K12-QueryTopK-Z0**. LLaVA-1.5-7B starts with 576 image tokens, keeps the 48
+tokens most relevant to the query after decoder layer 12, and removes the remaining visual states
+after layer 20. No selector is trained and no test split is used to tune the method.
 
-- target tokens cover high-scoring image regions;
-- context tokens retain the radius-one neighbourhood around targets; and
-- anchor tokens spread coverage across the image.
+![K12-QueryTopK-Z0 schedule](assets/readme/k12_schedule.png)
 
-The final method is fixed rather than adaptive. It prunes after layer 20, keeps
-48 tokens, uses query-max scoring, allocates more of the non-target budget to
-anchors, preserves the original position gaps, and uses a layer-aware two-bank
-KV cache. There is no learned selector, policy controller or task-specific
-retuning after validation.
+The schedule is `[576] × 12 + [48] × 8 + [0] × 12`: 7,296 visual token-layers, or 228 visual
+tokens per decoder layer on average, compared with 18,432 for Full inference.
 
 ## Main results
 
-The final configuration was selected on all 8,811 RefCOCO validation referring
-expressions and frozen before testA, testB, POPE and TextVQA were examined.
-These are the current results derived from the local raw artefacts:
+The method reduces analytical work and measured latency, but it does not preserve quality on every
+split or task.
 
-| Evaluation | Samples | Full LLaVA | Frozen UG-Prune, 48 tokens |
+| RefCOCO split | Samples | Full Acc@0.5 | K12-Z0 Acc@0.5 | Change |
+|---|---:|---:|---:|---:|
+| Validation | 8,811 | 44.93% | 41.95% | -2.98 pp |
+| testA | 5,657 | 50.96% | 47.18% | -3.78 pp |
+| testB | 5,095 | 39.94% | 37.37% | -2.57 pp |
+
+![Validation quality against token-layer work](assets/readme/quality_vs_work.png)
+
+On an NVIDIA A40, five paired 1,000-example repetitions measured 0.869 seconds per example for
+Full and 0.814 seconds for K12-Z0, a **6.26% reduction**. Modelled prefill falls from 8.96 to
+4.32 TFLOPs and prompt KV storage falls by 54.04%. Timing is hardware- and implementation-specific.
+
+### Transfer
+
+| Benchmark | Full | K12-Z0 | Paired change (95% CI) |
 |---|---:|---:|---:|
-| RefCOCO testA Acc@0.5 | 5,657 | 50.57% | 50.33% |
-| RefCOCO testB Acc@0.5 | 5,095 | 38.72% | 38.65% |
-| POPE overall accuracy | 9,000 | 86.33% | 86.49% |
-| TextVQA soft accuracy | 5,000 | 48.02% | 36.46% |
+| POPE accuracy | 86.18% | 86.32% | +0.144 pp [-0.211, +0.489] |
+| MME total | 1,792.04 | 1,823.05 | +31.00 [-15.61, +80.65] |
+| TextVQA soft accuracy | 47.79% | 22.50% | -25.292 pp [-26.532, -24.090] |
 
-The paired RefCOCO accuracy intervals include zero on both held-out splits, so
-the small observed differences are treated as compatible with comparable
-quality, not as proof of equivalence or improvement. POPE shows a similarly
-small observed difference. TextVQA is the clear counter-example: aggressive
-object-oriented pruning loses substantial text-reading accuracy.
+![Cross-benchmark transfer](assets/readme/cross_benchmark_transfer.png)
 
-On one NVIDIA A40, five serial 1,000-example timing repetitions gave:
+TextVQA is the clearest limitation. A post-hoc diagnostic retained the 48 selected tokens after
+layer 20 and reached 24.93%, recovering only 2.44 percentage points (about 9.64% of the deficit to
+Full). The main loss therefore cannot be attributed solely to the final zero-token tail.
 
-| Configuration | Mean end-to-end latency | Change from full | Mean prompt KV cache |
+![TextVQA zero-tail diagnostic](assets/readme/textvqa_no_tail.png)
+
+### Recent methods
+
+These figures are changes from each method's matching Full control, not a single-stack leaderboard.
+FastV, IVC-Prune and Nüwa use their authors' software and, in some cases, different checkpoints or
+preprocessing.
+
+| Method | RefCOCO accuracy | Token-work reduction | Latency reduction |
 |---|---:|---:|---:|
-| Full LLaVA, 576 tokens | 0.9053 s | reference | 322.8 MB |
-| Development reference, K=12/B=48 | 0.8432 s | 6.9% lower | 157.8 MB |
-| Frozen method, K=20/B=48 | 0.8828 s | 2.49% lower | 223.8 MB |
+| K12-Z0 | -2.98 pp | 60.42% | 6.26% |
+| FastV | -19.10 pp | 65.45% | 44.43% |
+| IVC-Prune | -3.90 pp | 35.72% | 6.77% |
+| Nüwa | +3.84 pp | 66.67% | 9.01% |
 
-For the frozen method, prompt KV storage is 30.67% lower than full inference.
-The timing reduction is modest and is not claimed to be hardware-independent.
-The selector itself costs about 0.0149 s, which consumes much of the measured
-prefill saving.
+The FastV quality point uses the registered 1,000-record validation subset. External-method values
+should only be interpreted relative to their own Full controls.
 
-The locally executed FastV and VisionZip adapters score 7.27% and 3.54%
-Acc@0.5 on testA, below the three-seed random-pruning mean of 13.95%. No
-positive control validated these adapters against the papers' own reported
-results. Their comparison is therefore unvalidated and should not be read as
-evidence about the published methods themselves.
+## Reproduce and verify
 
-Authoritative result sources are:
-
-- `config.json`, `metrics.json` and aligned result JSONL files under
-  `experiments/final_evaluation/`;
-- `experiments/final_evaluation/protocol/protocol.json` for the registered
-  design and environment;
-- `experiments/final_evaluation/frozen_method.json` for the selected method;
-- `experiments/final_evaluation/FINAL_COMPLETION_REPORT.json` for campaign
-  completeness; and
-- `../Dissertation_Draft/analysis/derived/final_evaluation/` for regenerated
-  tables and intervals.
-
-W&B offline records are retained as secondary provenance. The local artefacts,
-not the W&B dashboard, are the numerical source of truth.
-
-`data/`, `experiments/` and W&B outputs are intentionally not Git-tracked. A
-GitHub clone therefore contains the compact implementation and protocol
-drivers, not the multi-gigabyte raw artefact bundle. The `verify` stage expects
-that bundle at the registered paths; a full rerun additionally requires the
-datasets prepared by `scripts/prepare_official_baseline_data.py` and the model
-checkpoint described below.
-
-## Reproduce the results
-
-The reproduction interface is dry-run by default. Its commands are declared in
-`reproduction.yaml`, so there is one readable registry rather than a collection
-of shell launchers. This prints the complete workflow without starting an
-experiment:
-
-```bash
-python scripts/reproduce.py
-```
-
-To execute or resume the complete final workflow:
-
-```bash
-python scripts/reproduce.py --execute
-```
-
-That one command sequences validation selection, provenance equivalence,
-freezing, held-out evaluation, transfer evaluation, controlled timing and
-evidence rebuilding. It preserves all registered safety gates. Quality runs
-use at most the soak-validated parallelism of three. Timing is always serial
-and refuses to start while another CUDA process is active. Complete artefacts
-are validated and skipped, so the workflow is resumable.
-
-The retained Chapter 5 development ablations are deliberately separate from
-the frozen held-out protocol:
-
-```bash
-python scripts/reproduce.py ablations          # plan only
-python scripts/reproduce.py ablations --execute
-```
-
-The final retrospective selector-mechanism ladder and artefact-repair campaign
-has its own strict controller. It compares raw query top-k, target NMS only,
-and structured target/context/anchor selection at K=12 and K=20 without
-changing the already-frozen method. Run its gates in order:
-
-```bash
-python scripts/audit_dissertation_artifacts.py
-python scripts/run_final_selector_campaign.py --phase register
-python scripts/run_final_selector_campaign.py --phase serial --execute
-python scripts/run_final_selector_campaign.py --phase soak --execute
-python scripts/run_final_selector_campaign.py --phase full --execute --max-parallel 3
-python scripts/analyse_final_selector_campaign.py
-python scripts/final_selector_completion_audit.py
-```
-
-The full phase refuses a dirty source tree and caps concurrency at the result
-of the three-process A40 soak. Each job appends only to
-`per_sample_results.partial.jsonl`; the canonical result JSONL is published
-atomically in manifest order after strict row, ID, token, configuration, and
-metric validation. The repair jobs preserve the historical validation row
-order through the equivalent unique-ID manifest, because the original manifest
-contains duplicate sample IDs that cannot satisfy safe resume semantics.
-Set `VLM_CAMPAIGN_PYTHON` to the inference-environment interpreter when it is
-not available at the local default `/workspace/.followup_venv/bin/python`.
-
-Each stage can also be invoked directly:
-
-```bash
-python scripts/reproduce.py selection
-python scripts/reproduce.py postfreeze
-python scripts/reproduce.py timing
-```
-
-### Verify existing artefacts without inference
-
-The fastest reproduction path does not rerun the model. It compiles and tests
-the implementation, validates the existing raw artefacts, and rebuilds the
-final CSV tables, figures and claim-to-artefact ledger:
-
-```bash
-python scripts/reproduce.py verify --execute
-```
-
-Add `--full-audit` to include the already-built dissertation PDF and its
-recorded visual-QA status. Neither form runs model inference.
-
-### Environment
-
-The registered environment used Python 3.11.10, PyTorch 2.4.1+cu124, CUDA
-12.4, Transformers 5.12.1, Datasets 4.8.5 and W&B 0.28.1. The timing evidence
-used one NVIDIA A40 with batch size one and BF16 inference.
-
-The direct package versions recovered from the final W&B artefacts are pinned
-in `requirements.txt`:
+Python 3.11 and the pinned packages in `requirements.txt` reproduce the canonical LLaVA path.
+GPU inference requires the registered datasets, manifests, model snapshots, and raw artifact bundle;
+these are intentionally not stored in Git. External methods may require their own pinned environment.
 
 ```bash
 python3.11 -m venv .venv
@@ -174,56 +76,50 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-The main checkpoint is `llava-hf/llava-1.5-7b-hf`. Set `HF_HOME` if it is not
-cached under `/workspace/cache/huggingface`.
+The controller is dry-run-first. This prints every registered command without starting a GPU job:
 
-Before execution, `scripts/reproduce.py` checks:
+```bash
+python scripts/reproduce.py
+```
 
-- every registered source and manifest SHA-256;
-- the recorded Python and core package versions;
-- the pinned FastV and VisionZip revisions;
-- checkpoint availability; and
-- visible GPU hardware for timing.
+Run a stage by name, or add `--execute` to execute it:
 
-It fails on drift by default. Explicit `--allow-source-drift`,
-`--allow-environment-drift` and `--allow-hardware-drift` flags are available
-for diagnostic reruns, but results produced with them are not an exact
-reproduction of the registered experiment epoch.
+```bash
+python scripts/reproduce.py main
+python scripts/reproduce.py selector
+python scripts/reproduce.py timing
+python scripts/reproduce.py baselines
+python scripts/reproduce.py external
+python scripts/reproduce.py main --execute
+```
 
-Two limits remain. The registered experiment epoch had a dirty Git working
-tree, so the per-file hashes are stronger provenance than its commit alone.
-Also, the run metadata records the LLaVA model identifier but not an immutable
-Hub revision. The preflight reports both facts rather than claiming bitwise
-reproducibility that the artefacts cannot establish.
+The fastest path is inference-free. It regenerates the README plots and validates the accepted
+summary, CSV tables, schedule arithmetic, and displayed headline values:
 
-## Core implementation
+```bash
+python scripts/reproduce.py verify --execute
+```
 
-- `vlm_pruning/selectors/ug_prune.py`: exact-budget target, context and anchor
-  selection.
-- `vlm_pruning/features/`: query-token resolution and relevance-map handling.
-- `vlm_pruning/llava_hooks/mid_layer_pruning.py`: shortened decoder path,
-  position handling and the two-bank cache.
-- `scripts/run_ug_prune_single_pass.py`: fixed mid-layer UG-Prune runner.
-- `scripts/run_official_baseline.py`: full, random, uniform, FastV and
-  VisionZip evaluation.
-- `scripts/run_final_evaluation.py`: registered selection campaign and GPU
-  soak.
-- `scripts/run_final_postfreeze.py`: held-out and task-transfer campaigns.
-- `scripts/run_final_timing_campaign.py`: repeated serial efficiency campaign.
-- `scripts/run_strong_dissertation_ablations.py`: retained development
-  ablations.
-- `scripts/run_final_selector_campaign.py`: the retrospective mechanism,
-  incomplete-run repair, clean-provenance, smoke and GPU-soak controller.
-- `scripts/audit_dissertation_artifacts.py` and
-  `scripts/final_selector_completion_audit.py`: pre-launch and independent
-  final artefact audits.
-- `scripts/analyse_final_selector_campaign.py`: paired bootstrap and spatial
-  mechanism analysis plus the supersession ledger.
-- `scripts/reproduce.py` and `reproduction.yaml`: the single dry-run-first
-  reproduction interface and its declarative command registry.
-- `tests/test_phase2_ug_prune.py` and `tests/test_phase2b_single_pass.py`:
-  selector, position and cache tests.
+For IVC-Prune, set `IVC_PYTHON`, `IVC_SOURCE`, and `IVC_MODEL_SNAPSHOT` to the pinned environment,
+official checkout, and immutable model snapshot before executing the external stage. The worker
+enforces official commit `03afd9cee41f60bb30b51a4105839f2b5d467814` and model revision
+`a272c74b2481d8aff3aa6fc2c4bf891fe57334fb`.
 
-The binding scientific protocol is in `GOAL.md`. It distinguishes validation
-selection from held-out reporting, fixes the prompts and budgets, and defines
-the completion checks used by the orchestrators.
+## Repository layout
+
+| Path | Purpose |
+|---|---|
+| `vlm_pruning/` | Token selection, progressive pruning, cache handling, scoring, and statistics |
+| `scripts/reproduce.py` | Single dry-run-first workflow controller |
+| `reproduction.yaml` | Registered commands and stages |
+| `scripts/run_progressive_oracle_refcoco.py` | Full, K12, merging, and zero-tail scientific worker |
+| `scripts/run_official_baseline.py` | Full, controls, and FastV-compatible worker |
+| `scripts/run_native_nuwa_refcoco.py` | Nüwa within-stack worker |
+| `scripts/run_ivc_prune_refcoco.py` | IVC-Prune within-stack worker |
+| `results/dissertation/` | Compact accepted JSON/CSV evidence |
+| `assets/readme/` | Figures generated from the accepted summary |
+| `tests/` | Focused scientific and workflow checks |
+
+The numerical source of truth for this repository is
+[`results/dissertation/summary.json`](results/dissertation/summary.json). Large raw predictions are
+required for a fresh independent rescore and remain in the separately archived experiment bundle.

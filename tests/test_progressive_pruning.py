@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import json
 import unittest
+
+import pytest
+
+pytest.importorskip("torch")
 from types import SimpleNamespace
 
 from vlm_pruning.llava_hooks import (

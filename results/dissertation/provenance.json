@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "summary": "Compact values transcribed from the accepted, hash-verified dissertation evidence package.",
+  "sources": [
+    {
+      "path": "../Lava-Prune/analysis/dissertation_k12_evidence/accepted_VALIDATION_DECISION.json",
+      "sha256": "ca5f12de6b9eb2f0762966c248c947bf7ca63439befc6ca049ece17a1add5a48"
+    },
+    {
+      "path": "../Lava-Prune/analysis/dissertation_k12_evidence/accepted_TIMING_DECISION.json",
+      "sha256": "230f0da3cd569e3366789d058408147814934717af5ac789c9daf63a3f6d935e"
+    },
+    {
+      "path": "../Lava-Prune/analysis/dissertation_k12_evidence/accepted_HELDOUT_RESULTS.json",
+      "sha256": "e24ef529bb8dbc1c7f8193079f8e1c8cf8672800fac206e910cb3e19c0074308"
+    },
+    {
+      "path": "../Lava-Prune/analysis/dissertation_k12_evidence/accepted_CROSS_BENCHMARK_RESULTS.json",
+      "sha256": "43794516c51754d51431a5db3027abbe2fcfc6f702b19bd08081ab4d14c1bb69"
+    },
+    {
+      "path": "../Lava-Prune/analysis/dissertation_k12_evidence/TEXTVQA_PAIRED_ERROR_ANALYSIS.json",
+      "sha256": "d71db7a23f9e2a8b2cfd3925306bce30d2dab18e2c56ce22a81b0604c8321a3e",
+      "note": "The authoritative full-package manifest should be used when the archived package is present."
+    },
+    {
+      "path": "../FINAL_COMPLETION_REPORT.json",
+      "sha256": "799f1dbe86be14ce9a5d772bcf86e0ccffdc6c504add03cf0ee27c887c210d9f",
+      "scope": "IVC-Prune campaign"
+    }
+  ],
+  "boundaries": {
+    "raw_predictions_tracked": false,
+    "datasets_tracked": false,
+    "external_methods_compared_with_matching_full_control": true
+  }
+}

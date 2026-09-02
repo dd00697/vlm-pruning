@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "title": "K12-QueryTopK-Z0 dissertation results",
+  "method": {
+    "name": "K12-QueryTopK-Z0",
+    "schedule": [
+      {"layers": 12, "visual_tokens": 576},
+      {"layers": 8, "visual_tokens": 48},
+      {"layers": 12, "visual_tokens": 0}
+    ],
+    "visual_token_layer_work": 7296,
+    "average_visual_tokens_per_layer": 228
+  },
+  "refcoco": {
+    "validation": {
+      "samples": 8811,
+      "full": {"acc_at_0_5": 0.449325, "mean_iou": 0.435115},
+      "k12_z0": {"acc_at_0_5": 0.419476, "mean_iou": 0.428451}
+    },
+    "testA": {
+      "samples": 5657,
+      "full": {"acc_at_0_5": 0.509634, "mean_iou": 0.468318},
+      "k12_z0": {"acc_at_0_5": 0.471805, "mean_iou": 0.461087},
+      "acc_delta_pp": -3.7829,
+      "acc_delta_ci95_pp": [-4.9319, -2.6162]
+    },
+    "testB": {
+      "samples": 5095,
+      "full": {"acc_at_0_5": 0.399411, "mean_iou": 0.408763},
+      "k12_z0": {"acc_at_0_5": 0.373700, "mean_iou": 0.405752},
+      "acc_delta_pp": -2.5711,
+      "acc_delta_ci95_pp": [-3.8665, -1.2758]
+    }
+  },
+  "timing": {
+    "hardware": "NVIDIA A40",
+    "samples_per_repetition": 1000,
+    "repetitions": 5,
+    "full_end_to_end_seconds": 0.868512,
+    "k12_z0_end_to_end_seconds": 0.814139,
+    "latency_reduction_percent": 6.260,
+    "latency_ratio_ci95": [0.93510, 0.93963],
+    "full_modelled_prefill_tflops": 8.96,
+    "k12_z0_modelled_prefill_tflops": 4.323,
+    "prompt_kv_reduction_percent": 54.042,
+    "final_kv_reduction_percent": 52.252
+  },
+  "transfer": {
+    "mme": {
+      "full": 1792.04,
+      "k12_z0": 1823.05,
+      "delta": 31.00,
+      "delta_ci95": [-15.61, 80.65]
+    },
+    "pope": {
+      "full_accuracy": 0.86178,
+      "k12_z0_accuracy": 0.86322,
+      "delta_pp": 0.144,
+      "delta_ci95_pp": [-0.211, 0.489]
+    },
+    "textvqa": {
+      "full_soft_accuracy": 0.47788,
+      "k12_z0_soft_accuracy": 0.22496,
+      "delta_pp": -25.292,
+      "delta_ci95_pp": [-26.532, -24.090],
+      "k12_no_tail_soft_accuracy": 0.24934,
+      "no_tail_minus_z0_pp": 2.438,
+      "no_tail_minus_z0_ci95_pp": [1.892, 2.978],
+      "recovered_full_gap_percent": 9.64
+    }
+  },
+  "external_refcoco_validation": [
+    {"method": "K12-Z0", "accuracy_delta_pp": -2.9849, "token_work_reduction_percent": 60.42, "prefill_flops_reduction_percent": 51.77, "prompt_kv_reduction_percent": 54.04, "latency_reduction_percent": 6.260},
+    {"method": "FastV", "accuracy_delta_pp": -19.10, "token_work_reduction_percent": 65.45, "prefill_flops_reduction_percent": 56.40, "prompt_kv_reduction_percent": null, "latency_reduction_percent": 44.43},
+    {"method": "IVC-Prune", "accuracy_delta_pp": -3.90, "token_work_reduction_percent": 35.72, "prefill_flops_reduction_percent": 29.70, "prompt_kv_reduction_percent": 61.80, "latency_reduction_percent": 6.77},
+    {"method": "Nüwa", "accuracy_delta_pp": 3.84, "token_work_reduction_percent": 66.67, "prefill_flops_reduction_percent": 54.96, "prompt_kv_reduction_percent": 56.81, "latency_reduction_percent": 9.01}
+  ],
+  "external_transfer_deltas": [
+    {"method": "K12-Z0", "textvqa_pp": -25.292, "pope_pp": 0.144, "mme_points": 31.00},
+    {"method": "FastV", "textvqa_pp": -2.49, "pope_pp": -4.14, "mme_points": -36.55},
+    {"method": "IVC-Prune", "textvqa_pp": -8.63, "pope_pp": 0.07, "mme_points": -10.11},
+    {"method": "Nüwa", "textvqa_pp": -0.77, "pope_pp": -0.92, "mme_points": 25.65}
+  ],
+  "interpretation": {
+    "external_methods_are_within_stack": true,
+    "fastv_refcoco_subset_samples": 1000,
+    "timing_is_hardware_specific": true,
+    "textvqa_no_tail_is_post_hoc": true
+  }
+}

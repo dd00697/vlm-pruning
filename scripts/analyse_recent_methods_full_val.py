@@ -505,10 +505,9 @@ def campaign_classification(
 def immutable_context() -> dict[str, Any]:
     paths = {
         "router": REPO_ROOT / "experiments/adaptive_efficiency_refcoco_val_20260815/analysis/GATE_RESULTS_AND_SELECTION.json",
-        "oracle": REPO_ROOT / "experiments/progressive_oracle_refcoco_val_20260814/RESEARCH_REPORT.md",
         "e256": REPO_ROOT / "experiments/hardware_aware_zero_tail_refcoco_val_20260816/early_compression/analysis/QUALITY_RESULTS.json",
-        "saqr": REPO_ROOT / "experiments/trained_prellm_resampler_refcoco_20260817/RESEARCH_REPORT.md",
         "timing": REPO_ROOT / "experiments/hardware_aware_zero_tail_refcoco_val_20260816/matched_timing/analysis/NATURAL_RESULTS.json",
+        "accepted_summary": REPO_ROOT / "results/dissertation/summary.json",
     }
     if any(not path.is_file() for path in paths.values()):
         raise AnalysisError("An immutable contextual evidence artifact is missing")

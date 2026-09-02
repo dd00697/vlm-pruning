@@ -3,6 +3,10 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+
+import pytest
+
+pytest.importorskip("torch")
 from pathlib import Path
 from types import SimpleNamespace
 

@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import unittest
 
+import pytest
+
+pytest.importorskip("torch")
+
 from scripts.run_final_val_canonical_timing import METHODS, ORDER_PLAN, timing_row
 
 
