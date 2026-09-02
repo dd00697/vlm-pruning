@@ -63,6 +63,11 @@ def main() -> int:
         ROOT / "assets/readme/quality_vs_work.png",
         ROOT / "assets/readme/cross_benchmark_transfer.png",
         ROOT / "assets/readme/textvqa_no_tail.png",
+        ROOT / "assets/readme/token_selection_example.png",
+        ROOT / "assets/readme/heldout_iou_thresholds.png",
+        ROOT / "assets/readme/selection_frequency_maps.png",
+        ROOT / "assets/readme/timing_decomposition.png",
+        ROOT / "assets/readme/textvqa_error_analysis.png",
     ]
     require(all(path.is_file() and path.stat().st_size > 1000 for path in figures), "README figure missing")
 

@@ -27,6 +27,31 @@
       "path": "../FINAL_COMPLETION_REPORT.json",
       "sha256": "799f1dbe86be14ce9a5d772bcf86e0ccffdc6c504add03cf0ee27c887c210d9f",
       "scope": "IVC-Prune campaign"
+    },
+    {
+      "path": "../Lava-Prune/images/final/k12/k12_query_topk_z0_token_visualization.pdf",
+      "sha256": "6437e65db82438a635bc8fe8f9de16a9cb16072dcc4eff09b1ce142744583385",
+      "rendered_as": "assets/readme/token_selection_example.png"
+    },
+    {
+      "path": "../Lava-Prune/images/final/k12/paired_localization_threshold_crossing_full_vs_k12.pdf",
+      "sha256": "ffeff2b6bd581501173fba3eae6e42f351b8f2810c649577da8f8dbbaaa9b89e",
+      "rendered_as": "assets/readme/heldout_iou_thresholds.png"
+    },
+    {
+      "path": "../Lava-Prune/images/final/k12/query_agnostic_selection_frequency_maps.pdf",
+      "sha256": "6594d76b3aa2aa526bc6c08e8f9be922a7e66a31bd9845274455c7247e1ecc71",
+      "rendered_as": "assets/readme/selection_frequency_maps.png"
+    },
+    {
+      "path": "../Lava-Prune/images/final/k12/canonical_timing_decomposition_k12_paired_campaign.pdf",
+      "sha256": "f85bf4db1ad777161d0afd5d9a8cca5095e9fc921358f35dec78bf38107e14f5",
+      "rendered_as": "assets/readme/timing_decomposition.png"
+    },
+    {
+      "path": "../Lava-Prune/images/final/k12/textvqa_paired_error_analysis.pdf",
+      "sha256": "afdf1850f506fe98cd6a0cc9ba28e5cd52b2c315f396b5944d673f659f84090d",
+      "rendered_as": "assets/readme/textvqa_error_analysis.png"
     }
   ],
   "boundaries": {
